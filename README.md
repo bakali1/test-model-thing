@@ -1,6 +1,6 @@
 Hey! Thanks for being here.
 
-Here's the video, if you came here from somewhere else -> [Video](https://example.com)
+Here's the video, if you came here from somewhere else -> [Video](https://youtu.be/aXCaRem-vNA)
 
 The train and benchmark scripts are provided (using MLX, but you can port to other platforms if you want).
 
