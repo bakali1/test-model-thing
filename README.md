@@ -1,5 +1,7 @@
 # Test-Model-Thing (TMT)
 
+[YouTube Video](https://youtu.be/9UERVVwpNew)
+
 This is a small proof-of-concept language model (not an LLM) that incorporates the following (and some smaller features as well):
 * Latent-space prediction
 * Internal state + recurrent trace units (RTUs)
@@ -14,8 +16,6 @@ Being a proof of concept I have only trained a 4.5-million parameter model (keep
 This model architecture was designed in about a month by me (a solo high school dev) and some Gemini (only pair programming, no agents). I wrote about a dozen prototypes before creating this architecture. I write READMEs myself without AI.
 
 Feel free to fork the training and benchmark code (everything is under MIT). I really encourage you to try things out, submit issues, and fork the repo.
-
-[YouTube Video](https://youtu.be/9UERVVwpNew)
 
 <img width="499" height="497" alt="3f7f1530-c0c7-43c4-9981-30e9023a19fb" src="https://github.com/user-attachments/assets/eb7e5a97-09b5-4a7b-9484-eb898042e9dc" />
 
