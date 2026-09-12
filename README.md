@@ -15,7 +15,7 @@ This model architecture was designed in about a month by me (a solo high school 
 
 Feel free to fork the training and benchmark code (everything is under MIT). I really encourage you to try things out, submit issues, and fork the repo.
 
-_I used to have a video here, but I privated it for now._
+[YouTube Video](https://youtu.be/9UERVVwpNew)
 
 <img width="499" height="497" alt="3f7f1530-c0c7-43c4-9981-30e9023a19fb" src="https://github.com/user-attachments/assets/eb7e5a97-09b5-4a7b-9484-eb898042e9dc" />
 
