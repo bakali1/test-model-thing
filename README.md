@@ -19,6 +19,26 @@ Feel free to fork the training and benchmark code (everything is under MIT). I r
 
 <img width="499" height="497" alt="3f7f1530-c0c7-43c4-9981-30e9023a19fb" src="https://github.com/user-attachments/assets/eb7e5a97-09b5-4a7b-9484-eb898042e9dc" />
 
+## Running on Linux
+
+MLX ships CPU wheels for Linux x86_64, so this runs on any modern Linux box (no GPU needed). On Linux you must install the ```mlx[cpu]``` extra so the CPU backend library (```libmlx.so```) is pulled in:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install 'mlx[cpu]'
+python main.py
+```
+
+The default entry point now uses the 4.5m config from the README (```dim = 512```, ```layers = 16```) and saves/loads weights to/from ```model.safetensors``` (created from scratch on first run). If ```wikipedia_clean/``` doesn't exist, dataset mode automatically falls back to any ```*.txt``` files in the repo (e.g. ```sample.txt```) or a small built-in sample text.
+
+A few environment variables are supported for non-interactive/CI use:
+* ```TMT_MODE=0``` (dataset) or ```TMT_MODE=1``` (chat) skips the mode prompt.
+* ```TMT_STEPS=N``` stops training cleanly after N steps (weights are still saved).
+* ```TMT_LOG=1``` prints the running loss every 100 steps.
+
+Example smoke test: ```TMT_MODE=0 TMT_STEPS=50 TMT_LOG=1 .venv/bin/python main.py > /dev/null```
+
 ## Training your own model
 
 Model weights (in ```.safetensors```) are not provided because GitHub doesn't like very large files. But, you can train your own model simply by initializing a ```venv``` and installing ```mlx```, no other libraries needed, then running ```main.py```. When you run it, you will be prompted with the mode, ```0``` being train on dataset and ```1``` being chat. You will have to configure your own dataset by modifying the code (to run dataset mode), but you should be able to run chat mode without modifying anything if you have weights already.

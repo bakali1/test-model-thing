@@ -2,6 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
 import mlx.utils as util
+import os
 
 class Encoder(nn.Module):
     def __init__(self, dim: int):
@@ -87,7 +88,7 @@ class Model(nn.Module):
 
             return loss, (states, decays, output, stop) # loss = variance loss + pred mse loss + crossentropy loss + stop mse loss
 
-        (_, (states, decays, output, stop)), (grads, dlds_s) = mx.value_and_grad(
+        (lossval, (states, decays, output, stop)), (grads, dlds_s) = mx.value_and_grad(
             fwd, argnums = (0, 1)
         )(p, [mx.zeros((self.dim, )) for _ in range(self.layercount)])
 
@@ -113,6 +114,7 @@ class Model(nn.Module):
         self.optimizer.update(self, grads)
         mx.eval(self.parameters(), self.optimizer.state)
 
+        self.lastloss = lossval.item()
         return self.sample(output).item(), stop.item()
 
     def save(self, path: str):
@@ -140,7 +142,7 @@ class Model(nn.Module):
             elif k.startswith("decaytrace."): self.layers[int(k.split('.')[1])].decaytrace = v
             elif k == "embedtrace": self.encoder.embedtrace = v
             
-        if model: self.update(util.tree_unflatten(list(model.items())))
+        if model: self.update(util.tree_unflatten([(k, v) for k, v in model.items() if k in util.tree_flatten(self.parameters())]))
         if opts: self.optimizer.state = util.tree_unflatten(list(opts.items()))
 
 class Runtime:
@@ -149,6 +151,8 @@ class Runtime:
         self.path = path
         self.threshold = threshold
         self.step = 0
+        self.limit = int(os.environ.get('TMT_STEPS', '0') or 0)
+        self.log = os.environ.get('TMT_LOG', '') == '1'
 
     def save(self):
         self.step += 1
@@ -157,6 +161,12 @@ class Runtime:
     def call(self, c: int, n: int | None, end: bool):
         outputs = self.model(c, n, end)
         self.save()
+
+        if self.log and self.step % 100 == 0:
+            avg = self.model.lastloss
+            print(f'\r[step {self.step}] loss = {avg:.4f}', end = '', flush = True)
+
+        if self.limit and self.step >= self.limit: raise KeyboardInterrupt
         return outputs
 
     def write(self, b: int):
@@ -186,24 +196,40 @@ class Runtime:
         import glob, itertools
         files = glob.glob('wikipedia_clean/**/wiki_*', recursive = True)
 
+        if not files:
+            files = glob.glob('*.txt')
+            print(f'\n[wikipedia_clean/ not found, falling back to local .txt files: {files}]', flush = True)
+
+        if not files:
+            print('\n[no dataset found, training on built-in sample text]', flush = True)
+            files = None
+
         while True:
-            for file in files:
-                with open(file, 'r', encoding = 'utf-8', errors = 'ignore') as f:
-                    for line in f:
-                        data = line.encode('utf-8')
-                        for i, (c, n) in enumerate(itertools.pairwise(data)):
-                            b, _ = self.call(c, n, i == len(data) - 2)
-                            self.write(b)
+            if files is None:
+                lines = iter(SAMPLE_TEXT.splitlines(keepends = True))
+            else:
+                lines = (line for file in files for line in open(file, 'r', encoding = 'utf-8', errors = 'ignore'))
+
+            for line in lines:
+                data = line.encode('utf-8')
+                for i, (c, n) in enumerate(itertools.pairwise(data)):
+                    b, _ = self.call(c, n, i == len(data) - 2)
+                    self.write(b)
 
     def now(self):
         from datetime import datetime
         return datetime.now().strftime('%d/%m/%Y, %H:%M:%S')
 
     def __call__(self):
-        try: mode = bool(int(input(f'\n[{self.now()}]\nmode >> ')))
-        except ValueError:
-            print('\nInvalid mode.')
-            return
+        envmode = os.environ.get('TMT_MODE')
+        if envmode is not None:
+            mode = bool(int(envmode))
+            print(f'\n[{self.now()}]\nmode >> {int(mode)} (from TMT_MODE)')
+        else:
+            try: mode = bool(int(input(f'\n[{self.now()}]\nmode >> ')))
+            except ValueError:
+                print('\nInvalid mode.')
+                return
 
         self.model.load(self.path)
         print()
@@ -212,9 +238,23 @@ class Runtime:
             match mode:
                 case False: self.dataset()
                 case True: self.chat()
-
+        except KeyboardInterrupt: pass
         finally: self.model.save(self.path)
 
+SAMPLE_TEXT = '''The quick brown fox jumps over the lazy dog. The dog barks, and the fox runs away into the forest.
+Deep in the forest there lived an old owl who knew every path, every stream, and every tree by its name.
+To be, or not to be, that is the question: whether 'tis nobler in the mind to suffer the slings and arrows of outrageous fortune.
+All that glitters is not gold; often have you heard that told.
+The rain in Spain stays mainly in the plain. In Hertford, Hereford, and Hampshire, hurricanes hardly ever happen.
+It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness.
+Once upon a midnight dreary, while I pondered, weak and weary, over many a quaint and curious volume of forgotten lore.
+A journey of a thousand miles begins with a single step. Practice makes perfect, and patience pays in the end.
+The sun rises in the east and sets in the west, and the stars come out to watch over us all through the night.
+Hello, world! This is a tiny sample used to smoke-test training when no real dataset is available (a bit like CoLA).
+'''
+
 if __name__ == '__main__':
-    Runtime(path = 'larger-130m.safetensors', threshold = 0.35, dim = 2048, layers = 32, temp = 0.75, lr = 5e-4)()
+    # 4.5m parameter config (see README). Set TMT_MODE=0/1 to skip the mode
+    # prompt, TMT_STEPS=N to stop after N steps, TMT_LOG=1 to print the loss.
+    Runtime(path = 'model.safetensors', threshold = 0.35, dim = 512, layers = 16, temp = 0.75, lr = 5e-4)()
     # param count = (256 * dim) + (dim * dim + dim * 2 + dim) + (256 * dim + dim + 1)

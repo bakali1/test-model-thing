@@ -1,0 +1,10 @@
+The quick brown fox jumps over the lazy dog. The dog barks, and the fox runs away into the forest.
+Deep in the forest there lived an old owl who knew every path, every stream, and every tree by its name.
+To be, or not to be, that is the question: whether 'tis nobler in the mind to suffer the slings and arrows of outrageous fortune.
+All that glitters is not gold; often have you heard that told.
+The rain in Spain stays mainly in the plain. In Hertford, Hereford, and Hampshire, hurricanes hardly ever happen.
+It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness.
+Once upon a midnight dreary, while I pondered, weak and weary, over many a quaint and curious volume of forgotten lore.
+A journey of a thousand miles begins with a single step. Practice makes perfect, and patience pays in the end.
+The sun rises in the east and sets in the west, and the stars come out to watch over us all through the night.
+Hello, world! This is a tiny sample file used to smoke-test dataset training when no real dataset (wikipedia_clean/) is available.
