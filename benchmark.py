@@ -12,7 +12,30 @@ class Classification(nn.Module):
 
     def __call__(self, x: mx.array): return self.proj(x)
 
+# Tiny built-in stand-in for CoLA (grammatical=1, ungrammatical=0) so the
+# benchmark can run when CoLA/original/raw/in_domain_train.tsv is missing.
+BUILTIN_COLA = [
+    (b'The plot of the novel was surprisingly clever.', 1),
+    (b'The professor gave a fascinating lecture yesterday.', 1),
+    (b'She sings beautifully and plays the piano well.', 1),
+    (b'The children played happily in the park all afternoon.', 1),
+    (b'This is the book that I told you about last week.', 1),
+    (b'Every student finished their assignment on time.', 1),
+    (b'The movie was so entertaining that we watched it twice.', 1),
+    (b'Ran quickly the dog down street the.', 0),
+    (b'The seems cat sleeping under table the.', 0),
+    (b'Bought yesterday I a new book interesting.', 0),
+    (b'Their laughing baby the loudly was.', 0),
+    (b'Is more this box heavy than that one much.', 0),
+    (b'Went she to store the morning early.', 0),
+    (b'Cake delicious the ate slowly dog the.', 0),
+]
+
 def cola(filepath: str):
+    import os
+    if not os.path.exists(filepath):
+        print(f"\n[{filepath} not found, using tiny built-in labeled sample ({len(BUILTIN_COLA)} examples)]", flush = True)
+        return BUILTIN_COLA
     data = []
     with open(filepath, 'r', encoding = 'utf-8') as f:
         for line in f:

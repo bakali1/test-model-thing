@@ -50,6 +50,13 @@ class Model(nn.Module):
 
         self.layers = [Layer(dim) for _ in range(layers)]
         self.optimizer = opt.AdamW(learning_rate = lr)
+        self.frozen = False
+
+    def freeze(self):
+        """Feature-extraction mode: stop all parameter updates and make
+        __call__ return the final latent state instead of sampling (used by
+        benchmark.py, which trains only a linear head on frozen features)."""
+        self.frozen = True
 
     def sample(self, output: mx.array):
         probs = mx.softmax(output)
@@ -60,6 +67,21 @@ class Model(nn.Module):
 
     def __call__(self, currb: int, nextb: int | None, end: bool):
         c = mx.array(currb)
+
+        if self.frozen:
+            # No gradients, no optimizer updates, no trace/state bookkeeping:
+            # just stream the byte through and return the last layer's state
+            # (the latent benchmark.py's head consumes).
+            x = self.encoder(c)
+            states = []
+            for layer in self.layers:
+                x, state, _ = layer(x, mx.zeros((self.dim, )))
+                states.append(state)
+
+            final = mx.stop_gradient(states[-1])
+            mx.eval(final)
+            return final
+
         p = self.trainable_parameters()
 
         def fwd(params, dummies: list[mx.array]):
@@ -171,7 +193,9 @@ class Runtime:
 
     def write(self, b: int):
         import sys
-        sys.stdout.buffer.write(bytes([b]))
+        # Decoding with 'replace' keeps the terminal clean: raw model bytes can
+        # be invalid/partial UTF-8 (especially early in training).
+        sys.stdout.write(bytes([b]).decode('utf-8', errors = 'replace'))
         sys.stdout.flush()
 
     def chat(self):
