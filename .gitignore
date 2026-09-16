@@ -7,3 +7,8 @@
 *.pipe
 *.DS_Store
 *.safetensors
+
+# Runtime corpus: downloaded public-domain books live in the repo root as *.txt.
+# Not committed (they're data, not code). sample.txt stays tracked for CI smoke tests.
+*.txt
+!sample.txt

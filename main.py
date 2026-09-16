@@ -280,5 +280,9 @@ Hello, world! This is a tiny sample used to smoke-test training when no real dat
 if __name__ == '__main__':
     # 4.5m parameter config (see README). Set TMT_MODE=0/1 to skip the mode
     # prompt, TMT_STEPS=N to stop after N steps, TMT_LOG=1 to print the loss.
-    Runtime(path = 'model.safetensors', threshold = 0.35, dim = 512, layers = 16, temp = 0.75, lr = 5e-4)()
+    # threshold = stop-head cutoff for chat (valid range ~0..1, higher = longer
+    # responses; 0.25 chosen to stop whitespace rambling on under-trained models)
+    # temp = sampling temperature (lower = more deterministic; 0.6 chosen for
+    # the same reason). Both are easy tweaks if chat feels too stingy/random.
+    Runtime(path = 'model.safetensors', threshold = 0.25, dim = 512, layers = 16, temp = 0.6, lr = 5e-4)()
     # param count = (256 * dim) + (dim * dim + dim * 2 + dim) + (256 * dim + dim + 1)
