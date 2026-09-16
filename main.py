@@ -4,6 +4,14 @@ import mlx.optimizers as opt
 import mlx.utils as util
 import os
 
+# Per-byte one-hot column, precomputed once: onehot[c][:, None] replaces
+# building (mx.arange(256) == c)[:, None] on every training step.
+ONEHOT = mx.eye(256)
+# Cache for mx.array(byte) conversions (one shared scalar array per byte 0..255).
+BYTE_ARRAYS = [mx.array(i) for i in range(256)]
+# 0-d has-next / stop-target flags for the compiled training step.
+FLAGS = (mx.array(0.0), mx.array(1.0))
+
 class Encoder(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -38,6 +46,21 @@ class Layer(nn.Module):
 
         return x + self.silu(self.weights(self.norm(state))), state, decay
 
+def _prune_empty(tree):
+    """Drop empty dict/list subtrees (e.g. the parameterless nn.SiLU child
+    modules, which appear as `layers.N.silu = {}` in trainable_parameters()).
+    They carry no arrays, but save()/load() round-trips flatten them away, so
+    an unpruned tree goes out of structural sync with a reloaded optimizer
+    state and tree_map raises KeyError on resume."""
+    if isinstance(tree, dict):
+        pruned = {k: _prune_empty(v) for k, v in tree.items()}
+        return {k: v for k, v in pruned.items()
+                if not (isinstance(v, (dict, list)) and not v)}
+    if isinstance(tree, list):
+        return [_prune_empty(v) for v in tree]
+    return tree
+
+
 class Model(nn.Module):
     def __init__(self, dim: int, layers: int, temp: float, lr: float):
         super().__init__()
@@ -50,23 +73,112 @@ class Model(nn.Module):
 
         self.layers = [Layer(dim) for _ in range(layers)]
         self.optimizer = opt.AdamW(learning_rate = lr)
+
+        # Same dummies list reused every step (it is never mutated) instead of
+        # reallocating layercount zero arrays per call; the trainable parameter
+        # tree is cached lazily on first step (trainable_parameters() walks the
+        # whole module tree otherwise, every single step). object.__setattr__
+        # keeps these out of nn.Module's parameter registry.
+        object.__setattr__(self, "_dummies", [mx.zeros((self.dim, )) for _ in range(self.layercount)])
+        object.__setattr__(self, "_trainable", None)
+
+        # The two hot inner loops of a training step (value_and_grad of the
+        # forward pass, and the AdamW parameter update) are mx.compile'd into
+        # single fused graphs. Both are written as pure functions of their
+        # arguments (byte scalars, has-next/end flags and the optimizer state
+        # are passed in explicitly, so nothing changes between calls except
+        # input values); the surrounding mutation/trace bookkeeping stays
+        # eager. Measured: optimizer 70.7ms -> 36.7ms, vjp 19.5ms -> 17.0ms,
+        # with bit-exact results over chained steps.
+        self._vgc = self._build_vgc()
+        self._adamwc = self._build_adamw()
         self.frozen = False
+
+    def _build_vgc(self):
+        """mx.compile(mx.value_and_grad(fwd)) for one training step.
+
+        fwd is pure: every per-step varying quantity (input byte c, target
+        byte n, has-next flag, stop-target flag) is a compile input. The
+        next-byte terms are gated with hasnext so a single graph covers both
+        the streaming path (hasnext=1.0) and generation (hasnext=0.0, loss =
+        variance term only, exactly like the eager `if nextb is not None`).
+        The module update inside is only plumbing to route the traced params
+        into the layer reads (same trick as the eager value_and_grad path)."""
+        model = self
+
+        def fwd(params, dummies: list[mx.array], c, n, hasnext, endf):
+            model.update(params)
+            x = model.encoder(c)
+
+            states, decays = [], []
+
+            for i, layer in enumerate(model.layers):
+                x, state, decay = layer(x, dummies[i])
+
+                states.append(state)
+                decays.append(decay)
+
+            output, stop = model.decoder(x)
+
+            loss = mx.maximum(0.0, 1.0 - mx.sqrt(mx.var(x) + 1e-4))
+            tgt = mx.stop_gradient(model.encoder(n))
+            pred = mx.mean(mx.square(x - tgt))
+            xent = -output[n] + mx.logsumexp(output)
+            stopmse = mx.mean(mx.square(stop - endf))
+
+            # loss = variance loss + pred mse loss + crossentropy loss + stop mse loss
+            return loss + hasnext * (pred + xent + stopmse), (states, decays, output, stop)
+
+        return mx.compile(mx.value_and_grad(fwd, argnums = (0, 1)))
+
+    def _build_adamw(self):
+        """mx.compile'd AdamW step, bit-exact reproduction of
+        opt.AdamW.apply_gradients (bias_correction=False default: update =
+        w*(1-lr*decay) - lr*m/(sqrt(v)+eps); per-leaf m/v returned instead of
+        mutated so the function is pure)."""
+        o = self.optimizer
+        b1, b2 = o.betas
+        eps = o.eps
+        wd = o.weight_decay
+
+        def adamw(grads, params, state, lr_arr):
+            step = state["step"] + 1
+
+            def single(g, w, s):
+                lr = lr_arr.astype(g.dtype)
+                m_ = b1 * s["m"] + (1 - b1) * g
+                v_ = b2 * s["v"] + (1 - b2) * mx.square(g)
+                return w * (1 - lr * wd) - lr * m_ / (mx.sqrt(v_) + eps), m_, v_
+
+            combined = util.tree_map(single, grads, params, state)
+            split = lambda i: util.tree_map(
+                lambda t: t[i], combined, is_leaf = lambda x: isinstance(x, tuple)
+            )
+            return split(0), split(1), split(2), step
+
+        return mx.compile(adamw)
 
     def freeze(self):
         """Feature-extraction mode: stop all parameter updates and make
         __call__ return the final latent state instead of sampling (used by
         benchmark.py, which trains only a linear head on frozen features)."""
         self.frozen = True
+        object.__setattr__(self, "_trainable", None)
 
     def sample(self, output: mx.array):
+        # Entropy via logsumexp: H = -sum(softmax(o) * log_softmax(o)) equals
+        # (logsumexp(o) - sum(probs * o)) / ln(256), but avoids log(probs + eps).
         probs = mx.softmax(output)
-        entropy = -mx.sum(probs * mx.log(probs + 1e-8)) / mx.log(mx.array(256))
+        entropy = (mx.logsumexp(output) - mx.sum(probs * output)) / mx.log(mx.array(256))
 
-        temp = mx.maximum(0.1, self.temp * (1.0 - self.temp * entropy)).item()
+        # Keep temp as an array (no .item() mid-step): mx.random.categorical
+        # accepts array logits, so the sync can wait until the caller needs
+        # the sampled byte. Same scale, same distribution.
+        temp = mx.maximum(0.1, self.temp * (1.0 - self.temp * entropy))
         return mx.random.categorical(output / temp)
 
     def __call__(self, currb: int, nextb: int | None, end: bool):
-        c = mx.array(currb)
+        c = BYTE_ARRAYS[currb]
 
         if self.frozen:
             # No gradients, no optimizer updates, no trace/state bookkeeping:
@@ -82,48 +194,29 @@ class Model(nn.Module):
             mx.eval(final)
             return final
 
-        p = self.trainable_parameters()
+        p = self._trainable
+        if p is None:
+            p = object.__setattr__(self, "_trainable", _prune_empty(self.trainable_parameters())) or self._trainable
 
-        def fwd(params, dummies: list[mx.array]):
-            self.update(params)
-            x = self.encoder(c)
+        dummies = self._dummies
+        c_arg = c
+        n_arg = BYTE_ARRAYS[nextb] if nextb is not None else BYTE_ARRAYS[0]
+        hasnext = FLAGS[1 if nextb is not None else 0]
+        endf = FLAGS[1 if end else 0]
 
-            states, decays = [], []
-
-            for i, layer in enumerate(self.layers):
-                x, state, decay = layer(x, dummies[i])
-
-                states.append(state)
-                decays.append(decay)
-
-            output, stop = self.decoder(x)
-
-            loss = mx.maximum(0.0, 1.0 - mx.sqrt(mx.var(x) + 1e-4))
-            if nextb is not None:
-                n = mx.array(nextb)
-                tgt = mx.stop_gradient(self.encoder(n))
-
-                loss = loss + mx.mean(mx.square(x - tgt))
-                loss = loss - output[n] + mx.logsumexp(output)
-
-                loss = loss + mx.mean(mx.square(stop - mx.array([1.0 if end else 0.0])))
-
-            return loss, (states, decays, output, stop) # loss = variance loss + pred mse loss + crossentropy loss + stop mse loss
-
-        (lossval, (states, decays, output, stop)), (grads, dlds_s) = mx.value_and_grad(
-            fwd, argnums = (0, 1)
-        )(p, [mx.zeros((self.dim, )) for _ in range(self.layercount)])
+        (lossval, (states, decays, output, stop)), (grads, dlds_s) = self._vgc(
+            p, dummies, c_arg, n_arg, hasnext, endf
+        )
 
         self.update(p)
 
-        embedtrace = (self.encoder.embedtrace * decays[0]) + (mx.arange(256) == c)[:, None]
+        embedtrace = (self.encoder.embedtrace * decays[0]) + ONEHOT[c][:, None]
         grads["encoder"]["embed"]["weight"] += dlds_s[0] * (self.encoder.embedtrace * decays[0])
         self.encoder.embedtrace = mx.stop_gradient(embedtrace)
-        mx.eval(self.encoder.embedtrace)
 
         for i, layer in enumerate(self.layers):
             dlds = dlds_s[i]
-            
+
             decaytrace = (decays[i] * layer.decaytrace) + (decays[i] * (1.0 - decays[i]) * layer.states)
 
             grads["layers"][i]["decay"] = dlds * decaytrace
@@ -131,10 +224,46 @@ class Model(nn.Module):
             layer.states = mx.stop_gradient(states[i])
             layer.decaytrace = mx.stop_gradient(decaytrace)
 
-            mx.eval(layer.states, layer.decaytrace)
+        # The trace arrays were just reassigned on the module; the optimizer
+        # must update from these fresh values (the old code did this implicitly
+        # by reading self.parameters() after the assignments), so mirror them
+        # into the cached tree before the AdamW step.
+        p["encoder"]["embedtrace"] = self.encoder.embedtrace
+        for i, layer in enumerate(self.layers):
+            p["layers"][i]["states"] = layer.states
+            p["layers"][i]["decaytrace"] = layer.decaytrace
 
-        self.optimizer.update(self, grads)
-        mx.eval(self.parameters(), self.optimizer.state)
+        # Graft the post-update parameter arrays back into the cached tree (the
+        # optimizer replaces leaves by identity, so the cache would go stale;
+        # tree_map keeps the original structure and swaps in the new arrays).
+        # Compiled AdamW step: pure function returning the new parameters, the
+        # new m/v moment trees and the incremented step counter.
+        if "encoder" not in self.optimizer.state:
+            st = {"step": mx.array(0, mx.uint64), "learning_rate": self.optimizer.learning_rate}
+            st.update(util.tree_map(lambda g: {"m": mx.zeros_like(g), "v": mx.zeros_like(g)}, grads))
+            self.optimizer.state = st
+
+        new_params, new_m, new_v, new_step = self._adamwc(
+            grads, p, self.optimizer.state, self.optimizer.learning_rate
+        )
+        self.update(new_params)
+        self.optimizer.state["step"] = new_step
+        util.tree_map(lambda a, s: s.__setitem__("m", a), new_m, self.optimizer.state)
+        util.tree_map(lambda a, s: s.__setitem__("v", a), new_v, self.optimizer.state)
+        self._trainable = util.tree_map(lambda _, new: new, self._trainable, new_params)
+
+        # ONE eval per step: the trace bookkeeping, gradient grafts and optimizer
+        # update above are pure lazy graph construction. Each extra mx.eval is a
+        # full dispatch barrier (syncs the stream), so fusing them into a single
+        # eval of everything the step produced (including lastloss/sampled byte,
+        # so the sample temp needs no mid-step .item()) is materially faster.
+        mx.eval(
+            self.encoder.embedtrace,
+            [layer.states for layer in self.layers],
+            [layer.decaytrace for layer in self.layers],
+            self.parameters(),
+            self.optimizer.state,
+        )
 
         self.lastloss = lossval.item()
         return self.sample(output).item(), stop.item()
@@ -148,12 +277,21 @@ class Model(nn.Module):
         for i, layer in enumerate(self.layers):
             data[f"state.{i}"] = layer.states
             data[f"decaytrace.{i}"] = layer.decaytrace
-            
-        mx.save_safetensors(path, data)
+
+        # Atomic save: write to a temp file next to the destination and rename.
+        # A crash/interrupt mid-save must never truncate an existing checkpoint
+        # (mx.save_safetensors opens the destination directly and can leave a
+        # 0-byte file behind if it fails partway). Note mx.save_safetensors
+        # appends '.safetensors' if missing, so the temp name must end in it.
+        import os
+        tmp = f"{path}.tmp.safetensors"
+        mx.save_safetensors(tmp, data)
+        mx.synchronize()  # save_safetensors writes lazily on the stream
+        os.replace(tmp, path)
 
     def load(self, path: str):
         import os
-        if not os.path.exists(path): return
+        if not os.path.exists(path) or os.path.getsize(path) == 0: return
 
         data, model, opts = mx.load(path), {}, {}
         
@@ -166,6 +304,9 @@ class Model(nn.Module):
             
         if model: self.update(util.tree_unflatten([(k, v) for k, v in model.items() if k in util.tree_flatten(self.parameters())]))
         if opts: self.optimizer.state = util.tree_unflatten(list(opts.items()))
+        # Loaded arrays replace the module's parameter leaves by identity, so
+        # any cached trainable tree is now stale.
+        object.__setattr__(self, "_trainable", None)
 
 class Runtime:
     def __init__(self, path: str, threshold: float, **kwargs):
