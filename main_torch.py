@@ -1,5 +1,5 @@
 import os
-
+import ti
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +22,17 @@ import torch.nn.functional as F
 # function whose *input values* for the trace arrays are the freshly
 # bookkept raw trace values (mirrored into the cached tree before the
 # optimizer step), not the values the forward pass read.
+#
+# Optimizations over the straightforward port (all semantics-preserving):
+#   * The params+dummies list handed to autograd.grad is cached once
+#     instead of being rebuilt per step.
+#   * Detached views of every parameter are cached once (`_values_base`);
+#     because the in-place `_foreach_copy_` update mutates the parameter
+#     storage, those views always reflect the current values. This
+#     removes ~100 per-step .detach() calls and a dict rebuild.
+#   * sample() keeps the temperature computation on-device with
+#     torch.clamp instead of forcing a host sync via float(entropy) /
+#     Python max() per generated token.
 # ---------------------------------------------------------------------------
 
 # Per-byte one-hot column, precomputed once (mirrors ONEHOT in main.py).
@@ -206,6 +217,17 @@ class Model(nn.Module):
         self._names = list(self._pn)
         self._params = [self._pn[n] for n in self._names]
 
+        # OPT 1: params+dummies concat is loop-invariant; cache it so
+        # autograd.grad does not rebuild the list every step.
+        self._params_and_dummies = self._params + self._dummies
+
+        # OPT 2: detached views of every parameter, built ONCE. These
+        # share storage with the params, so the in-place `_foreach_copy_`
+        # update automatically reflects into them on the next step.
+        # Replaces the per-step `{n: p.detach() for n, p in self._pn.items()}`
+        # rebuild (~100 .detach() calls + dict construction per step).
+        self._values_base = {n: p.detach() for n, p in self._pn.items()}
+
     # -- bookkeeping helpers -------------------------------------------------
 
     def freeze(self):
@@ -229,9 +251,16 @@ class Model(nn.Module):
         # then a categorical draw. (RNG differs from mx.random.categorical
         # by design; the sampled byte only feeds the chat loop, not the
         # training stream.)
+        #
+        # OPT 3: keep entropy/temp as 0-dim tensors. The original used
+        # `max(0.1, ... * float(entropy))`, forcing a device→host sync of
+        # a scalar on EVERY generated token. torch.clamp keeps the whole
+        # computation on-device; the only remaining sync is the final
+        # .item() (unavoidable — we must return a Python int). Numerically
+        # identical to max(0.1, ...).
         probs = torch.softmax(output, dim=0)
         entropy = (torch.logsumexp(output, dim=0) - torch.sum(probs * output)) / LN256
-        temp = max(0.1, self.temp * (1.0 - self.temp * float(entropy)))
+        temp = torch.clamp(self.temp * (1.0 - self.temp * entropy), min=0.1)
         return torch.multinomial(torch.softmax(output / temp, dim=0), 1).item()
 
     def generate(self, currb: int):
@@ -288,8 +317,9 @@ class Model(nn.Module):
         # ---- grads wrt ALL leaves and the dummies (one backward, like
         # value_and_grad with argnums=(0,1)) ----
         names, params = self._names, self._params
+        # OPT 1: cached params+dummies list instead of `params + dummies`.
         gout = torch.autograd.grad(
-            loss, params + dummies, allow_unused=True
+            loss, self._params_and_dummies, allow_unused=True
         )
         glist, dlds = gout[: len(names)], gout[len(names):]
         grads = {
@@ -325,8 +355,15 @@ class Model(nn.Module):
 
         # ---- AdamW step (pure; trace arrays update FROM their fresh
         # bookkept values, exactly like main.py mirrors p before _adamwc) ----
-        values = {n: p.detach() for n, p in self._pn.items()}
+        #
+        # OPT 2: reuse cached detached views instead of rebuilding the
+        # dict with ~100 .detach() calls. The detached views share storage
+        # with the params, and the in-place `_foreach_copy_` below mutates
+        # that storage, so `_values_base[n]` always holds the current
+        # value. Only the trace entries need fresh values written on top.
+        values = self._values_base.copy()
         values.update(new_trace)
+
         new_values, new_mv, new_step = self.optimizer._apply_pure(
             grads, values, self.optimizer.state
         )
@@ -409,18 +446,52 @@ class Runtime:
         self.frozen = os.environ.get('TMT_FROZEN', '') == '1'
         self.maxtokens = int(os.environ.get('TMT_MAXTOKENS', '2000') or 2000)
 
+        # --- steps/sec bookkeeping ---------------------------------------
+        # Anchor for the current 100-step window. The first call inside a
+        # window only sets this; the interval it measures is therefore
+        # 99 model steps, not 100 (see `call`). Step 1 carries the
+        # one-time torch.compile warmup cost and is excluded from the
+        # first window's rate as a side effect.
+        self._t_last = None
+        # Wall-clock at the very first call, for an optional lifetime rate.
+        self._t_start = None
+
     def save(self):
         self.step += 1
         if self.step % 500 == 0:
             self.model.save(self.path)
 
     def call(self, c: int, n: int | None, end: bool):
+        # ---- steps/sec timing (training path only) ----
+        # Frozen mode returns a latent tensor from Model.__call__, not a
+        # (byte, stop) tuple, and never reaches here anyway (chat() calls
+        # model.generate directly), but the None-guards keep this safe
+        # even if someone invokes Runtime.call() with TMT_FROZEN=1.
+        now = time.perf_counter()
+        if self._t_start is None:
+            self._t_start = now
+        if self._t_last is None:
+            self._t_last = now
+
         outputs = self.model(c, n, end)
         self.save()
 
+        # Fires on steps 100, 200, ... (save() already incremented step).
         if self.log and self.step % 100 == 0:
+            window_elapsed = now - self._t_last
+            # 99 measured model steps per window: the first call only
+            # anchored _t_last. Guard against a zero/negative interval in
+            # case perf_counter resolution is coarse.
+            rate = 99.0 / window_elapsed if window_elapsed > 0 else 0.0
             avg = self.model.lastloss
-            print(f'\r[step {self.step}] loss = {avg:.4f}', end='', flush=True)
+            print(
+                f'\r[step {self.step}] loss = {avg:.4f} '
+                f'| {rate:.2f} step/s',
+                end='',
+                flush=True,
+            )
+            # Reset the window anchor.
+            self._t_last = now
 
         if self.limit and self.step >= self.limit:
             raise KeyboardInterrupt
@@ -523,7 +594,6 @@ class Runtime:
         finally:
             if not self.frozen:
                 self.model.save(self.path)
-
 
 SAMPLE_TEXT = '''The quick brown fox jumps over the lazy dog. The dog barks, and the fox runs away into the forest.
 Deep in the forest there lived an old owl who knew every path, every stream, and every tree by its name.

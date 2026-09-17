@@ -341,6 +341,9 @@ class Runtime:
         self.step = 0
         self.limit = int(os.environ.get('TMT_STEPS', '0') or 0)
         self.log = os.environ.get('TMT_LOG', '') == '1'
+        # Timestamp of the previous log line (perf_counter), used to report
+        # steps/sec inline so training speed is visible in the log itself.
+        self.lastlog = None
         # TMT_FROZEN=1: chat is read-only (frozen weights, no training on
         # chat input, no checkpoint writes). Default: normal train-as-you-chat.
         self.frozen = os.environ.get('TMT_FROZEN', '') == '1'
@@ -356,8 +359,18 @@ class Runtime:
         self.save()
 
         if self.log and self.step % 100 == 0:
+            import sys, time
             avg = self.model.lastloss
-            print(f'\r[step {self.step}] loss = {avg:.4f}', end = '', flush = True)
+            now = time.perf_counter()
+            rate = ''
+            if self.lastlog is not None and now > self.lastlog:
+                rate = f', {100 / (now - self.lastlog):.1f} steps/s'
+            self.lastlog = now
+            # Interactive terminal: keep the in-place \r updating. Redirected
+            # to a file (train.log): one clean line per 100 steps with a wall
+            # timestamp, instead of \r-separated fragments.
+            sep = '\r' if sys.stdout.isatty() else '\n'
+            print(f'{sep}[step {self.step} @ {self.now()}{rate}] loss = {avg:.4f}', end = '', flush = True)
 
         if self.limit and self.step >= self.limit: raise KeyboardInterrupt
         return outputs
