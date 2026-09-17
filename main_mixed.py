@@ -593,11 +593,11 @@ class Runtime:
 
     def dataset(self):
         import glob, itertools
-        files = glob.glob('wikipedia_clean/**/wiki_*', recursive=True)
+        files = glob.glob('data/wikipedia_clean/**/wiki_*', recursive=True)
 
         if not files:
-            files = glob.glob('*.txt')
-            print(f'\n[wikipedia_clean/ not found, falling back to local .txt files: {files}]', flush=True)
+            files = glob.glob('data/*.txt')
+            print(f'\n[data/wikipedia_clean/ not found, falling back to data/*.txt: {files}]', flush=True)
 
         if not files:
             print('\n[no dataset found, training on built-in sample text]', flush=True)

@@ -30,7 +30,7 @@ pip install 'mlx[cpu]'
 python main.py
 ```
 
-The default entry point now uses the 4.5m config from the README (```dim = 512```, ```layers = 16```) and saves/loads weights to/from ```model.safetensors``` (created from scratch on first run). If ```wikipedia_clean/``` doesn't exist, dataset mode automatically falls back to any ```*.txt``` files in the repo (e.g. ```sample.txt```) or a small built-in sample text.
+The default entry point now uses the 4.5m config from the README (```dim = 512```, ```layers = 16```) and saves/loads weights to/from ```model.safetensors``` (created from scratch on first run). If ```data/wikipedia_clean/``` doesn't exist, dataset mode automatically falls back to any ```*.txt``` files in ```data/``` (e.g. ```data/sample.txt```) or a small built-in sample text.
 
 A few environment variables are supported for non-interactive/CI use:
 * ```TMT_MODE=0``` (dataset) or ```TMT_MODE=1``` (chat) skips the mode prompt.

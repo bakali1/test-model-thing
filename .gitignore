@@ -1,6 +1,6 @@
 /.venv/
 /typings/
-/wikipedia_clean/
+/data/wikipedia_clean/
 /CoLA/
 *.xml.bz2
 /__pycache__/
@@ -8,7 +8,8 @@
 *.DS_Store
 *.safetensors
 
-# Runtime corpus: downloaded public-domain books live in the repo root as *.txt.
-# Not committed (they're data, not code). sample.txt stays tracked for CI smoke tests.
+# Runtime corpus: downloaded public-domain books and wiki dumps live in
+# data/ as *.txt. Not committed (they're data, not code).
+# data/sample.txt stays tracked for CI smoke tests.
 *.txt
-!sample.txt
+!data/sample.txt
