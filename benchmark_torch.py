@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from main_torch import Model, AdamW
+from main_mixed import Model, AdamW
 
 
 class Classification(nn.Module):

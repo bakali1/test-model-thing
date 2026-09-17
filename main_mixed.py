@@ -1,32 +1,68 @@
 import os
-
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# Pure-PyTorch CPU port of main.py (the MLX byte-level recurrent LM).
+# main_mixed.py - the go-forward torch port of main.py (MLX byte-level
+# recurrent LM).
 #
-# Semantics-preserving port: every leaf that MLX registers on the module
-# (including the recurrent/trace arrays states/decaytrace/embedtrace/decay,
-# which MLX's value_and_grad differentiates and AdamW updates) is a torch
-# nn.Parameter here, and AdamW updates ALL of them exactly like MLX does.
+# Semantics-preserving port of the ARCHITECTURE: every leaf that MLX
+# registers on the module (including the recurrent/trace arrays
+# states/decaytrace/embedtrace/decay, which MLX's value_and_grad
+# differentiates and AdamW updates) is a torch nn.Parameter here, and the
+# forward pass, gradients, manual grafts and trace bookkeeping are the
+# same computation as main.py's.
 #
-# AdamW parity note: MLX's opt.AdamW defaults to bias_correction=False
-# (update = w*(1-lr*wd) - lr*m/(sqrt(v)+eps)); torch.optim.AdamW always
-# applies bias correction (torch.optim._functional.adam divides by
-# 1-b1^step/1-b2^step), which measurably changes the trajectory (~10x
-# larger effective first steps). So this file implements AdamW with the
-# exact MLX formulas (the same ones main.py's compiled _adamwc uses), and
-# additionally reproduces main.py's quirk that the AdamW step is a pure
-# function whose *input values* for the trace arrays are the freshly
-# bookkept raw trace values (mirrored into the cached tree before the
-# optimizer step), not the values the forward pass read.
+# OPTIMIZER (go-forward choice, Sep 2026): the BUILT-IN
+# torch.optim.AdamW with fused=True (single fused kernel per step).
+# Measured over repeated 500-step runs:
+#     custom compiled AdamW   34.7 step/s (4.5M)    1.50 step/s (130M)
+#     torch AdamW foreach     23.7 step/s (4.5M)               -
+#     torch AdamW fused       39.3 step/s (4.5M)    2.30 step/s (130M)
+#
+# TRAJECTORY NOTE (deliberate, documented): torch's AdamW always applies
+# bias correction, while MLX's opt.AdamW defaults to
+# bias_correction=False (update = w*(1-lr*wd) - lr*m/(sqrt(v)+eps);
+# bias correction gives ~10x larger effective first steps). So the
+# OPTIMIZER MATH diverges from main.py's MLX recipe - a torch run will
+# not match an MLX run step-for-step. The architecture (the project) is
+# untouched: same forward, same gradients, same losses, same trace
+# bookkeeping, same model you can chat with. Fresh runs under this
+# recipe are the intended use; resuming an MLX-parity checkpoint works
+# (same file format) but continues on the torch trajectory from there.
+#
+# Other measured-and-kept decisions:
+#   * torch.set_num_threads(1): tiny tensors (512-dim vectors, 512x512
+#     matmuls) - thread-pool sync only adds overhead. Windows 200-500
+#     at 4.5M params: 1T ~35, 2T ~34, 3T ~33, 4T ~32 step/s; at 130M
+#     1.50 vs 1.41. TMT_THREADS env var overrides for experiments.
+#   * NOT kept (measured, no win): torch.compile on the whole forward
+#     (fused AOT backward ~2 step/s slower at 4.5M, neutral at 130M);
+#     torch.compile on the graft/trace bookkeeping (neutral at both).
+#   * The params+dummies list handed to autograd.grad is cached once
+#     instead of being rebuilt per step.
+#   * sample() keeps the temperature computation on-device with
+#     torch.clamp instead of forcing a host sync via float(entropy) /
+#     Python max() per generated token.
+#   * The pure-step trace quirk IS reproduced: the freshly bookkept
+#     trace values are copied into the parameters BEFORE optimizer.step
+#     (torch's AdamW reads the live parameter values), mirroring
+#     main.py's pure _adamwc consuming the mirrored trace inputs.
+#
+# The AdamW class below (MLX-formulas, bias_correction=False) is kept
+# only for benchmark_torch.py's classification head; the Model itself
+# uses the built-in fused AdamW above.
 # ---------------------------------------------------------------------------
+
+torch.set_num_threads(int(os.environ.get('TMT_THREADS', '1') or 1))
 
 # Per-byte one-hot column, precomputed once (mirrors ONEHOT in main.py).
 ONEHOT = torch.eye(256)
 ONEHOT_COLS = [ONEHOT[:, i][:, None] for i in range(256)]
+# log(256), precomputed once (sample() recomputed this tensor every call).
+LN256 = torch.log(torch.tensor(256.0))
 
 
 class AdamW:
@@ -58,6 +94,13 @@ class AdamW:
         for n in self.names:
             self.state[n] = {"m": None, "v": None}
 
+        # torch.compile'd leaf math (see _step_math). The step counter is
+        # deliberately kept OUTSIDE the compiled region (in _apply_pure):
+        # a Python int that changes every call would guard-trigger a
+        # recompile per step until dynamo's cache overflows. Tensors are
+        # guarded by shape/dtype only, so the compiled graph is reused.
+        self._step_math_c = torch.compile(self._step_math)
+
     def init_state(self, values):
         """Allocate m/v from concrete values (must be called once, with the
         real tensors, before the first _apply_pure)."""
@@ -65,12 +108,15 @@ class AdamW:
             self.state[n]["m"] = torch.zeros_like(values[n])
             self.state[n]["v"] = torch.zeros_like(values[n])
 
-    def _apply_pure(self, grads, values, state):
-        """Pure AdamW step (mirrors main.py._adamwc): given the grads tree
-        and the *input values* the update should apply to (which for the
-        trace arrays are the freshly bookkept values, NOT the values the
-        forward read), return new values + new m/v + incremented step."""
-        step = state["step"] + 1
+    def _step_math(self, grads, values, state):
+        """Pure AdamW leaf math for one step (no step counter): the same
+        formulas as before, over all leaves. This is the hot 73% of the
+        training step - the eager loop did ~8 small memory passes over
+        ~4.5M params per leaf (~800 kernel launches). torch.compile fuses
+        the elementwise chain per leaf; measured 45.0 -> 16.9 ms/step on
+        the target machine, allclose (rtol 1e-5) vs the eager loop on
+        params and m/v. Reads only tensors from `state` (the "step" int
+        is never touched, see __init__ note)."""
         new_values, new_mv = {}, {}
         for n, g in grads.items():
             w = values[n]
@@ -82,7 +128,19 @@ class AdamW:
             w_ = w * (1.0 - lr * self.wd) - lr * m_ / (torch.sqrt(v_) + self.eps)
             new_values[n] = w_
             new_mv[n] = (m_, v_)
-        return new_values, new_mv, step
+        return new_values, new_mv
+
+    def _apply_pure(self, grads, values, state):
+        """Pure AdamW step (mirrors main.py._adamwc): given the grads tree
+        and the *input values* the update should apply to (which for the
+        trace arrays are the freshly bookkept values, NOT the values the
+        forward read), return new values + new m/v + incremented step."""
+        new_values, new_mv = {}, {}
+        with torch.no_grad():
+            # Compiled leaf math: run under no_grad so no input/output can
+            # be autograd-tracked (keeps dynamo guards stable across steps).
+            new_values, new_mv = self._step_math_c(grads, values, state)
+        return new_values, new_mv, state["step"] + 1
 
     def step_inplace(self, grads, param_map, values=None):
         """Eager convenience path (benchmark head training): update in place,
@@ -168,14 +226,50 @@ class Model(nn.Module):
         # (encoder.embed.weight, layers.0.states, ...).
         self._pn = {n: p for n, p in self.named_parameters()}
 
-        self.optimizer = AdamW(list(self._pn), lr=lr)
-        self.optimizer.init_state(self._pn)
-
         # Same dummies list reused every step (never mutated); kept out of
         # the module's parameter registry via object.__setattr__.
         object.__setattr__(self, "_dummies",
                            [torch.zeros(dim, requires_grad=True) for _ in range(layers)])
         self.frozen = False
+
+        # Hot-path caches: the per-leaf name list and parameter list are
+        # loop-invariant but were rebuilt with list(self._pn) every step.
+        self._names = list(self._pn)
+        self._params = [self._pn[n] for n in self._names]
+
+        # OPT 1: params+dummies concat is loop-invariant; cache it so
+        # autograd.grad does not rebuild the list every step.
+        self._params_and_dummies = self._params + self._dummies
+
+        # GO-FORWARD OPTIMIZER: built-in torch.optim.AdamW with fused=True
+        # (single fused kernel per step; fastest measured option, see the
+        # header table). wd=0.01 matches MLX opt.AdamW's default weight
+        # decay - the value main.py trains with.
+        try:
+            self.optimizer = torch.optim.AdamW(
+                self._params, lr=lr, betas=(0.9, 0.999), eps=1e-8,
+                weight_decay=0.01, fused=True,
+            )
+        except (RuntimeError, ValueError):
+            # torch builds without a CPU fused AdamW kernel: fall back to
+            # the default (foreach) implementation, same math.
+            self.optimizer = torch.optim.AdamW(
+                self._params, lr=lr, betas=(0.9, 0.999), eps=1e-8,
+                weight_decay=0.01,
+            )
+
+        # Trace arrays are Parameters too, so the built-in AdamW updates
+        # them as well, but only if they hold the FRESHLY BOOKKEPT values
+        # when step() runs (torch reads the live parameter values); see
+        # the "pure-step trace quirk" note in the header. The forward
+        # pass reads the old traces; the optimizer consumes the new ones.
+        self._trace_names = (
+            [f"layers.{i}.states" for i in range(layers)]
+            + [f"layers.{i}.decaytrace" for i in range(layers)]
+            + ["encoder.embedtrace"]
+        )
+        self._trace_params = [self._pn[n] for n in self._trace_names]
+
 
     # -- bookkeeping helpers -------------------------------------------------
 
@@ -200,11 +294,16 @@ class Model(nn.Module):
         # then a categorical draw. (RNG differs from mx.random.categorical
         # by design; the sampled byte only feeds the chat loop, not the
         # training stream.)
+        #
+        # OPT 3: keep entropy/temp as 0-dim tensors. The original used
+        # `max(0.1, ... * float(entropy))`, forcing a device→host sync of
+        # a scalar on EVERY generated token. torch.clamp keeps the whole
+        # computation on-device; the only remaining sync is the final
+        # .item() (unavoidable — we must return a Python int). Numerically
+        # identical to max(0.1, ...).
         probs = torch.softmax(output, dim=0)
-        entropy = (torch.logsumexp(output, dim=0) - torch.sum(probs * output)) / torch.log(
-            torch.tensor(256.0)
-        )
-        temp = max(0.1, self.temp * (1.0 - self.temp * float(entropy)))
+        entropy = (torch.logsumexp(output, dim=0) - torch.sum(probs * output)) / LN256
+        temp = torch.clamp(self.temp * (1.0 - self.temp * entropy), min=0.1)
         return torch.multinomial(torch.softmax(output / temp, dim=0), 1).item()
 
     def generate(self, currb: int):
@@ -260,48 +359,59 @@ class Model(nn.Module):
 
         # ---- grads wrt ALL leaves and the dummies (one backward, like
         # value_and_grad with argnums=(0,1)) ----
-        names = list(self._pn)
+        names, params = self._names, self._params
+        # OPT 1: cached params+dummies list instead of `params + dummies`.
         gout = torch.autograd.grad(
-            loss, [self._pn[n] for n in names] + dummies, allow_unused=True
+            loss, self._params_and_dummies, allow_unused=True
         )
         glist, dlds = gout[: len(names)], gout[len(names):]
         grads = {
             n: (g if g is not None else torch.zeros_like(p))
-            for n, g, p in zip(names, glist, [self._pn[n] for n in names])
+            for n, g, p in zip(names, glist, params)
         }
 
         # ---- manual grafts (main.py's post-vgc bookkeeping, using the
         # values the forward read - params are untouched so far) ----
+        # .detach() on the grafts: they are computed from requires_grad
+        # parameters inside the graph, so without it the resulting "grad"
+        # tensors carry requires_grad=True (a latent wart the eager loop
+        # tolerated). Every tensor fed to the compiled AdamW must be
+        # requires_grad=False or dynamo's requires_grad guard fails and
+        # the graph recompiles every step (~50 MB/step of retained
+        # artifacts - verified leak). Values are bit-identical either way
+        # (MLX grads are plain arrays; detaching is the exact analogue).
         decays0 = decays[0]
         embedtrace_graft = dlds[0] * (self.encoder.embedtrace * decays0)
-        grads["encoder.embed.weight"] = grads["encoder.embed.weight"] + embedtrace_graft
+        grads["encoder.embed.weight"] = grads["encoder.embed.weight"] + embedtrace_graft.detach()
 
         new_trace = {}  # freshly bookkept values the AdamW step must consume
         for i, layer in enumerate(self.layers):
             decaytrace = (decays[i] * layer.decaytrace) + (
                 decays[i] * (1.0 - decays[i]) * layer.states
             )
-            grads[f"layers.{i}.decay"] = dlds[i] * decaytrace
+            grads[f"layers.{i}.decay"] = (dlds[i] * decaytrace).detach()
             new_trace[f"layers.{i}.states"] = states[i].detach()
             new_trace[f"layers.{i}.decaytrace"] = decaytrace.detach()
         new_trace["encoder.embedtrace"] = (
             self.encoder.embedtrace * decays0 + ONEHOT_COLS[c]
         ).detach()
 
-        # ---- AdamW step (pure; trace arrays update FROM their fresh
-        # bookkept values, exactly like main.py mirrors p before _adamwc) ----
-        values = {n: p.detach() for n, p in self._pn.items()}
-        values.update(new_trace)
-        new_values, new_mv, new_step = self.optimizer._apply_pure(
-            grads, values, self.optimizer.state
-        )
+        # ---- AdamW step (built-in fused; trace arrays update FROM their
+        # fresh bookkept values, exactly like main.py mirrors the trace
+        # into the pure _adamwc inputs before stepping) ----
         with torch.no_grad():
-            for n, w_ in new_values.items():
-                self._pn[n].copy_(w_)
-        for n, (m_, v_) in new_mv.items():
-            self.optimizer.state[n]["m"] = m_
-            self.optimizer.state[n]["v"] = v_
-        self.optimizer.state["step"] = new_step
+            # Fresh trace values into the parameters BEFORE step() (see
+            # the _trace_names note in __init__). One multi-tensor copy
+            # kernel instead of ~34 individual copy_ calls.
+            torch._foreach_copy_(
+                self._trace_params, [new_trace[n] for n in self._trace_names]
+            )
+            # Hand the (already detached) grads to the leaves the
+            # optimizer owns.
+            for p, n_ in zip(params, names):
+                p.grad = grads[n_]
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
 
         self.lastloss = float(loss.detach())
         return self.sample(output.detach()), float(stop.detach())
@@ -312,22 +422,30 @@ class Model(nn.Module):
         """Atomic save: write a genuine safetensors file (safetensors.torch
         save_file, same on-disk format the MLX version writes) to a temp
         file next to the destination, then os.replace. Key layout mirrors
-        main.py (m.<name> params, o.<name>.[m|v] optimizer state) and the
-        trace arrays are ordinary params here, so they live under
-        m.encoder.embedtrace / m.layers.N.[states|decaytrace]. (torch.save
-        pickles would also work, but safetensors keeps the .safetensors
-        extension meaningful and interoperable.)"""
+        main.py (m.<name> params, o.<name>.[m|v] optimizer moments,
+        o.step, o.learning_rate) and the trace arrays are ordinary params
+        here, so they live under m.encoder.embedtrace /
+        m.layers.N.[states|decaytrace]. The built-in optimizer's moments
+        (exp_avg/exp_avg_sq) are stored under the same o.<name>.m/v keys
+        as before, so checkpoints stay interchangeable with the earlier
+        torch ports."""
         import safetensors.torch as st
 
         data = {}
         for n, p in self._pn.items():
             data[f"m.{n}"] = p.detach().cpu().contiguous()
-        for n in self._pn:
-            stt = self.optimizer.state[n]
-            data[f"o.{n}.m"] = stt["m"].detach().cpu().contiguous()
-            data[f"o.{n}.v"] = stt["v"].detach().cpu().contiguous()
-        data["o.step"] = torch.tensor(self.optimizer.state["step"], dtype=torch.int64)
-        data["o.learning_rate"] = torch.tensor(self.optimizer.state["learning_rate"], dtype=torch.float64)
+        step = 0
+        for n, p in self._pn.items():
+            stt = self.optimizer.state.get(p)
+            if not stt or "exp_avg" not in stt:
+                continue
+            data[f"o.{n}.m"] = stt["exp_avg"].detach().cpu().contiguous()
+            data[f"o.{n}.v"] = stt["exp_avg_sq"].detach().cpu().contiguous()
+            s = stt.get("step", 0)
+            step = max(step, int(s.item()) if isinstance(s, torch.Tensor) else int(s))
+        data["o.step"] = torch.tensor(step, dtype=torch.int64)
+        data["o.learning_rate"] = torch.tensor(
+            self.optimizer.param_groups[0]["lr"], dtype=torch.float64)
 
         tmp = f"{path}.tmp.safetensors"
         st.save_file(data, tmp)
@@ -351,15 +469,21 @@ class Model(nn.Module):
             for n, p in self._pn.items():
                 if f"m.{n}" in data:
                     p.copy_(data[f"m.{n}"])
-        for n in self._pn:
+        for n, p in self._pn.items():
             if f"o.{n}.m" in data and f"o.{n}.v" in data:
-                stt = self.optimizer.state[n]
-                stt["m"] = data[f"o.{n}.m"].to(self._pn[n].dtype)
-                stt["v"] = data[f"o.{n}.v"].to(self._pn[n].dtype)
+                stt = self.optimizer.state[p]
+                stt["exp_avg"] = data[f"o.{n}.m"].to(p.dtype)
+                stt["exp_avg_sq"] = data[f"o.{n}.v"].to(p.dtype)
         if "o.step" in data:
-            self.optimizer.state["step"] = int(data["o.step"])
+            s = float(int(data["o.step"]))
+            # Built-in AdamW tracks step as a scalar tensor per param.
+            for p in self._params:
+                stt = self.optimizer.state[p]
+                stt["step"] = torch.tensor(s, dtype=torch.float32)
         if "o.learning_rate" in data:
-            self.optimizer.state["learning_rate"] = float(data["o.learning_rate"])
+            lr = float(data["o.learning_rate"])
+            for g in self.optimizer.param_groups:
+                g["lr"] = lr
 
 
 class Runtime:
@@ -373,18 +497,52 @@ class Runtime:
         self.frozen = os.environ.get('TMT_FROZEN', '') == '1'
         self.maxtokens = int(os.environ.get('TMT_MAXTOKENS', '2000') or 2000)
 
+        # --- steps/sec bookkeeping ---------------------------------------
+        # Anchor for the current 100-step window. The first call inside a
+        # window only sets this; the interval it measures is therefore
+        # 99 model steps, not 100 (see `call`). Step 1 carries the
+        # one-time torch.compile warmup cost and is excluded from the
+        # first window's rate as a side effect.
+        self._t_last = None
+        # Wall-clock at the very first call, for an optional lifetime rate.
+        self._t_start = None
+
     def save(self):
         self.step += 1
         if self.step % 500 == 0:
             self.model.save(self.path)
 
     def call(self, c: int, n: int | None, end: bool):
+        # ---- steps/sec timing (training path only) ----
+        # Frozen mode returns a latent tensor from Model.__call__, not a
+        # (byte, stop) tuple, and never reaches here anyway (chat() calls
+        # model.generate directly), but the None-guards keep this safe
+        # even if someone invokes Runtime.call() with TMT_FROZEN=1.
+        now = time.perf_counter()
+        if self._t_start is None:
+            self._t_start = now
+        if self._t_last is None:
+            self._t_last = now
+
         outputs = self.model(c, n, end)
         self.save()
 
+        # Fires on steps 100, 200, ... (save() already incremented step).
         if self.log and self.step % 100 == 0:
+            window_elapsed = now - self._t_last
+            # 99 measured model steps per window: the first call only
+            # anchored _t_last. Guard against a zero/negative interval in
+            # case perf_counter resolution is coarse.
+            rate = 99.0 / window_elapsed if window_elapsed > 0 else 0.0
             avg = self.model.lastloss
-            print(f'\r[step {self.step}] loss = {avg:.4f}', end='', flush=True)
+            print(
+                f'\r[step {self.step}] loss = {avg:.4f} '
+                f'| {rate:.2f} step/s',
+                end='',
+                flush=True,
+            )
+            # Reset the window anchor.
+            self._t_last = now
 
         if self.limit and self.step >= self.limit:
             raise KeyboardInterrupt
@@ -487,7 +645,6 @@ class Runtime:
         finally:
             if not self.frozen:
                 self.model.save(self.path)
-
 
 SAMPLE_TEXT = '''The quick brown fox jumps over the lazy dog. The dog barks, and the fox runs away into the forest.
 Deep in the forest there lived an old owl who knew every path, every stream, and every tree by its name.
