@@ -1,0 +1,705 @@
+# numpy port of test-model-thing (TMT)
+# Preserves the architecture: latent-space prediction, RTU (recurrent trace
+# unit) layers, byte I/O, continuous streaming, test-time training.
+#
+# Why not MLX: MLX only accelerates via Metal (Apple Silicon) or CUDA (NVIDIA).
+# On anything else it falls back to an unoptimized CPU path (~2 GFLOPS here).
+# numpy + OpenBLAS uses the x86 CPU properly (~50 GFLOPS on this Sandy Bridge),
+# so the same architecture runs ~20x faster without any GPU.
+#
+# Training uses minibatching (B independent byte-streams in lockstep):
+#   - matvecs become GEMMs that OpenBLAS multithreads
+#   - the dense AdamW update amortizes over B bytes instead of 1
+# Per-stream recurrence, traces, and losses are mathematically identical to
+# main.py; the optimizer just sees the summed gradient of B bytes per step.
+#
+# CLI is compatible with main.py; checkpoints are .npz instead of .safetensors.
+
+import argparse
+import glob
+import itertools
+import os
+import random
+import sys
+import time
+from datetime import datetime
+
+import numpy as np
+
+# Trace truncation tolerance: ring lag k is kept while its weight (~decay**k)
+# is above this. 1e-7 reproduces the dense float32 trace (K=25 at decay 0.5);
+# 1e-4 (K=15) sits ~4 orders below the stochastic gradient's own noise and is
+# ~25% cheaper in the credit, so it is the default.
+RING_TOL = float(os.environ.get("TMT_RING_TOL", "1e-4"))
+
+# The ring's credit is a scatter: dembed[row] += vals[i] for B*K rows. numpy's
+# np.add.at costs ~29 ns/element and a one-hot BLAS matmul wastes 256x the FLOPs;
+# a compiled tight loop does the minimum work with contiguous row accesses and
+# measured ~5-7x faster than the BLAS form. Optional: falls back to BLAS if numba
+# is unavailable, so the port still runs on numpy alone.
+try:
+    from numba import njit as _njit
+
+    @_njit(cache=True)
+    def _scatter_credit(dembed, rows, vals):
+        n = rows.shape[0]
+        dim = vals.shape[1]
+        for i in range(n):
+            r = rows[i]
+            for d in range(dim):
+                dembed[r, d] += vals[i, d]
+except Exception:                     # pragma: no cover
+    _scatter_credit = None
+rng = np.random.default_rng()
+F = np.float32
+
+
+def sigmoid(x):
+    # overflow-safe: sigmoid(x) = e^x/(1+e^x) for x<0, 1/(1+e^-x) for x>=0
+    out = np.empty_like(x)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
+
+
+def batch_layernorm(x, g, b, eps=F(1e-5)):
+    """x: (B, dim). Returns normalized (B, dim) + cache."""
+    mu = x.mean(axis=1, keepdims=True)
+    xv = x.var(axis=1, keepdims=True)
+    inv = 1.0 / np.sqrt(xv + eps)
+    xhat = (x - mu) * inv
+    return g * xhat + b, (xhat, inv, g)
+
+
+def batch_layernorm_backward(dy, cache):
+    """dy: (B, dim). Returns dx (B, dim), dg (dim,), db (dim,)."""
+    xhat, inv, g = cache
+    dg = (dy * xhat).sum(axis=0)
+    db = dy.sum(axis=0)
+    dxhat = dy * g
+    n = xhat.shape[1]
+    dx = inv * (dxhat - dxhat.mean(axis=1, keepdims=True)
+                - (xhat * (dxhat * xhat).sum(axis=1, keepdims=True)) / n)
+    return dx.astype(F), dg.astype(F), db.astype(F)
+
+
+class Layer:
+    """One recurrent trace unit (RTU) layer, faithful to main.py."""
+
+    def __init__(self, dim):
+        self.dim = dim
+        lim = 1.0 / np.sqrt(dim)
+        self.W = rng.uniform(-lim, lim, (dim, dim)).astype(F)
+        self.g = np.ones(dim, F)
+        self.b = np.zeros(dim, F)
+        self.decay = rng.uniform(-lim, lim, (dim,)).astype(F)
+
+    def adopt_views(self, W, g, b, decay):
+        """Rebind params to views into the model's flat buffer."""
+        self.W, self.g, self.b, self.decay = W, g, b, decay
+
+    def forward(self, enc, x_in, states):
+        """enc, x_in, states: (B, dim). Returns new x, new_states, decay, cache."""
+        decay = sigmoid(self.decay)                      # (dim,)
+        state = states * decay + enc                     # (B, dim)
+        h, cache = batch_layernorm(state, self.g, self.b)
+        z = h @ self.W.T                                 # GEMM (B, dim)
+        sig = sigmoid(z)
+        y = z * sig                                      # silu
+        return x_in + y, state, decay, (z, sig, h, cache)
+
+    def backward(self, dx_out, cache):
+        """dx_out: (B, dim). Returns dx_in, dW, dg, db, dstate."""
+        z, sig, h, ln_cache = cache
+        dx_in = dx_out
+        dz = dx_out * sig * (1.0 + z * (1.0 - sig))      # silu'
+        dW = dz.T @ h                                    # GEMM (dim, dim)
+        dh = dz @ self.W                                 # GEMM (B, dim)
+        dstate, dg, db = batch_layernorm_backward(dh, ln_cache)
+        return dx_in, dW, dg, db, dstate
+
+
+class Model:
+    def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None):
+        self.dim = dim
+        self.layercount = layers
+        self.temp = temp
+        self.lr = F(lr)
+        self.b1, self.b2, self.eps, self.wd = F(0.9), F(0.999), F(1e-8), F(0.01)
+        self.t = 0
+        self.bytes_seen = 0          # exact training bytes, saved in checkpoints
+
+        lim = 1.0 / np.sqrt(dim)
+        # Ring-buffer trace: retain lag k while its weight (~decay**k) is above
+        # RING_TOL. The dense (B,256,dim) eligibility matrix only has O(K)
+        # non-negligible rows, so the ring is the same information in 256/K less
+        # memory. RING_TOL=1e-7 reproduces float32 exactly; 1e-4 is still 4 orders
+        # below the stochastic gradient's own noise and cuts the GEMM cost ~1.7x.
+        dmax = float(sigmoid(np.array([decay_init if decay_init is not None else lim]))[0])
+        self.ring_k = int(min(256, np.ceil(np.log(RING_TOL) / np.log(max(dmax, 1e-3)))))
+        init = {
+            "embed": (rng.standard_normal((256, dim)) * 0.1).astype(F),
+            "Wd": rng.uniform(-lim, lim, (256, dim)).astype(F),
+            "bd": np.zeros(256, F),
+            "Ws": rng.uniform(-lim, lim, (dim,)).astype(F),
+            "bs": np.zeros(1, F),
+        }
+        for i in range(layers):
+            init[f"layer{i}.W"] = rng.uniform(-lim, lim, (dim, dim)).astype(F)
+            init[f"layer{i}.g"] = np.ones(dim, F)
+            init[f"layer{i}.b"] = np.zeros(dim, F)
+            # decay_init is pre-sigmoid. The default (uniform ~0) gives
+            # sigmoid ~= 0.5, a one-byte memory half-life: the recurrent state
+            # is then too short-lived for the decay param to get a coherent
+            # gradient, which is why decay sits at 0.5 forever in both this
+            # port and main.py. +3 => sigmoid 0.953, ~14-byte half-life.
+            # Always draw the uniform first, even when overridden, so that an
+            # A/B against the default shares one RNG stream (otherwise np.full
+            # skips a draw and every later layer gets different weights).
+            d0 = rng.uniform(-lim, lim, (dim,)).astype(F)
+            if decay_init is not None:
+                d0[:] = decay_init
+            init[f"layer{i}.decay"] = d0
+
+        # flat parameter buffer + grads + adam moments (contiguous, in-place ops)
+        self.shapes = [(k, v.shape) for k, v in init.items()]
+        n = sum(int(np.prod(s)) for _, s in self.shapes)
+        self.theta = np.concatenate([init[k].ravel() for k, _ in self.shapes])
+        self.grads = np.zeros(n, F)
+        self.m = np.zeros(n, F)
+        self.v = np.zeros(n, F)
+
+        # bind all params as views into theta
+        self.views, self.gviews = {}, {}
+        off = 0
+        for name, shape in self.shapes:
+            size = int(np.prod(shape))
+            self.views[name] = self.theta[off:off + size].reshape(shape)
+            self.gviews[name] = self.grads[off:off + size].reshape(shape)
+            off += size
+
+        self.embed = self.views["embed"]
+        self.Wd, self.bd = self.views["Wd"], self.views["bd"]
+        self.Ws, self.bs = self.views["Ws"], self.views["bs"]
+        self.layers = [Layer(dim) for _ in range(layers)]
+        for i, l in enumerate(self.layers):
+            l.adopt_views(self.views[f"layer{i}.W"], self.views[f"layer{i}.g"],
+                          self.views[f"layer{i}.b"], self.views[f"layer{i}.decay"])
+
+        # recurrent state + traces; stream 0 is the persistent "memory" stream
+        self.B = 1
+        self.new_states(1)
+
+    def new_states(self, B):
+        self.B = B
+        self.ring_b = np.zeros((B, self.ring_k), np.int64)      # byte per lag
+        self.ring_rows = self.ring_b.ravel()                    # view, kept fresh
+        # one-hot selector, only needed by the BLAS fallback (unused with numba)
+        self.ring_M = (np.zeros((256, B * self.ring_k), F)
+                       if _scatter_credit is None else None)
+        self.ring_vals = np.zeros((B, self.ring_k, self.dim), F)   # scratch, no per-step alloc
+        for l in self.layers:
+            l.states = np.zeros((B, self.dim), F)
+            l.decaytrace = np.zeros((B, self.dim), F)
+            l.ring_w = np.zeros((B, self.ring_k, self.dim), F)
+
+    def params(self):
+        return self.views
+
+    def reset(self):
+        self.ring_b[:] = 0
+        for l in self.layers:
+            l.states[:] = 0
+            l.decaytrace[:] = 0
+            l.ring_w[:] = 0
+
+    def count(self):
+        per_layer = self.dim * self.dim + 3 * self.dim
+        return (256 * self.dim + self.layercount * per_layer +
+                256 * self.dim + 256 + self.dim + 1)
+
+    # ---------- inference (single stream, frozen) ----------
+    def frozen_step(self, c):
+        s = 0  # stream 0 carries persistent memory
+        enc = self.embed[c]
+        x = enc[None, :]
+        for l in self.layers:
+            x, new_state, _, _ = l.forward(enc.reshape(1, -1), x, l.states[s:s + 1])
+            l.states[s:s + 1] = new_state
+        output = (x[0] @ self.Wd.T + self.bd)
+        stop = sigmoid(x[0] @ self.Ws + self.bs)[0]
+        return self.sample(output), stop
+
+    def sample(self, output):
+        probs = np.exp(output - output.max())
+        probs /= probs.sum()
+        entropy = -(probs * np.log(probs + 1e-8)).sum() / np.log(256.0)
+        temp = max(0.1, self.temp * (1.0 - self.temp * entropy))
+        logits = output / temp
+        p = np.exp(logits - logits.max())
+        p /= p.sum()
+        return int(rng.choice(256, p=p))
+
+    # ---------- training (B streams in lockstep) ----------
+    def step_batch(self, cs, ns, ends):
+        """cs, ns, ends: lists of length B. One AdamW update for B byte-steps."""
+        self.t += 1
+        B = len(cs)
+        self.bytes_seen += B
+        c_arr = np.asarray(cs, np.int64)
+        n_arr = np.asarray(ns, np.int64)
+        end_arr = np.asarray(ends, F)
+
+        enc = self.embed[c_arr]                          # (B, dim)
+
+        # ---- forward ----
+        x = enc
+        caches, states, decays = [], [], []
+        for l in self.layers:
+            x, state, decay, cache = l.forward(enc, x, l.states)
+            caches.append(cache)
+            states.append(state)
+            decays.append(decay)
+
+        output = x @ self.Wd.T + self.bd                 # (B, 256)
+        stop = sigmoid(x @ self.Ws + self.bs[0])         # (B,)
+
+        # ---- loss components (per stream) ----
+        xv = x.var(axis=1) + F(1e-4)
+        var_active = (1.0 - np.sqrt(xv)) > 0
+        tgt = self.embed[n_arr]                          # (B, dim)
+        lse = output.max(axis=1, keepdims=True) + np.log(
+            np.exp(output - output.max(axis=1, keepdims=True)).sum(axis=1, keepdims=True))
+        ce = (lse[:, 0] - output[np.arange(B), n_arr])
+        stop_t = end_arr
+        loss = float((np.where(var_active, 1.0 - np.sqrt(xv), 0.0).sum()
+                      + ((x - tgt) ** 2).sum() / self.dim
+                      + ce.sum() + ((stop - stop_t) ** 2).sum()) / B)
+        # CE component alone (nats/byte), so training logs are comparable to
+        # eval_npz's "model" line; the total loss also carries the variance
+        # hinge, the embed-MSE and the stop-head MSE.
+        self.last_ce = float(ce.mean())
+
+        # ---- backward: decoder ----
+        doutput = np.exp(output - lse)                   # softmax
+        doutput[np.arange(B), n_arr] -= 1.0
+        dWd = doutput.T @ x                              # (256, dim) GEMM
+        dbd = doutput.sum(axis=0)
+        dx = doutput @ self.Wd                           # (B, dim)
+
+        dstop = 2.0 * (stop - stop_t) * stop * (1.0 - stop)
+        dWs = (dstop[:, None] * x).sum(axis=0)           # (dim,)
+        dbs = dstop.sum(axis=0, keepdims=True)
+        dx += dstop[:, None] * self.Ws[None, :]
+
+        # variance hinge loss grad (masked where inactive)
+        dvar = np.where(var_active, -1.0 / (2.0 * np.sqrt(xv)), 0.0)[:, None]
+        dx += (dvar * 2.0 * (x - x.mean(axis=1, keepdims=True)) / self.dim).astype(F)
+
+        # MSE grad (per-stream mean over dim)
+        dx += (2.0 * (x - tgt) / self.dim).astype(F)
+
+        # ---- propagate through layers ----
+        denc = dx.copy()
+        lw, lg, lb = [], [], []
+        lgrads = []
+        for i in reversed(range(self.layercount)):
+            l = self.layers[i]
+            dx_in, dW, dg, db, dstate = l.backward(dx, caches[i])
+            dx = dx_in
+            denc += dstate
+            lw.append(dW); lg.append(dg); lb.append(db)
+            lgrads.append(dstate)                        # == dlds per stream
+        lgrads.reverse()
+        lw.reverse(); lg.reverse(); lb.reverse()
+
+        # ---- trace updates (ring buffer, BLAS credit) ----
+        # dembed[v] += sum over retained lags landing on byte v of w_k * dlds.
+        # Doing that with np.add.at costs ~29 ns/element (unbuffered scatter);
+        # instead build a (256, B*K) one-hot selector and let BLAS do the
+        # reduction (~1 ns/element). The selector's byte indices are shared by all
+        # layers, so it is built once per step.
+        dembed = np.zeros((256, self.dim), F)
+        decay_grads = []
+        K = self.ring_k
+        p = (self.t - 1) % K
+        scratch = self.ring_vals
+        if _scatter_credit is None:                 # BLAS fallback needs the selector
+            M = self.ring_M
+            M.fill(0)
+            M[self.ring_rows, np.arange(B * K)] = 1.0
+        for i, l in enumerate(self.layers):
+            dlds = lgrads[i]                             # (B, dim)
+            w = l.ring_w                                 # (B, K, dim) lag weights
+            # main.py credits the trace to the FULL (256, dim) embedding matrix:
+            #   grads["encoder"]["embed"]["weight"] += dlds * (embedtrace * decay)
+            # using the pre-update trace. Reading only row c_b drops the temporal
+            # credit for every byte except the current one (and double-counts it).
+            #
+            # The (B,256,dim) bookkeeping is memory-bound (~117 MB moved per layer
+            # per step), so: compute the decayed trace ONCE and reuse it for both
+            # the credit and the update (it used to be computed twice), sum across
+            # streams with einsum (bit-identical to the broadcast+sum it replaces,
+            # but without materialising a (B,256,dim) product), and add this byte's
+            # one-hot in place instead of building a (B,256,1) array.
+            # decay first: the dense credit uses (T_{t-1} * decay_t), not T_{t-1}
+            w *= decays[i]
+            np.multiply(w, dlds[:, None, :], out=scratch)
+            sv = scratch.reshape(B * K, self.dim)
+            if _scatter_credit is not None:
+                _scatter_credit(dembed, self.ring_rows, sv)
+            else:
+                np.add(dembed, M @ sv, out=dembed)
+            w[:, p] = 1.0        # this byte becomes lag 1 (empty product = 1)
+            l.decaytrace = (decays[i][None, :] * l.decaytrace +
+                            decays[i][None, :] * (1.0 - decays[i][None, :]) * l.states)
+            decay_grads.append((dlds * l.decaytrace).sum(axis=0))
+            l.states = states[i]                         # stop_gradient
+        self.ring_b[:, p] = c_arr
+
+        gv = self.gviews
+        np.add.at(dembed, c_arr, denc)                   # autograd part
+        gv["embed"][:] = dembed
+        gv["Wd"][:] = dWd
+        gv["bd"][:] = dbd
+        gv["Ws"][:] = dWs
+        gv["bs"][:] = dbs
+        for i in range(self.layercount):
+            gv[f"layer{i}.W"][:] = lw[i]
+            gv[f"layer{i}.g"][:] = lg[i]
+            gv[f"layer{i}.b"][:] = lb[i]
+            gv[f"layer{i}.decay"][:] = decay_grads[i]
+
+        # ---- fused AdamW (in-place, one pass over 4.5M params) ----
+        t = self.t
+        th, gr, m, v = self.theta, self.grads, self.m, self.v
+        m *= self.b1; m += (1 - self.b1) * gr
+        v *= self.b2; v += (1 - self.b2) * (gr * gr)
+        np.sqrt(v, out=v)
+        th -= self.lr * (m * (1 / (1 - self.b1 ** t)) /
+                         (v * (1 / (1 - self.b2 ** t)) + self.eps) + self.wd * th)
+
+        return loss
+
+    # ---------- persistence ----------
+    def save(self, path):
+        data = {k: v for k, v in self.params().items()}
+        for i, l in enumerate(self.layers):
+            data[f"state.{i}"] = l.states
+            data[f"decaytrace.{i}"] = l.decaytrace
+        data["t"] = np.array(self.t, np.int64)
+        data["bytes"] = np.array(self.bytes_seen, np.int64)
+        data["m"] = self.m
+        data["v"] = self.v
+        data["B"] = np.array(self.B, np.int64)
+        tmp = path + ".tmp.npz"
+        np.savez(tmp, **data)
+        os.replace(tmp, path)
+
+    def load(self, path):
+        if not os.path.exists(path):
+            return
+        d = np.load(path)
+        if "t" in d:
+            self.t = int(d["t"])
+        # Training-byte counter. Checkpoints saved before this field existed
+        # don't have it; fall back to t*B, which is exact unless the batch size
+        # changed at some point in the model's history.
+        self.bytes_seen = int(d["bytes"]) if "bytes" in d else self.t * self.B
+        if "m" in d:
+            if d["m"].shape != self.m.shape:
+                raise ValueError(
+                    f"checkpoint {path} holds {int(d['m'].shape[0]):,} parameters but "
+                    f"this model was built with {self.m.size:,} "
+                    f"(dim={self.dim}, layers={self.layercount}); pass matching "
+                    f"--dim/--layers")
+            self.m[:] = d["m"]
+            self.v[:] = d["v"]
+        # ring_k is sized from the *init* decay. If this checkpoint carries
+        # larger decay values, the first dropped lag keeps a nonzero weight
+        # (sigma^K) and the embed credit loses that share. Note: only the embed
+        # credit is truncated -- the decay gradient uses the dense decaytrace,
+        # so timescale learning itself is unaffected. Warn on the absolute
+        # magnitude, not the ratio to the requested tolerance.
+        # (checked at the END of load, once theta holds the loaded values)
+
+        off = 0
+        for name, shape in self.shapes:
+            if name in d:
+                size = int(np.prod(shape))
+                self.theta[off:off + size] = d[name].astype(F).ravel()
+            off += size
+        # Recurrent buffers are shaped (B, ...). Adapt their row count to the
+        # caller's self.B instead of adopting the checkpoint's B: a B=32
+        # checkpoint loaded into a B=1 chat step used to broadcast silently and
+        # then die in the trace update. Row 0 (the persistent memory stream) is
+        # preserved; extra streams are zero-padded.
+        for i, l in enumerate(self.layers):
+            for key, attr in ((f"state.{i}", "states"),
+                              (f"decaytrace.{i}", "decaytrace")):
+                if key not in d:
+                    continue
+                v = d[key].astype(F)
+                if v.shape[0] != self.B:
+                    resized = np.zeros((self.B,) + v.shape[1:], F)
+                    n = min(self.B, v.shape[0])
+                    resized[:n] = v[:n]
+                    v = resized
+                setattr(l, attr, v)
+
+        if self.layers:
+            sig_max = max(float(sigmoid(l.decay).max()) for l in self.layers)
+            cut = sig_max ** self.ring_k
+            if cut > 0.01:
+                print(f"[warn] trace truncation: heaviest dim (sigma={sig_max:.3f}) "
+                      f"still carries {cut:.1%} of its gradient at lag {self.ring_k} "
+                      f"(tol {RING_TOL:g}); raise TMT_RING_TOL for more lags",
+                      file=sys.stderr)
+
+
+class Runtime:
+    def __init__(self, path, threshold=0.35, batch=8, maxtokens=None,
+                 save_every=1000, max_steps=0, **kw):
+        self.model = Model(**kw)
+        self.path = path
+        self.threshold = threshold
+        self.batch = batch
+        # Stop training after this many steps (0 = never). Same as main.py's
+        # TMT_STEPS; makes two runs comparable at an exact step budget.
+        self.max_steps = max_steps
+        # Steps between checkpoint writes. A B=32 checkpoint is ~322 MB (the
+        # per-layer (B,256,dim) embedtrace dominates), so saving every 100
+        # steps -- the old hardcoded interval -- meant ~900 GB written per day
+        # of training. 0 disables periodic saves (exit/^C still saves).
+        self.save_every = save_every
+        # Same guard as main.py: the stop head is a learned signal and can sit
+        # below the threshold forever, so generation also needs a hard cap.
+        self.maxtokens = (int(os.environ.get("TMT_MAXTOKENS", "2000") or 2000)
+                          if maxtokens is None else maxtokens)
+        self.step = 0
+        self.prevtime = None
+
+    def save(self):
+        self.step += 1
+        if self.step % 100 == 0:
+            self.model.save(self.path)
+
+    def write(self, b):
+        sys.stdout.buffer.write(bytes([b]))
+        sys.stdout.flush()
+
+    def chat(self, save, frozen):
+        model = self.model
+        model.new_states(1)
+        model.load(self.path)
+        print()
+        while True:
+            try:
+                text = input(f"\n[{self.now()} | "
+                             f"{0 if self.prevtime is None else time.time() - self.prevtime:.4f}s]\nUser >> ")
+            except EOFError:
+                print("\n[EOF, exiting chat]")
+                break
+            self.prevtime = time.time()
+            data = (text + "\n").encode("utf-8")
+            t0 = time.time()
+            for i, (c, n) in enumerate(itertools.pairwise(data)):
+                self.ingest(c, n, i == len(data) - 2, save, frozen)
+            rate = (len(data) - 1) / max(1e-9, time.time() - t0)
+            print(f"\n[{self.now()}] (ingest {rate:.0f} B/s)\nModel >> ", end="", flush=True)
+            b = data[-1]
+            generated = 0
+            while True:
+                b, stop = model.frozen_step(b)
+                self.write(b)
+                generated += 1
+                if stop > self.threshold:
+                    print()
+                    break
+                if generated >= self.maxtokens:
+                    print(f"\n[stopped: max tokens reached ({self.maxtokens})]")
+                    break
+            if save and not frozen:
+                model.save(self.path)
+
+    def ingest(self, c, n, end, save, frozen):
+        if frozen:
+            model = self.model
+            b, stop = model.frozen_step(c)
+        else:
+            self.model.step_batch([c], [n], [end])
+            b, stop = None, None
+        if save and not frozen:
+            self.save()
+        return b, stop
+
+    @staticmethod
+    def make_streams(data, B):
+        """Split `data` into B byte-streams by round-robining whole lines.
+
+        Returns (streams, ends) where ends[j][t] is the stop-head target for
+        step t of stream j: True on the byte-pair that finishes a line. main.py
+        streams line-by-line and so flags one end per line; slicing a 40 MB file
+        into B contiguous chunks instead flagged exactly one end per stream
+        (~6.5M steps), which starves the stop head and teaches it to never
+        stop."""
+        lines = data.splitlines(keepends=True)
+        buckets = [lines[i::B] for i in range(B)]
+        if any(not bucket for bucket in buckets):
+            # Fewer lines than streams: fall back to contiguous chunks.
+            chunk = len(data) // B
+            streams = [data[i * chunk:(i + 1) * chunk] for i in range(B)]
+            ends = []
+            for s in streams:
+                e = np.zeros(len(s), bool)
+                if len(s) >= 2:
+                    e[len(s) - 2] = True
+                ends.append(e)
+            return streams, ends
+
+        streams, ends = [], []
+        for bucket in buckets:
+            s = b"".join(bucket)
+            e = np.zeros(len(s), bool)
+            off = 0
+            for line in bucket:
+                off += len(line)
+                if len(line) >= 2:       # 1-byte lines yield no byte-pair
+                    e[off - 2] = True
+            streams.append(s)
+            ends.append(e)
+        return streams, ends
+
+    def train(self, save, frozen, dataset):
+        model = self.model
+        B = self.batch
+        model.new_states(B)   # shape buffers before load, so load() adapts rows
+        model.load(self.path)  # to B and keeps row 0's trained memory
+        files = glob.glob(dataset, recursive=True)
+        if not files:
+            raise FileNotFoundError(f"Could not find training files: {dataset!r}")
+        random.shuffle(files)
+        total = 0
+        loss_win = ce_win = 0.0          # windowed means between progress prints
+        n_win = 0
+        t0 = time.time()
+        while True:
+            for file in files:
+                with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                    data = f.read().encode("utf-8", errors="ignore")
+                if len(data) < B * 4:
+                    continue
+                streams, endss = self.make_streams(data, B)
+                L = min(len(s) for s in streams) - 1
+                if L < 1:
+                    continue
+                for t in range(L):
+                    cs = [s[t] for s in streams]
+                    ns = [s[t + 1] for s in streams]
+                    loss_win += model.step_batch(cs, ns, [e[t] for e in endss])
+                    ce_win += model.last_ce
+                    n_win += 1
+                    total += B
+                    if self.max_steps and model.t >= self.max_steps:
+                        print(f"  [reached step budget {self.max_steps}, stopping]")
+                        return
+                    if save and self.save_every and model.t % self.save_every == 0:
+                        model.save(self.path)
+                    if total % (B * 100) == 0:
+                        dt = time.time() - t0
+                        print(f"  {total} bytes | {total / dt:.1f} B/s | step {model.t} | "
+                              f"loss {loss_win / n_win:.3f} | ce {ce_win / n_win:.3f}",
+                              flush=True)
+                        loss_win = ce_win = 0.0
+                        n_win = 0
+
+    def now(self):
+        return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
+
+    def __call__(self, mode, dataset, save, frozen):
+        print()
+        crashed = False
+        try:
+            if mode == "train":
+                self.train(save, frozen, dataset)
+            elif mode == "chat":
+                self.chat(save, frozen)
+            elif mode == "bench":
+                self.bench(frozen)
+        except Exception:
+            # A hard error can leave states/traces half-updated: don't overwrite
+            # a good checkpoint with that. KeyboardInterrupt is a BaseException,
+            # so ^C still saves (that is how a train run is meant to end).
+            crashed = True
+            raise
+        finally:
+            # Frozen runs are read-only, matching main.py: never rewrite the
+            # checkpoint from a frozen chat (it would also shrink the state
+            # rows to B=1).
+            if save and not frozen and not crashed and mode in ("train", "chat"):
+                self.model.save(self.path)
+
+    def bench(self, frozen):
+        model = self.model
+        text = ("The quick brown fox jumps over the lazy dog. "
+                "Machine learning models learn patterns from data.\n").encode()
+        if frozen:
+            N = 300
+            model.new_states(1)
+            t0 = time.time()
+            for i in range(N):
+                model.frozen_step(97 + (i % 26))
+            dt = time.time() - t0
+            print(f"params: {model.count():,}")
+            print(f"frozen: {dt / N * 1000:.1f} ms/byte -> {N / dt:.1f} B/s (MLX: 12.1 B/s)")
+        else:
+            B = self.batch
+            model.new_states(B)
+            stream = (text * ((B * 300) // len(text) + 1))
+            chunk = len(stream) // B
+            streams = [stream[i * chunk:(i + 1) * chunk] for i in range(B)]
+            N = min(chunk - 1, 300)
+            t0 = time.time()
+            for t in range(N):
+                model.step_batch([s[t] for s in streams], [s[t + 1] for s in streams], [False] * B)
+            dt = time.time() - t0
+            print(f"params: {model.count():,}")
+            print(f"train (batch {B}): {dt / N * 1000:.1f} ms/step -> {N * B / dt:.1f} B/s (MLX: 6.1 B/s)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="test-model-thing (numpy port)")
+    parser.add_argument("path")
+    parser.add_argument("mode", choices=["train", "chat", "bench"])
+    parser.add_argument("--frozen", action="store_true")
+    parser.add_argument("--no-save", action="store_false")
+    parser.add_argument("--dataset", default="data/wikipedia_clean/**/wiki_*")
+    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--layers", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--temp", type=float, default=0.75)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed for init + sampling (default: nondeterministic)")
+    parser.add_argument("--decay-init", type=float, default=None,
+                        help="pre-sigmoid decay init, e.g. 3 for sigmoid 0.95 "
+                             "(default: uniform ~0 => sigmoid ~0.5, 1-byte memory)")
+    parser.add_argument("--save-every", type=int, default=1000,
+                        help="steps between checkpoint writes; 0 = only on exit/^C")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="stop training after N steps and save; 0 = run forever")
+    parser.add_argument("--threshold", type=float, default=0.35,
+                        help="chat stop-head cutoff (main.py uses 0.25)")
+    args = parser.parse_args()
+
+    if args.seed is not None:
+        rng = np.random.default_rng(args.seed)
+
+    runtime = Runtime(path=args.path, dim=args.dim, layers=args.layers,
+                      temp=args.temp, lr=args.lr, batch=args.batch,
+                      decay_init=args.decay_init, save_every=args.save_every,
+                      max_steps=args.steps, threshold=args.threshold)
+    print(f"parameters: {runtime.model.count():,}")
+    runtime(args.mode, args.dataset, args.no_save, args.frozen)
