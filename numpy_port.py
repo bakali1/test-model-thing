@@ -439,6 +439,7 @@ class Model:
         data["m"] = self.m
         data["v"] = self.v
         data["B"] = np.array(self.B, np.int64)
+        data["ring_k"] = np.array(self.ring_k, np.int64)
         if self.tail is not None:
             data.update(self.tail.save_dict())
         tmp = path + ".tmp.npz"

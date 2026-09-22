@@ -49,7 +49,10 @@ def load(path):
     sig = np.concatenate([1 / (1 + np.exp(-d[f"layer{i}.decay"])) for i in range(L)])
     hl = np.log(2) / -np.log(np.clip(sig, 1e-12, 1 - 1e-12))
     t = int(d["t"]) if "t" in d else -1
-    return path, t, L, sig, hl, tail_cols(d, L)
+    # ring length is a parameter fixed at Model.__init__ (trainer's TMT_RING_TOL);
+    # newer checkpoints record it. Older ones: fall back to the env guess.
+    K = int(d["ring_k"]) if "ring_k" in d else ring_k()
+    return path, t, L, sig, hl, tail_cols(d, L), K
 
 
 def ring_k():
@@ -66,18 +69,17 @@ def main():
 
     names = [f"{r[0].split('/')[-1]} (t={r[1]:,})" for r in reports]
     print("memory report")
-    for path, t, L, sig, hl, tcols in reports:
+    for path, t, L, sig, hl, tcols, K in reports:
         print(f"  {path}: t={t:,}  {sig.size} dims  {L} layers")
-    K = ring_k()
-    print(f"\n  categories (by half-life), K={K} (TMT_RING_TOL="
-          f"{os.environ.get('TMT_RING_TOL', '1e-4')}):")
+    K0 = reports[0][-1]
+    print(f"\n  categories (by half-life; ring K read from each checkpoint):")
     w = max(len(n) for n in names) + 2
     hdr = f"  {'category':<18}" + "".join(f"{n:>{w}}" for n in names)
     print(hdr)
     counts = {}
     for label, lo, hi in CATEGORIES:
         row = f"  {label:<18}"
-        for _, _, _, _, hl, _ in reports:
+        for _, _, _, _, hl, _, _ in reports:
             n = int(((hl >= lo) & (hl < hi)).sum())
             counts.setdefault(label, []).append(n)
             row += f"{n:>{w}}"
@@ -91,15 +93,15 @@ def main():
         print(f"  {label:<18} {n:>7,}  {'#' * max(1, round(48 * n / mx)) if n else ''}")
 
     print(f"\n  longest-memory dims (last checkpoint):")
-    path, t, L, sig, hl, _ = reports[-1]
+    path, t, L, sig, hl, _, _ = reports[-1]
     order = np.argsort(hl)[::-1][:5]
     for i in order:
         layer = i // (sig.size // L)
         print(f"    layer{layer:<3d} sigma={sig[i]:.4f}  half-life {hl[i]:6.2f} bytes")
 
-    print(f"\n  ring truncation cost at K={K} (share of embed-credit mass dropped, = sigma^K):")
+    print(f"\n  ring truncation cost (share of embed-credit mass dropped, = sigma^K):")
     print("    (dims covered by the tail accumulator are exact; cost shown is cold-only)")
-    for path, t, L, sig, hl, tcols in reports:
+    for path, t, L, sig, hl, tcols, K in reports:
         dim = sig.size // L
         dropped = sig ** K
         if tcols:
@@ -114,7 +116,7 @@ def main():
             extra = (" would-adopt: %3d" % int((dropped > 0.01).sum())
                      + "  (pre-tail checkpoint)")
         hot = int((dropped > 0.01).sum())
-        print(f"    {path.split('/')[-1]:<22} total {dropped.mean():7.4%}   "
+        print(f"    {path.split('/')[-1]:<22} K={K:>3}  total {dropped.mean():7.4%}   "
               f"dims dropping >1%: {hot:>3}   worst dim: {dropped.max():.2%}"
               f"{extra}")
     return 0

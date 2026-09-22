@@ -105,6 +105,8 @@ def main():
 
     print(f"checkpoint : {args.ckpt}")
     print(f"params     : {m.count():,}  (dim={dim}, layers={layers})")
+    if "ring_k" in d:
+        print(f"ring       : K={int(d['ring_k'])} lags (sized from trainer's TMT_RING_TOL)")
     if "bytes" in d:
         bytes_line = f"bytes seen : {int(d['bytes']):,}  (exact, from checkpoint)"
     else:
