@@ -98,6 +98,10 @@ def main():
 
     d = np.load(args.ckpt)
     dim, layers = infer_config(d)
+    # build the eval model with the checkpoint's own ring K so the tail's
+    # hot-set accounting during load matches what the trainer actually did
+    if "ring_k" in d:
+        N.RING_TOL = 0.5115 ** int(d["ring_k"])
     m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4)
     m.new_states(1)
     m.load(args.ckpt)
