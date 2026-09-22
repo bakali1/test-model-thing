@@ -33,13 +33,23 @@ def layer_count(d):
                    if k.startswith("layer") and k.split(".")[1] == "decay")
 
 
+def tail_cols(d, L):
+    """Hot dims covered by the tail accumulator (tail_credit.py), per layer."""
+    cols = {}
+    for i in range(L):
+        k = f"tail_cols.{i}"
+        if k in d:
+            cols[i] = np.asarray(d[k], int)
+    return cols
+
+
 def load(path):
     d = np.load(path)
     L = layer_count(d)
     sig = np.concatenate([1 / (1 + np.exp(-d[f"layer{i}.decay"])) for i in range(L)])
     hl = np.log(2) / -np.log(np.clip(sig, 1e-12, 1 - 1e-12))
     t = int(d["t"]) if "t" in d else -1
-    return path, t, L, sig, hl
+    return path, t, L, sig, hl, tail_cols(d, L)
 
 
 def ring_k():
@@ -56,7 +66,7 @@ def main():
 
     names = [f"{r[0].split('/')[-1]} (t={r[1]:,})" for r in reports]
     print("memory report")
-    for path, t, L, sig, hl in reports:
+    for path, t, L, sig, hl, tcols in reports:
         print(f"  {path}: t={t:,}  {sig.size} dims  {L} layers")
     K = ring_k()
     print(f"\n  categories (by half-life), K={K} (TMT_RING_TOL="
@@ -67,7 +77,7 @@ def main():
     counts = {}
     for label, lo, hi in CATEGORIES:
         row = f"  {label:<18}"
-        for _, _, _, _, hl in reports:
+        for _, _, _, _, hl, _ in reports:
             n = int(((hl >= lo) & (hl < hi)).sum())
             counts.setdefault(label, []).append(n)
             row += f"{n:>{w}}"
@@ -81,18 +91,32 @@ def main():
         print(f"  {label:<18} {n:>7,}  {'#' * max(1, round(48 * n / mx)) if n else ''}")
 
     print(f"\n  longest-memory dims (last checkpoint):")
-    path, t, L, sig, hl = reports[-1]
+    path, t, L, sig, hl, _ = reports[-1]
     order = np.argsort(hl)[::-1][:5]
     for i in order:
         layer = i // (sig.size // L)
         print(f"    layer{layer:<3d} sigma={sig[i]:.4f}  half-life {hl[i]:6.2f} bytes")
 
     print(f"\n  ring truncation cost at K={K} (share of embed-credit mass dropped, = sigma^K):")
-    for path, t, L, sig, hl in reports:
+    print("    (dims covered by the tail accumulator are exact; cost shown is cold-only)")
+    for path, t, L, sig, hl, tcols in reports:
+        dim = sig.size // L
         dropped = sig ** K
+        if tcols:
+            mask = np.zeros(sig.size, bool)
+            for i, c in tcols.items():
+                if c.size:
+                    mask[i * dim + c] = True
+            covered = int(mask.sum())
+            dropped = np.where(mask, 0.0, dropped)
+            extra = f" tail-covered dims: {covered:>3}"
+        else:
+            extra = (" would-adopt: %3d" % int((dropped > 0.01).sum())
+                     + "  (pre-tail checkpoint)")
         hot = int((dropped > 0.01).sum())
         print(f"    {path.split('/')[-1]:<22} total {dropped.mean():7.4%}   "
-              f"dims dropping >1%: {hot:>3}   worst dim: {dropped.max():.2%}")
+              f"dims dropping >1%: {hot:>3}   worst dim: {dropped.max():.2%}"
+              f"{extra}")
     return 0
 
 

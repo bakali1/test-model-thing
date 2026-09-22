@@ -26,6 +26,9 @@ from datetime import datetime
 
 import numpy as np
 
+import tail_credit
+from tail_credit import TailCredit, REBASE_EVERY, HOT_FRAC
+
 # Trace truncation tolerance: ring lag k is kept while its weight (~decay**k)
 # is above this. 1e-7 reproduces the dense float32 trace (K=25 at decay 0.5);
 # 1e-4 (K=15) sits ~4 orders below the stochastic gradient's own noise and is
@@ -192,6 +195,14 @@ class Model:
         self.B = 1
         self.new_states(1)
 
+        # tail-credit (exact long-lag embed credit) is created lazily at the
+        # first training step / in load(), sized to the active batch B.
+        # Read the env var per-instance so an A/B can flip TMT_TAIL between
+        # model constructions in one process.
+        self.tail = None
+        self.tail_state = {}   # checkpoint keys handed to a fresh tail
+        self.tail_enabled = os.environ.get("TMT_TAIL", "1") != "0"
+
     def new_states(self, B):
         self.B = B
         self.ring_b = np.zeros((B, self.ring_k), np.int64)      # byte per lag
@@ -204,6 +215,28 @@ class Model:
             l.states = np.zeros((B, self.dim), F)
             l.decaytrace = np.zeros((B, self.dim), F)
             l.ring_w = np.zeros((B, self.ring_k, self.dim), F)
+
+    # ---------- tail credit (exact long-lag embed credit) ----------
+    def _ensure_tail(self):
+        """Create/resize the tail accumulator for the current B and reconcile
+        hot-dim membership against the current decay. Idempotent; a no-op by
+        default but ~microseconds once the tail matches B."""
+        if not getattr(self, "tail_enabled", False):
+            return
+        if self.tail is None or self.tail.B != self.B:
+            self.tail = TailCredit(self.B, self.ring_k)
+            if self.tail_state:
+                self.tail.restore_from(self.tail_state, self.layercount)
+            self.tail_state = {}
+        self._tail_sync()
+
+    def _tail_sync(self):
+        """Re-evaluate hot dims against the current decay and re-seed any
+        newly-hot dim from the ring. Already-hot dims keep their exact EMA."""
+        if self.tail is None:
+            return
+        sigs = np.stack([sigmoid(l.decay) for l in self.layers]).astype(F)
+        self.tail.sync(sigs, [l.ring_w for l in self.layers], self.ring_b)
 
     def params(self):
         return self.views
@@ -321,6 +354,7 @@ class Model:
         # instead build a (256, B*K) one-hot selector and let BLAS do the
         # reduction (~1 ns/element). The selector's byte indices are shared by all
         # layers, so it is built once per step.
+        self._ensure_tail()
         dembed = np.zeros((256, self.dim), F)
         decay_grads = []
         K = self.ring_k
@@ -346,13 +380,24 @@ class Model:
             # one-hot in place instead of building a (B,256,1) array.
             # decay first: the dense credit uses (T_{t-1} * decay_t), not T_{t-1}
             w *= decays[i]
+            if self.tail is not None and self.tail.nhot(i):
+                self.tail.begin_step(i, decays[i][self.tail.cols_of(i)])
             np.multiply(w, dlds[:, None, :], out=scratch)
+            if self.tail is not None and self.tail.nhot(i):
+                # ring skips hot dims (their credit would be truncated); the
+                # tail EMA covers them exactly at every lag
+                scratch[:, :, self.tail.mask(i)] = 0.0
+                tailc = self.tail.credit(i, dlds)
+                if tailc is not None:
+                    np.add.at(dembed, (slice(None), self.tail.cols_of(i)), tailc)
             sv = scratch.reshape(B * K, self.dim)
             if _scatter_credit is not None:
                 _scatter_credit(dembed, self.ring_rows, sv)
             else:
                 np.add(dembed, M @ sv, out=dembed)
             w[:, p] = 1.0        # this byte becomes lag 1 (empty product = 1)
+            if self.tail is not None and self.tail.nhot(i):
+                self.tail.add_byte(i, c_arr)
             l.decaytrace = (decays[i][None, :] * l.decaytrace +
                             decays[i][None, :] * (1.0 - decays[i][None, :]) * l.states)
             decay_grads.append((dlds * l.decaytrace).sum(axis=0))
@@ -394,6 +439,8 @@ class Model:
         data["m"] = self.m
         data["v"] = self.v
         data["B"] = np.array(self.B, np.int64)
+        if self.tail is not None:
+            data.update(self.tail.save_dict())
         tmp = path + ".tmp.npz"
         np.savez(tmp, **data)
         os.replace(tmp, path)
@@ -449,14 +496,37 @@ class Model:
                     v = resized
                 setattr(l, attr, v)
 
+        # tail-credit state (exact long-lag embed credit); handed to a freshly
+        # created tail in _ensure_tail (B is adapted there like the state rows)
+        self.tail_state = {}
+        for i in range(self.layercount):
+            for key in (f"tail_cols.{i}", f"tail_E.{i}"):
+                if key in d:
+                    self.tail_state[key] = d[key]
+        if self.tail_enabled:
+            self._ensure_tail()
+
         if self.layers:
-            sig_max = max(float(sigmoid(l.decay).max()) for l in self.layers)
-            cut = sig_max ** self.ring_k
-            if cut > 0.01:
-                print(f"[warn] trace truncation: heaviest dim (sigma={sig_max:.3f}) "
-                      f"still carries {cut:.1%} of its gradient at lag {self.ring_k} "
-                      f"(tol {RING_TOL:g}); raise TMT_RING_TOL for more lags",
-                      file=sys.stderr)
+            sigs = [sigmoid(l.decay) for l in self.layers]
+            if self.tail_enabled:
+                hot = np.concatenate([s[s ** self.ring_k > HOT_FRAC] for s in sigs])
+                if hot.size:
+                    print(f"[tail] {hot.size} hot dim(s) get exact embed credit "
+                          f"(K={self.ring_k}, sigma**K > {HOT_FRAC:.0%}); "
+                          f"worst would have dropped {hot.max() ** self.ring_k:.1%}")
+                cold = np.concatenate([s[s ** self.ring_k <= HOT_FRAC] for s in sigs])
+                cut = float(cold.max()) ** self.ring_k if cold.size else 0.0
+                if cut > HOT_FRAC:
+                    print(f"[warn] cold-dim truncation {cut:.1%} at lag "
+                          f"{self.ring_k} (tol {RING_TOL:g})", file=sys.stderr)
+            else:
+                sig_max = max(float(s.max()) for s in sigs)
+                cut = sig_max ** self.ring_k
+                if cut > 0.01:
+                    print(f"[warn] trace truncation: heaviest dim "
+                          f"(sigma={sig_max:.3f}) still carries {cut:.1%} of its "
+                          f"gradient at lag {self.ring_k} (tol {RING_TOL:g}); "
+                          f"raise TMT_RING_TOL for more lags", file=sys.stderr)
 
 
 class Runtime:
