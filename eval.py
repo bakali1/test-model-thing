@@ -30,6 +30,7 @@ from eval_npz import (auc_score, cross_entropy, infer_config, line_end_labels)
 
 TRAIN_GLOB_DEFAULT = "data/wikipedia_clean/**/wiki_*"
 EVAL_GLOB_DEFAULT = "data/eval/**/*"
+SHIFT_GLOB_DEFAULT = "data/eval_shift/**/*"
 NOVEL_GLOB_DEFAULT = "data/*.txt"
 
 
@@ -100,6 +101,7 @@ def main():
     ap.add_argument("ckpt")
     ap.add_argument("--train-glob", default=TRAIN_GLOB_DEFAULT)
     ap.add_argument("--eval-glob", default=EVAL_GLOB_DEFAULT)
+    ap.add_argument("--shift-glob", default=SHIFT_GLOB_DEFAULT)
     ap.add_argument("--novel-glob", default=NOVEL_GLOB_DEFAULT)
     ap.add_argument("--slices", type=int, default=3,
                     help="disjoint held-out slices per file (SE comes from these)")
@@ -161,6 +163,18 @@ def main():
     ce_uni = float(np.mean([-np.log(uni[b]) for b in seq0[1:]]))
     ce_bg = float(np.mean([-np.log(bg[a, b]) for a, b in zip(seq0[:-1], seq0[1:])]))
     print(f"  unigram {ce_uni:.4f} | bigram {ce_bg:.4f} | model {ce_bg - ce:.4f} vs bigram")
+
+    # ---- near-domain shift (same task, independent generation) ----
+    shift_files = _files(args.shift_glob)
+    if shift_files:
+        sces, _, _, _, _ = _eval_corpus(m, shift_files, args.slices, args.bytes)
+        sce = float(sces.mean())
+        sse = (float(sces.std(ddof=1) / np.sqrt(len(sces)))
+               if len(sces) > 1 else float("nan"))
+        print(f"\nshift-distribution CE ({len(shift_files)} file(s), "
+              f"{len(sces)} slices):")
+        print(f"  mean {sce:.4f} +/- {sse:.4f}  (in-domain held-out {ce:.4f}; "
+              f"gap {sce - ce:+.4f})")
 
     # ---- cross-domain (novels) ----
     if args.xd_bytes > 0:

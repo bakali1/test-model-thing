@@ -8,12 +8,28 @@ One row per checkpoint that a decision was based on. Never edit a row; append.
     .venv/bin/python eval.py <checkpoint.npz> [--slices 3] [--bytes 20000]
 
 Prints: held-out CE per disjoint slice + mean ± SE, unigram/bigram baselines
-from the training corpus, cross-domain CE on the Gutenberg novels, decay /
-half-life histogram, hot-dim count, and stop-head AUC + recall/precision.
+from the training corpus, a same-task distribution-shift CE, cross-domain CE on
+the Gutenberg novels, decay / half-life histogram, hot-dim count, and stop-head
+AUC + recall/precision.
 
 `eval.py` refuses to run if any eval file is reachable by the training glob.
-Held-out = `data/eval/` (physically outside `data/wikipedia_clean/`).
-The held-out set for in-domain is `wiki_tinystories_005.txt`.
+The held-out corpora live physically outside `data/wikipedia_clean/`:
+
+  * `data/eval/` — in-domain held-out. `wiki_tinystories_005.txt` (the file
+    moved out at the Phase 0 split) + `tinystories_valid.txt` (see below).
+  * `data/eval_shift/` — `tinystories_v2gpt4_valid.txt`, TinyStoriesV2 generated
+    by GPT-4: same task, independent generation ⇒ a distribution-shift number.
+
+### Held-out data provenance (`fetch_eval_data.py`, reproducible)
+
+    .venv/bin/python fetch_eval_data.py
+
+Downloads the canonical TinyStories validation splits from
+`huggingface.co/datasets/roneneldan/TinyStories`, strips the `<|endoftext|>`
+markers (the training corpus has none), and drops stories that are
+near-duplicates of a training story (TinyStories is heavily templated, so the
+official split still shares ~3% of stories with the train set). The result is
+byte-identical on every run (sha256-stable).
 
 ## Phase 0 changes
 
@@ -31,18 +47,26 @@ The held-out set for in-domain is `wiki_tinystories_005.txt`.
 ## Contamination caveat (important)
 
 The live checkpoint `tmt` **trained on all five wikistories files**, including
-005, before the split existed. Its held-out CE below is therefore optimistic
-and NOT a clean generalization number — it is recorded only as the pre-split
-reference. Every checkpoint trained from now on (with 005 in `data/eval/`) has
-a genuinely held-out in-domain number. The **cross-domain** (novels) number
-was never in the wiki training glob and is honest for all checkpoints.
+005, before the split existed. Its CE on 005 is optimistic and NOT a
+generalization number. The clean baseline is therefore measured on
+`data/eval/tinystories_valid.txt` (never in the training glob) and on the
+novels (cross-domain; the wiki run never read them).
 
 ## Log
 
-| date | ckpt | t | bytes | held-out CE (mean ± SE) | cross-domain CE | hot dims | half-life mean | note |
-|---|---|---|---|---|---|---|---|---|
-| 2026-09-23 | tmt.npz | 64,747 | 57,602,080 | 1.2235 ± 0.0103 (3×20k, file 005) | 3.3785 ± 0.2933 (12 novels × 8k) | 57 | 1.12 B | pre-split ckpt: 005 was trained on, so in-domain CE is optimistic; ruler baseline only |
+Baseline command (hold fixed for future rows unless noted):
 
-Stop head @ tmt.npz: AUC 0.9710; thr 0.35 recall 11.2% / precision 51.0%.
+    .venv/bin/python eval.py tmt.npz --eval-glob 'data/eval/tinystories_valid.txt' --xd-files 4
+
+| date | ckpt | t | bytes | in-domain held-out CE | shift CE | cross-domain CE | hot dims | half-life mean | note |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-09-23 | tmt.npz | 64,747 | 57,602,080 | *(1.2235 ± 0.0103 on file 005 — CONTAMINATED, reference only)* | – | 3.3785 ± 0.2933 (12 novels) | 57 | 1.12 B | pre-split ckpt: 005 was trained on |
+| **2026-09-23** | **tmt.npz** | **64,747** | **57,602,080** | **1.1741 ± 0.0415** (3×20k, `tinystories_valid`) | **1.1425 ± 0.0165** (3×20k, v2gpt4) | **3.1532 ± 0.4275** (4 novels × 8k) | 57 | 1.12 B | **clean baseline** — held-out bytes never trained on |
+
+Stop head @ clean baseline: AUC 0.9547; thr 0.35 recall 9.6% / precision 40.4%.
 Memory histogram (half-life): <1 B: 2131 | 1–2 B: 5926 | 2–4 B: 124 |
 4–8 B: 9 | 8–16 B: 1 | 16–32 B: 0 | >32 B: 1.
+
+The in-domain SE (0.04) is currently the coarse number: one held-out file, 3
+slices. A win inside ~1 SE is not a win. Raise `--slices` before trusting a
+sub-0.1 CE difference, or add a second held-out file.
