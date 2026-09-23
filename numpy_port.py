@@ -450,6 +450,19 @@ class Model:
         if not os.path.exists(path):
             return
         d = np.load(path)
+        # ring_k is a property of the checkpoint, not of this process's
+        # RING_TOL: the run that wrote it sized its ring for its own decay
+        # range, and re-deriving it here (from an unrelated --decay-init or
+        # TMT_RING_TOL) silently truncates the embed credit for the hottest
+        # dims -- e.g. the live run's K=18 shrinks to 14 at the default tol.
+        # Honor the stored K and resize the ring buffers to match before any
+        # state is read into them. (The eval tools already follow this rule.)
+        if "ring_k" in d:
+            ck_k = int(d["ring_k"])
+            if ck_k != self.ring_k:
+                self.ring_k = ck_k
+                self.tail = None      # rebuilt below at the checkpoint's K
+                self.new_states(self.B)
         if "t" in d:
             self.t = int(d["t"])
         # Training-byte counter. Checkpoints saved before this field existed
