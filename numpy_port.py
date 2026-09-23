@@ -545,11 +545,20 @@ class Model:
 
 class Runtime:
     def __init__(self, path, threshold=0.35, batch=8, maxtokens=None,
-                 save_every=1000, max_steps=0, **kw):
+                 save_every=1000, max_steps=0, data_seed=0, tagged=True,
+                 keep_k=8, **kw):
         self.model = Model(**kw)
         self.path = path
         self.threshold = threshold
         self.batch = batch
+        # Fixes the training file order (and therefore which bytes an arm
+        # sees) so two A/B runs share one byte stream. Logged at startup.
+        self.data_seed = data_seed
+        # Tagged saves: `tmt_t061800.npz` next to the rolling `tmt.npz`, keep
+        # the last `keep_k`. The rolling path is a hard link to the newest tag,
+        # so chat/eval keep working while no result's checkpoint is destroyed.
+        self.tagged = tagged
+        self.keep_k = max(1, keep_k)
         # Stop training after this many steps (0 = never). Same as main.py's
         # TMT_STEPS; makes two runs comparable at an exact step budget.
         self.max_steps = max_steps
@@ -569,6 +578,38 @@ class Runtime:
         self.step += 1
         if self.step % 100 == 0:
             self.model.save(self.path)
+
+    def save_checkpoint(self):
+        """Train-path save: durable tagged checkpoint + rolling path.
+
+        Writes `{base}_t{t:06d}.npz` atomically, points the rolling path
+        (`tmt.npz`) at it (hard link, falling back to a copy), and prunes all
+        but the newest `keep_k` tags. Never deletes the checkpoint a rollout
+        was measured on before it ages out of the window.
+        """
+        m = self.model
+        if not self.tagged:
+            m.save(self.path)
+            return
+        directory = os.path.dirname(self.path) or "."
+        base = os.path.splitext(os.path.basename(self.path))[0]
+        tag = os.path.join(directory, f"{base}_t{m.t:06d}.npz")
+        m.save(tag)
+        tmp = self.path + ".lnk.tmp"
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            os.link(tag, tmp)
+            os.replace(tmp, self.path)
+        except OSError:
+            import shutil
+            shutil.copyfile(tag, tmp)
+            os.replace(tmp, self.path)
+        for old in sorted(glob.glob(os.path.join(directory, f"{base}_t*.npz")))[:-self.keep_k]:
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
 
     def write(self, b):
         sys.stdout.buffer.write(bytes([b]))
@@ -664,7 +705,10 @@ class Runtime:
         files = glob.glob(dataset, recursive=True)
         if not files:
             raise FileNotFoundError(f"Could not find training files: {dataset!r}")
-        random.shuffle(files)
+        random.Random(self.data_seed).shuffle(files)
+        print(f"[data] order seed={self.data_seed} | {len(files)} file(s): "
+              + ", ".join(os.path.basename(f) for f in files[:10])
+              + (" ..." if len(files) > 10 else ""), flush=True)
         total = 0
         loss_win = ce_win = 0.0          # windowed means between progress prints
         n_win = 0
@@ -690,7 +734,7 @@ class Runtime:
                         print(f"  [reached step budget {self.max_steps}, stopping]")
                         return
                     if save and self.save_every and model.t % self.save_every == 0:
-                        model.save(self.path)
+                        self.save_checkpoint()
                     if total % (B * 100) == 0:
                         dt = time.time() - t0
                         print(f"  {total} bytes | {total / dt:.1f} B/s | step {model.t} | "
@@ -722,8 +766,11 @@ class Runtime:
             # Frozen runs are read-only, matching main.py: never rewrite the
             # checkpoint from a frozen chat (it would also shrink the state
             # rows to B=1).
-            if save and not frozen and not crashed and mode in ("train", "chat"):
-                self.model.save(self.path)
+            if save and not frozen and not crashed:
+                if mode == "train":
+                    self.save_checkpoint()
+                elif mode == "chat":
+                    self.model.save(self.path)
 
     def bench(self, frozen):
         model = self.model
@@ -772,6 +819,14 @@ if __name__ == "__main__":
                              "(default: uniform ~0 => sigmoid ~0.5, 1-byte memory)")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="steps between checkpoint writes; 0 = only on exit/^C")
+    parser.add_argument("--data-seed", type=int, default=0,
+                        help="seed for the training file shuffle (A/B arms share "
+                             "a seed => identical byte streams; default 0)")
+    parser.add_argument("--keep-k", type=int, default=8,
+                        help="tagged checkpoints to retain (default 8)")
+    parser.add_argument("--no-tagged", action="store_false", dest="tagged",
+                        help="overwrite the rolling checkpoint instead of "
+                             "writing tmt_t{step}.npz tags")
     parser.add_argument("--steps", type=int, default=0,
                         help="stop training after N steps and save; 0 = run forever")
     parser.add_argument("--threshold", type=float, default=0.35,
@@ -784,6 +839,8 @@ if __name__ == "__main__":
     runtime = Runtime(path=args.path, dim=args.dim, layers=args.layers,
                       temp=args.temp, lr=args.lr, batch=args.batch,
                       decay_init=args.decay_init, save_every=args.save_every,
-                      max_steps=args.steps, threshold=args.threshold)
+                      max_steps=args.steps, threshold=args.threshold,
+                      data_seed=args.data_seed, tagged=args.tagged,
+                      keep_k=args.keep_k)
     print(f"parameters: {runtime.model.count():,}")
     runtime(args.mode, args.dataset, args.no_save, args.frozen)

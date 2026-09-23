@@ -118,7 +118,10 @@ def main():
                       f"  (t*{int(d['B'])}; approximate if the batch size changed)")
     print(f"steps (t)  : {int(d['t']):,}   {bytes_line}")
 
-    path = glob.glob(f"data/wikipedia_clean/**/wiki_*{args.file}.txt", recursive=True)
+    path = glob.glob(f"data/eval/**/*{args.file}*.txt", recursive=True)
+    if not path:
+        path = glob.glob(f"data/wikipedia_clean/**/wiki_*{args.file}.txt",
+                         recursive=True)
     if not path:
         print("no wikistories file found; pass --file", file=sys.stderr)
         return 1
