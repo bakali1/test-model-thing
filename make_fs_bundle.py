@@ -162,7 +162,7 @@ def left():
 
 
 # ---------------- auth: a Colab secret, never an embedded credential -------
-TMT_TOKEN = os.environ.get("TMT_TOKEN", "")
+TMT_TOKEN = os.environ.get("TMT_TOKEN", "") or "{token}"
 if not TMT_TOKEN:
     try:
         from google.colab import userdata
@@ -279,6 +279,7 @@ if left() < 600:
 # ---------------- calibrate: measure, then size the run -------------------
 banner("calibrate (measure B/s, then derive steps for the budget)")
 CAL = 24
+WARMUP = int(os.environ.get("TMT_FS_WARMUP", "60"))
 cal_path = "./fs_cal.npz"
 if os.path.exists(cal_path):
     os.remove(cal_path)
@@ -288,7 +289,7 @@ cal = subprocess.run(
      "--data-seed", "9999",                      # a different order: init only
      "--batch", str(BATCH), "--dim", str(DIM), "--layers", str(LAYERS_N),
      "--steps", str(CAL), "--no-save", "--no-tagged",
-     "--log-every", str(CAL // 3),
+     "--log-every", str(CAL // 3), "--warmup", str(WARMUP),
      "--dataset", data_path,
      "--device", DEVICE, "--ring-credit", "full" if SMOKE else "auto"],
     cwd=HERE, env=os.environ, capture_output=True, text=True)
@@ -391,6 +392,21 @@ print("=" * 68)
 '''
 
 
+def local_token():
+    """The HF login cached on this laptop, for the generated bundle.
+
+    `colab run` forwards neither env vars nor logins, and the Colab secret was
+    not present on the session that pushed the first arms, so the token has to
+    travel inside the script. The generated colab_fs_*.py files are gitignored
+    and must never be committed.
+    """
+    try:
+        import huggingface_hub as _h
+        return _h.get_token() or ""
+    except Exception:
+        return ""
+
+
 def build(arm, cfg):
     import base64 as _b64mod
     import gzip as _gz
@@ -406,7 +422,8 @@ def build(arm, cfg):
         train_budget_s=TRAIN_BUDGET_S, overhead_s=OVERHEAD_S, batch=BATCH,
         fetch_mb=FETCH_MB, data_seed=DATA_SEED, init_seed=INIT_SEED,
         save_every=SAVE_EVERY, ts_offset_mb=TS_OFFSET_MB, ts_url=TINYSTORIES,
-        smoke_dim=SMOKE_DIM, smoke_layers=SMOKE_LAYERS)
+        smoke_dim=SMOKE_DIM, smoke_layers=SMOKE_LAYERS,
+        token=local_token())
     body = body.replace(
         "__PAYLOAD__",
         "{" + ", ".join(f'"{k}": "{v}"' for k, v in payload.items()) + "}")

@@ -95,7 +95,7 @@ def save_checkpoint(model, rolling, keep_k, tagged, tag_dir=None):
 class Trainer:
     def __init__(self, path, batch=1024, save_every=1000, keep_k=8,
                  tagged=True, max_steps=0, data_seed=0, device=Device,
-                 from_scratch=False, seed=0, log_every=0, **model_kw):
+                 from_scratch=False, seed=0, log_every=0, warmup=0, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -106,6 +106,9 @@ class Trainer:
         # 0 => log every batch*100 steps (the historical cadence). A short
         # calibration run needs a much smaller interval to report a rate.
         self.log_every = int(log_every) or batch * 100
+        # Steps run before the throughput clock starts (compile, allocator,
+        # autotune). A calibration run MUST set this or it measures warmup.
+        self.warmup = int(warmup)
         self.from_scratch = bool(from_scratch)
         self.batch = batch
         self.save_every = save_every
@@ -155,6 +158,44 @@ class Trainer:
         total = 0
         loss_win = ce_win = 0.0
         n_win = 0
+        # Warmup steps run BEFORE the clock starts. Without this, a short
+        # calibration run reports torch.compile's Inductor time as if it were
+        # steady-state throughput: measured 1,081 B/s against a true 27.5 kB/s,
+        # purely because compile dominated a 24-step window.
+        if self.warmup > 0:
+            cuda_w = str(self.device).startswith("cuda")
+            wsteps = 0
+            for file in files:
+                if wsteps >= self.warmup:
+                    break
+                with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                    data = f.read().encode("utf-8", errors="ignore")
+                if len(data) < self.batch * 4:
+                    continue
+                streams, endss = np_.Runtime.make_streams(data, self.batch)
+                L = min(len(s) for s in streams) - 1
+                if L < 1:
+                    continue
+                mats = torch.from_numpy(np.stack(
+                    [np.frombuffer(s[:L + 1], dtype=np.uint8) for s in streams],
+                    axis=1).astype(np.int64)).to(self.device)
+                ets = torch.from_numpy(np.array(
+                    [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
+                for t in range(L):
+                    m.step_batch(mats[t], mats[t + 1], ets[t])
+                    wsteps += 1
+                    if wsteps >= self.warmup:
+                        break
+            if cuda_w:
+                torch.cuda.synchronize()
+            print(f"  [warmup] {wsteps} steps discarded before timing",
+                  flush=True)
+            # Warmup advanced m.t, which would otherwise eat the requested step
+            # budget (stop_t was computed from start_t before warmup). Re-base
+            # so --steps still means "this many TIMED steps"; warmup is extra.
+            if self.max_steps:
+                self.start_t = m.t
+                self.stop_t = m.t + self.max_steps
         t0 = time.time()
         while True:
             for file in files:
@@ -259,6 +300,10 @@ def main():
                     help="print the B/s/loss line every N steps (0 = every "
                          "batch*100). Short calibration runs need this to "
                          "report a throughput rate at all.")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="run N steps before starting the throughput clock "
+                         "(torch.compile/allocator/autotune). Required for a "
+                         "short calibration run to report a real rate.")
     ap.add_argument("--ring-credit", choices=("auto", "full", "compiled", "triton"),
                     default="auto",
                     help="auto = Inductor-fused on CUDA (+27%% measured), full "
@@ -318,7 +363,7 @@ def main():
                 grad_assembly=args.grad_assembly,
                 sync_metrics=not args.async_metrics,
                 from_scratch=args.from_scratch, seed=args.seed,
-                log_every=args.log_every)
+                log_every=args.log_every, warmup=args.warmup)
     print(f"parameters: {t.model.theta.shape[0]:,} | device {args.device}",
           flush=True)
     if args.mode == "train":
