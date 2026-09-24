@@ -40,7 +40,27 @@ EVAL_ARGS = os.environ.get("TMT_FS_EVAL_ARGS", "").split() or [
     "--slices", "3", "--bytes", "20000", "--xd-bytes", "8000"]
 
 
-def pull_tags():
+def pick_at_step(tags, target):
+    """Choose the newest tag at or before `target` steps.
+
+    The arms are NOT byte-matched by construction: each derives its own step
+    count from its own in-session calibration, and those rates differ by up to
+    1.6x (FS-W calibrated 20,500 B/s -> 60,058 steps; FS-N 34,000 B/s ->
+    99,603). Comparing final-to-final would confound corpus with compute, so
+    the verdict is taken at a COMMON step count, where every arm has a tag.
+    """
+    best = None
+    for t in tags:
+        try:
+            ts = int(os.path.basename(t).split("_t")[-1].split(".")[0])
+        except ValueError:
+            continue
+        if ts <= target and (best is None or ts > best[0]):
+            best = (ts, t)
+    return best[1] if best else None
+
+
+def pull_tags(at_step=None):
     """Fetch the final tagged checkpoint for each arm from the hub."""
     import checkpoint_hub as hub
     for arm in ARMS:
@@ -98,13 +118,54 @@ def fmt_pair(p):
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "--pull":
-        pull_tags()
         argv = argv[1:]
+        if argv and argv[0].startswith("--at-step"):
+            at_step = int(argv.pop(0).split("=")[1])
+        for arm in ARMS:
+            pat = f"fs_{arm.lower()}_t*.npz"
+            tags = sorted(glob.glob(os.path.join(HERE, pat)))
+            if not tags:
+                tags = [os.path.basename(x) for x in
+                        hub.remote_tags(HUB_REPO, prefix=f"fs_{arm.lower()}_")]
+            if not tags:
+                print(f"  [warn] no tag for FS-{arm}")
+                continue
+            if at_step:
+                chosen = pick_at_step(tags, at_step)
+                if not chosen:
+                    print(f"  [warn] FS-{arm} has no tag at or before "
+                          f"t={at_step:,}")
+                    continue
+                tags = [chosen if os.path.isabs(chosen)
+                        else os.path.join(HERE, chosen)]
+            newest = tags[-1]
+            print(f"  pulling FS-{arm}: {os.path.basename(newest)} ...",
+                  flush=True)
+            try:
+                hub.pull(os.path.basename(newest), repo_id=HUB_REPO,
+                         expect_n=4481793, require_digest=True)
+            except SystemExit as e:
+                print(f"  [warn] pull refused: {e}")
     if not argv:
         argv = sorted(glob.glob(os.path.join(HERE, "fs_*_t*.npz")))
     paths = []
     for a in argv:
         paths.extend(sorted(glob.glob(a)))
+    # --at-step N: restrict every arm to the tag at or before N steps.
+    at_step = None
+    if argv and argv[0].startswith("--at-step"):
+        at_step = int(argv[0].split("=")[1])
+        argv = [x for x in argv if not x.startswith("--at-step")]
+        paths = []
+        for a in ARMS:
+            tags = sorted(glob.glob(os.path.join(HERE, f"fs_{a.lower()}_t*.npz")))
+            chosen = pick_at_step(tags, at_step) if tags else None
+            if chosen:
+                print(f"  FS-{a}: matched tag {os.path.basename(chosen)}")
+                paths.append(chosen)
+            else:
+                print(f"  FS-{a}: NO tag at or before t={at_step:,} -- "
+                      f"this arm is excluded from the matched comparison")
     if not paths:
         sys.exit("no checkpoints given and none found; pass paths or --pull")
 

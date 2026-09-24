@@ -319,7 +319,17 @@ if not rate:
 
 steps_by_time = int(TRAIN_BUDGET_S * rate / BATCH)
 steps_by_data = int(nbytes * 0.87 / BATCH)      # inverse of the 1.15 re-read
-STEPS = max(100, min(steps_by_time, steps_by_data))
+# A pinned step count OVERRIDES the calibration. Required for byte-matched
+# arms: two runs whose calibrations differ by 1.6x (FS-W 20,500 B/s -> 60,058
+# steps vs FS-N 34,000 B/s -> 99,603) would otherwise get different amounts of
+# training, confounding corpus with compute. The verdict script can compare at
+# a matched step, but pinning is cheaper than two long arms.
+PINNED = int(os.environ.get("TMT_FS_STEPS", "0") or 0)
+if PINNED:
+    STEPS = PINNED
+    print(f"  PINNED STEPS={{STEPS:,}} (TMT_FS_STEPS) for byte-matching", flush=True)
+else:
+    STEPS = max(100, min(steps_by_time, steps_by_data))
 print(f"  rate {{rate:,.0f}} B/s | time allows {{steps_by_time:,}} steps | "
       f"data allows {{steps_by_data:,}} -> STEPS={{STEPS:,}} "
       f"(~{{STEPS*BATCH/1e6:.0f}} MB, {{TRAIN_BUDGET_S/60:.0f}} min)",
