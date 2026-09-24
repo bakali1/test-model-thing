@@ -272,7 +272,7 @@ class GpuModel:
 
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
                  device=None, ring_credit="auto", sync_metrics=True,
-                 grad_assembly="cat"):
+                 grad_assembly="cat", seed=0):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
@@ -281,6 +281,7 @@ class GpuModel:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+        self._init_seed = int(seed)
         if ring_credit not in ("auto", "full", "compiled", "triton"):
             raise ValueError(f"unknown ring_credit={ring_credit!r}")
         if grad_assembly not in ("cat", "loop"):
@@ -322,7 +323,10 @@ class GpuModel:
 
     def _build(self, dim, layers, decay_init):
         lim = 1.0 / np.sqrt(dim)
-        rng = np.random.default_rng(0)          # deterministic stand-alone init
+        # Seeded init. Seed 0 is the historical default and is what every
+        # from-scratch A/B arm must share, so their starting weights are
+        # bit-identical and the data is the only axis that differs.
+        rng = np.random.default_rng(self._init_seed)
         init = {
             "embed": (rng.standard_normal((256, dim)) * 0.1).astype(np.float32),
             "Wd": rng.uniform(-lim, lim, (256, dim)).astype(np.float32),

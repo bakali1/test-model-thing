@@ -175,7 +175,7 @@ def item10_equal_step_conflict():
     hub.remote_tags = lambda *a, **k: [(10, "remote_t000010.npz")]
     try:
         try:
-            hub.pull(local, repo_id="fake/repo")
+            hub.pull(local, repo_id="fake/repo", require_digest=False)
             print("  FAIL: equal-step conflict silently accepted")
             return False
         except SystemExit as ex:
@@ -183,7 +183,8 @@ def item10_equal_step_conflict():
         # same content -> clean skip
         m.theta[0] = 0.1
         m.save(local)
-        pulled["r"] = hub.pull(local, repo_id="fake/repo")
+        pulled["r"] = hub.pull(local, repo_id="fake/repo",
+                               require_digest=False)
     finally:
         hh.hf_hub_download = orig_dl
         hub.remote_tags = orig_tags
@@ -205,6 +206,55 @@ def item12_push_no_tagged_rejected():
     return ok
 
 
+def item13_from_scratch_seed():
+    """From-scratch arms must share ONE init, and must not pull/load state.
+
+    This is the precondition for the corpus A/B (FS-W / FS-N / FS-L): if the
+    arms did not start from bit-identical weights, the data axis would be
+    confounded with the init. Also asserts the historical seed-0 init is
+    unchanged by the seed plumbing.
+    """
+    import torch
+    from train_gpu import Trainer
+    tmp = tempfile.mkdtemp()
+    data = os.path.join(tmp, "t.txt")
+    with open(data, "w") as f:
+        f.write("the quick brown fox jumps over the lazy dog. " * 4000)
+
+    def arm(seed, data_seed, path):
+        t = Trainer(path, batch=64, from_scratch=True, seed=seed,
+                    data_seed=data_seed, device="cpu", dim=64, layers=2,
+                    max_steps=3)
+        t.train(save=lambda *a: None, dataset=os.path.join(tmp, "*.txt"))
+        return t
+
+    a = arm(0, 0, os.path.join(tmp, "a.npz"))
+    b = arm(0, 1, os.path.join(tmp, "b.npz"))
+    c = arm(7, 0, os.path.join(tmp, "c.npz"))
+    # Same seed, different data ordering -> identical starting weights.
+    same = torch.equal(a.model.theta, b.model.theta)
+    # Different seed -> genuinely different init (the flag is not a no-op).
+    diff = not torch.equal(a.model.theta, c.model.theta)
+    # It really starts at t=0 and trains forward.
+    t0 = a.start_t == 0
+    # A stale checkpoint at the path must NOT be loaded in from-scratch mode.
+    stale = os.path.join(tmp, "d.npz")
+    np.savez(stale, theta=np.full((100,), 7.0, np.float32), B=np.array(64))
+    d = Trainer(stale, batch=64, from_scratch=True, seed=0, device="cpu",
+                dim=64, layers=2, max_steps=1)
+    d.train(save=lambda *a: None, dataset=os.path.join(tmp, "*.txt"))
+    ignored = d.start_t == 0
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok = same and diff and t0 and ignored
+    if not same:
+        print("    same seed did not give identical init")
+    if not diff:
+        print("    --seed is a no-op: different seeds gave identical init")
+    if not ignored:
+        print("    from-scratch loaded a stale checkpoint")
+    return ok
+
+
 def main():
     items = [
         ("1  A/B tag isolation", item1_multiarm_tags),
@@ -213,6 +263,7 @@ def main():
         ("9  hub content validation", item9_content_validation),
         ("10 equal-step conflict", item10_equal_step_conflict),
         ("12 --push --no-tagged rejected", item12_push_no_tagged_rejected),
+        ("13 from-scratch seed/isolation", item13_from_scratch_seed),
     ]
     bad = []
     for name, fn in items:

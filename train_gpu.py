@@ -95,9 +95,18 @@ def save_checkpoint(model, rolling, keep_k, tagged, tag_dir=None):
 class Trainer:
     def __init__(self, path, batch=1024, save_every=1000, keep_k=8,
                  tagged=True, max_steps=0, data_seed=0, device=Device,
-                 **model_kw):
-        self.model = GpuModel(device=str(device), **model_kw)
+                 from_scratch=False, seed=0, log_every=0, **model_kw):
+        # The init is drawn from a numpy Generator seeded inside GpuModel, so
+        # --seed is threaded through to make starting weights reproducible. Two
+        # from-scratch A/B arms with the same seed start bit-identical, which
+        # is what makes them byte-matched on the data axis alone.
+        self.model = GpuModel(device=str(device), seed=seed, **model_kw)
         self.path = path
+        self.seed = int(seed)
+        # 0 => log every batch*100 steps (the historical cadence). A short
+        # calibration run needs a much smaller interval to report a rate.
+        self.log_every = int(log_every) or batch * 100
+        self.from_scratch = bool(from_scratch)
         self.batch = batch
         self.save_every = save_every
         self.keep_k = keep_k
@@ -110,17 +119,26 @@ class Trainer:
         m = self.model
         m.new_states(self.batch)
         with_hub = _with_hub(hub_repo)
-        if hub_repo:
-            with_hub(hub.pull, self.path)     # may write/link self.path
-        if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
-            ck = np.load(self.path)
-            ck_B = int(ck["B"]) if "B" in ck else None
-            if ck_B is not None and ck_B != self.batch:
-                print(f"  [warn] checkpoint B={ck_B} but --batch {self.batch}: "
-                      f"recurrent rows resized (numpy_port does the same). A/B "
-                      f"arms must state B + LR (PLAN §6).", flush=True)
-            m.load(self.path)
-            del ck
+        if self.from_scratch:
+            # Deliberately t=0: no pull, no load, no inherited state. The
+            # experiment asks what a model can learn from ONE corpus, so any
+            # prior exposure to the arm's own data would confound the verdict.
+            print(f"  [from-scratch] t=0, seeded init (seed={self.seed}), "
+                  f"ring_k={m.ring_k}; no checkpoint pulled or loaded",
+                  flush=True)
+        else:
+            if hub_repo:
+                with_hub(hub.pull, self.path, expect_n=m.theta.numel(),
+                         require_digest=True)     # may write/link self.path
+            if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+                ck = np.load(self.path)
+                ck_B = int(ck["B"]) if "B" in ck else None
+                if ck_B is not None and ck_B != self.batch:
+                    print(f"  [warn] checkpoint B={ck_B} but --batch {self.batch}: "
+                          f"recurrent rows resized (numpy_port does the same). "
+                          f"A/B arms must state B + LR (PLAN §6).", flush=True)
+                m.load(self.path)
+                del ck
         # --steps is RELATIVE: train N more steps from wherever we resumed
         self.start_t = m.t
         self.stop_t = self.start_t + self.max_steps if self.max_steps else 0
@@ -177,11 +195,15 @@ class Trainer:
                             with_hub(hub.push, out)
                         print(f"  [save] {os.path.basename(out)} t={m.t}",
                               flush=True)
-                    if total % (self.batch * 100) == 0:
+                    if self.log_every and total % self.log_every == 0:
                         dt = time.time() - t0
+                        # Async metric mode keeps CUDA work queued; synchronize
+                        # only at the logging boundary, not once per step.
+                        loss_value = float(loss_win / n_win)
+                        ce_value = float(ce_win / n_win)
                         print(f"  {total/1e6:.1f} MB | {total/dt:.0f} B/s | "
-                              f"step {m.t} | loss {loss_win/n_win:.3f} | "
-                              f"ce {ce_win/n_win:.3f}", flush=True)
+                              f"step {m.t} | loss {loss_value:.3f} | "
+                              f"ce {ce_value:.3f}", flush=True)
                         loss_win = ce_win = 0.0
                         n_win = 0
 
@@ -225,6 +247,30 @@ def main():
     ap.add_argument("--layers", type=int, default=16)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--decay-init", type=float, default=None)
+    ap.add_argument("--from-scratch", action="store_true",
+                    help="start at t=0 with a seeded random init; no pull, no "
+                         "load. For corpus A/B arms where inherited exposure to "
+                         "the arm's own data would confound the verdict.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="torch seed for the from-scratch init (0 = the "
+                         "historical default). Use the SAME seed across arms "
+                         "so their starting weights are bit-identical.")
+    ap.add_argument("--log-every", type=int, default=0,
+                    help="print the B/s/loss line every N steps (0 = every "
+                         "batch*100). Short calibration runs need this to "
+                         "report a throughput rate at all.")
+    ap.add_argument("--ring-credit", choices=("auto", "full", "compiled", "triton"),
+                    default="auto",
+                    help="auto = Inductor-fused on CUDA (+27%% measured), full "
+                         "on CPU; triton = fused-kernel fallback")
+    ap.add_argument("--grad-assembly", choices=("cat", "loop"), default="cat",
+                    help="cat = one fused gradient-buffer write (default, "
+                         "bit-identical); loop = 69-copy reference for A/B")
+    ap.add_argument("--async-metrics", action="store_true",
+                    help="do not synchronize loss/CE every step; enables compile/graph experiments")
+    ap.add_argument("--compile-step", action="store_true",
+                    help="wrap the steady-state step in torch.compile/reduce-overhead "
+                         "(the measured A3 candidate; requires --async-metrics)")
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--keep-k", type=int, default=8)
     ap.add_argument("--no-tagged", action="store_true",
@@ -245,6 +291,9 @@ def main():
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.compile_step and not args.async_metrics:
+        sys.exit("--compile-step requires --async-metrics (a host float(loss) "
+                 "prevents CUDA graph/compile capture)")
     if args.no_tagged and (args.push or args.hub_repo
                           or os.environ.get("TMT_HUB_REPO")
                           or os.environ.get("TMT_HUB_URL")):
@@ -264,7 +313,12 @@ def main():
                 keep_k=args.keep_k, tagged=not args.no_tagged,
                 max_steps=args.steps, data_seed=args.data_seed,
                 device=args.device, dim=args.dim, layers=args.layers,
-                lr=args.lr, decay_init=args.decay_init)
+                lr=args.lr, decay_init=args.decay_init,
+                ring_credit=args.ring_credit,
+                grad_assembly=args.grad_assembly,
+                sync_metrics=not args.async_metrics,
+                from_scratch=args.from_scratch, seed=args.seed,
+                log_every=args.log_every)
     print(f"parameters: {t.model.theta.shape[0]:,} | device {args.device}",
           flush=True)
     if args.mode == "train":
