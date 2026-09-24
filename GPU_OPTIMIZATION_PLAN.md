@@ -64,6 +64,35 @@ traffic model: deleting the materialized `ring_vals` temporary, which Inductor
 fuses into the scatter. That single change is +20%, and it is the whole of the
 remaining Phase-A win — not the 1.5x the phase targeted.
 
+### 0.1 What the profiler changed (measured, T4, `bench_variants.py --profile`)
+
+`step_batch` now carries `record_function` phase regions (bit-identical output
+with them on). Per-step attribution:
+
+| phase | ms/step | share |
+|---|---|---|
+| **ring_credit** | 21.3 | 34% |
+| bwd_layers | 15.7 | 25% |
+| **tail_credit** | 10.2 | 16% |
+| fwd_layers | 10.2 | 16% |
+| decaytrace | 3.6 | 6% |
+| optimizer | 3.0 | 5% |
+
+Kernel-level facts that redirect the work:
+
+- **`masked_fill` costs 5.1 ms/step (8%)** to zero hot columns that are **1.4%
+  of the data**. The ring's cost is *strided indexing*, not bandwidth — which is
+  why `a1-cold` gained nothing (it swapped a slow masked write for an equally
+  slow gather). The fix is a **contiguous cold-only ring layout**.
+- **`cudaLaunchKernel`: 10.1 ms/step, 1,072 launches/step.** Real overhead, and
+  the right target for A3 — but via a hand-rolled `torch.cuda.CUDAGraph`, not
+  `torch.compile` over the whole step (which was 0.003x).
+- **The layer stack is 41% of the step and was never a target.** Only 8.3 ms of
+  its 26 ms is sgemm; the rest is layer_norm/activation/state elementwise.
+  Compiling just the layer function is the next candidate.
+- **The tail is 16%, not the 9% the traffic model implied**, which is why
+  `b2-tail` landed at 0.99x.
+
 ---
 
 ## 1. Where the time goes (as believed at writing time — corrected by §0)

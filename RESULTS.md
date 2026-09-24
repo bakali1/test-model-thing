@@ -106,6 +106,59 @@ remote pruning; crash-safe versioned corpus publication; HF pagination with
 revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
 exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
 
+### Kernel/phase attribution (T4, baseline, 3 profiled steps)
+
+`gpu_port.step_batch` now carries `record_function` phase regions (on by
+default; `TMT_PROFILE_REGIONS=0` disables; verified bit-identical output with
+them on). Attribution, per step (profiled wall 63 ms vs 51 ms unprofiled — the
+profiler adds overhead; use the ratios):
+
+| phase | ms/step | share of phase time |
+|---|---|---|
+| **ring_credit** | 21.3 | 34% |
+| bwd_layers | 15.7 | 25% |
+| **tail_credit** | 10.2 | 16% |
+| fwd_layers | 10.2 | 16% |
+| decaytrace | 3.6 | 6% |
+| optimizer | 3.0 | 5% |
+| loss/decoder/grad_copy | 0.9 | 1% |
+
+Top device kernels per step (from the same run):
+
+| kernel | ms/step | what it is |
+|---|---|---|
+| `elementwise_kernel` (MulFunctor) | 13.7 | ring decay, ring_vals multiply, tail `E.mul_` |
+| `indexFuncLargeIndex ReduceAdd` | 9.0 | `dembed.index_add_` (17 calls/step) |
+| `cudaLaunchKernel` (CPU time) | 10.1 | **1,072 launches per step** |
+| `direct_copy_kernel` | 5.8 | advanced-index copies (`w[:, p] = 1.0`, tail adds) |
+| **`masked_fill_kernel`** | **5.1** | **zeroing the 1.4% hot columns of the ring** |
+| sgemm (`volta_sgemm_*`) | 8.3 | the actual matmuls |
+
+**What this changes about the plan (all measured, not inferred):**
+
+1. **The ring's cost is strided indexing, not bandwidth.** `masked_fill` alone
+   is 5.1 ms/step (8% of the step) to zero columns that are 1.4% of the data.
+   The cost is the non-coalesced boolean-mask write, not the bytes. This also
+   explains why `a1-cold` gained nothing measurable (1.03x): it replaced a slow
+   masked write with an equally slow `index_select` gather. The fix is a
+   *contiguous cold-only ring layout* (physically store only the ~8,192-115
+   cold columns), which my plan dismissed as a science change for a reason that
+   now looks weak: a dim dropping out of the hot set would lose ≤18 steps of
+   history for 1 of 8,192 columns.
+2. **Launch overhead is ~10 ms/step (1,072 launches).** This is the real target
+   for A3, and `torch.compile(mode="reduce-overhead")` over the whole step was
+   the wrong tool (0.003x — it recompiles instead of replaying). A hand-rolled
+   `torch.cuda.CUDAGraph` capture of the steady-state step, or fusing just the
+   16 layer forwards/backwards, is the correct shape of that experiment.
+3. **The layer stack is 41% of the step and was never targeted.** Only 8.3 ms
+   of the 26 ms in fwd+bwd layers is sgemm; the rest is layer_norm, the
+   `x*(1+z*sg)` activation, and state updates. Compiling *only* the layer
+   function (a much smaller, static-shape graph than the whole step) is the
+   obvious next candidate.
+4. **The tail is 16%, not 9%** — closer to the size of the ring's decay, which
+   is why `b2-tail` (factored decay) was ~1.0x: it removed the `E.mul_` traffic
+   but added a per-step factor update and a division at renormalization.
+
 ### Phase-0 optimization board — MEASURED on T4 (2026-09-24)
 
 `bench_variants.py` run on the live checkpoint (t=94,747, B=1024, 12 timed

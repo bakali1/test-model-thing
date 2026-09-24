@@ -59,6 +59,28 @@ def _sig(x):
     return torch.sigmoid(x)
 
 
+# Phase profiling hooks. `record_function` is ~1 us per region and the regions
+# below cost ~0.02% of a 48 ms step, so they are on by default; set
+# TMT_PROFILE_REGIONS=0 to remove even that.
+_PROFILE_REGIONS = os.environ.get("TMT_PROFILE_REGIONS", "1") != "0"
+try:
+    from torch.profiler import record_function as _record_function
+
+    def _region(name):
+        return _record_function(name)
+except Exception:                                    # pragma: no cover
+    def _region(name):
+        return _null_region()
+
+
+class _null_region:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def _layer_norm(x, g, b, eps=1e-5):
     """Mirror of numpy_port.batch_layernorm (biased var, eps=1e-5)."""
     mu = x.mean(dim=1, keepdim=True)
@@ -637,31 +659,41 @@ class GpuModel:
     # ---------------- training step --------------------
     def step_batch(self, cs, ns, ends):
         """cs/ns: int64 tensors (B,), ends: fp32 (B,) — all on self.device.
-        Returns loss (python float). Mirrors numpy_port.step_batch exactly."""
+        Returns loss (python float, or a device tensor when sync_metrics=False).
+        Mirrors numpy_port.step_batch exactly.
+
+        Phase regions (`TMT_PROFILE_REGIONS=0` disables) let the Phase-0
+        profiler attribute time to ring / tail / optimizer / layer fwd-bwd
+        instead of leaving us to guess from raw kernel names.
+        """
+        rf = _region if _PROFILE_REGIONS else _null_region
         self.t += 1
         B = cs.shape[0]
         self.bytes_seen += B
         c_arr, n_arr, end_arr = cs, ns, ends
 
-        enc = self.embed[c_arr]                          # (B, dim)
-        x = enc
-        caches, states, decays = [], [], []
-        for l in self.layers:
-            x, state, decay, cache = l.forward(enc, x, l.states)
-            caches.append(cache)
-            states.append(state)
-            decays.append(decay)
+        with rf("fwd_layers"):
+            enc = self.embed[c_arr]                      # (B, dim)
+            x = enc
+            caches, states, decays = [], [], []
+            for l in self.layers:
+                x, state, decay, cache = l.forward(enc, x, l.states)
+                caches.append(cache)
+                states.append(state)
+                decays.append(decay)
 
-        output = x @ self.Wd.t() + self.bd               # (B, 256)
-        stop = _sig(x @ self.Ws + self.bs[0])            # (B,)
+        with rf("decoder"):
+            output = x @ self.Wd.t() + self.bd           # (B, 256)
+            stop = _sig(x @ self.Ws + self.bs[0])        # (B,)
 
-        xv = x.var(dim=1, unbiased=False) + 1e-4
-        var_active = (1.0 - torch.sqrt(xv)) > 0
-        tgt = self.embed[n_arr].detach()
-        mx = output.max(dim=1, keepdim=True).values
-        lse = mx + torch.log(torch.exp(output - mx).sum(dim=1, keepdim=True))
-        ar = torch.arange(B, device=self.device)
-        ce = lse[:, 0] - output[ar, n_arr]
+        with rf("loss_metrics"):
+            xv = x.var(dim=1, unbiased=False) + 1e-4
+            var_active = (1.0 - torch.sqrt(xv)) > 0
+            tgt = self.embed[n_arr].detach()
+            mx = output.max(dim=1, keepdim=True).values
+            lse = mx + torch.log(torch.exp(output - mx).sum(dim=1, keepdim=True))
+            ar = torch.arange(B, device=self.device)
+            ce = lse[:, 0] - output[ar, n_arr]
         loss_tensor = (torch.where(var_active, 1.0 - torch.sqrt(xv), 0.0).sum()
                        + ((x - tgt) ** 2).sum() / self.dim
                        + ce.sum() + ((stop - end_arr) ** 2).sum()) / B
@@ -677,8 +709,8 @@ class GpuModel:
             loss = loss_tensor
             self.last_ce = ce_tensor
 
-        # ---- backward: decoder ----
-        doutput = torch.exp(output - lse)                # softmax
+        with rf("bwd_decoder"):
+            doutput = torch.exp(output - lse)            # softmax
         doutput[ar, n_arr] -= 1.0
         dWd = doutput.t() @ x
         dbd = doutput.sum(dim=0)
@@ -693,17 +725,17 @@ class GpuModel:
         dx = dx + (dvar * 2.0 * (x - x.mean(dim=1, keepdim=True)) / self.dim)
         dx = dx + (2.0 * (x - tgt) / self.dim)
 
-        # ---- propagate through layers ----
-        denc = dx.clone()
-        lw, lg, lb, lgrads = [], [], [], []
-        for i in reversed(range(self.layercount)):
-            l = self.layers[i]
-            dstate, dW, dg, db = l.backward(dx, caches[i])
-            # dx_in == dx_out (residual pass-through); state grad -> denc
-            denc = denc + dstate
-            lw.append(dW); lg.append(dg); lb.append(db)
-            lgrads.append(dstate)
-        lgrads.reverse(); lw.reverse(); lg.reverse(); lb.reverse()
+        with rf("bwd_layers"):
+            denc = dx.clone()
+            lw, lg, lb, lgrads = [], [], [], []
+            for i in reversed(range(self.layercount)):
+                l = self.layers[i]
+                dstate, dW, dg, db = l.backward(dx, caches[i])
+                # dx_in == dx_out (residual pass-through); state grad -> denc
+                denc = denc + dstate
+                lw.append(dW); lg.append(dg); lb.append(db)
+                lgrads.append(dstate)
+            lgrads.reverse(); lw.reverse(); lg.reverse(); lb.reverse()
 
         # ---- trace updates (ring + tail credit) ----
         self._ensure_tail()
@@ -734,31 +766,33 @@ class GpuModel:
                 self.tail.begin_step(i, dec[self.tail.cols_of(i)])
             hot_mask = (self.tail.mask_of(i)
                         if self.tail is not None and self.tail.nhot(i) else None)
-            self._scatter_ring_credit(i, w, dlds, rows, hot_mask)
+            with rf("ring_credit"):
+                self._scatter_ring_credit(i, w, dlds, rows, hot_mask)
+                w[:, p] = 1.0                            # this byte = lag 1
+                if self.ring_algorithm == "factored":
+                    w._factor[:, p] = 1.0
             if self.tail is not None and self.tail.nhot(i):
-                tailc = self.tail.credit(i, dlds)
-                if tailc is not None:
-                    cols = self.tail.cols_of(i)
-                    dembed[:, cols] = dembed[:, cols] + tailc
-            # sum-scatter (np.add.at): duplicate rows accumulate
-            w[:, p] = 1.0                                # this byte = lag 1
-            if self.ring_algorithm == "factored":
-                w._factor[:, p] = 1.0
-            if self.tail is not None and self.tail.nhot(i):
-                self.tail.add_byte(i, c_arr)
-                if (self.tail_algorithm == "factored"
-                        and self.t % self._tail_renorm_every == 0):
-                    self.tail.end_step(i)
-            l.decaytrace = (dec[None, :] * l.decaytrace +
-                            dec[None, :] * (1.0 - dec[None, :]) * l.states)
-            decay_grads.append((dlds * l.decaytrace).sum(dim=0))
+                with rf("tail_credit"):
+                    tailc = self.tail.credit(i, dlds)
+                    if tailc is not None:
+                        cols = self.tail.cols_of(i)
+                        dembed[:, cols] = dembed[:, cols] + tailc
+                    self.tail.add_byte(i, c_arr)
+                    if (self.tail_algorithm == "factored"
+                            and self.t % self._tail_renorm_every == 0):
+                        self.tail.end_step(i)
+            with rf("decaytrace"):
+                l.decaytrace = (dec[None, :] * l.decaytrace +
+                                dec[None, :] * (1.0 - dec[None, :]) * l.states)
+                decay_grads.append((dlds * l.decaytrace).sum(dim=0))
             l.states = states[i]                         # stop_gradient
 
         self.ring_b[:, p] = c_arr
         dembed.index_add_(0, c_arr, denc)                # autograd part
 
-        gv = self.gviews
-        gv["embed"].copy_(dembed.reshape_as(gv["embed"]))
+        with rf("grad_copy"):
+            gv = self.gviews
+            gv["embed"].copy_(dembed.reshape_as(gv["embed"]))
         gv["Wd"].copy_(dWd.reshape_as(gv["Wd"]))
         gv["bd"].copy_(dbd.reshape_as(gv["bd"]))
         gv["Ws"].copy_(dWs.reshape_as(gv["Ws"]))
@@ -770,14 +804,15 @@ class GpuModel:
             gv[f"layer{i}.decay"].copy_(decay_grads[i].reshape_as(gv[f"layer{i}.decay"]))
 
         # ---- flat inline AdamW (mirror numpy_port exactly) ----
-        t = self.t
-        th, gr, m, v = self.theta, self.grads, self.m, self.v
-        m.mul_(self.b1).add_((1.0 - self.b1) * gr)
-        v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
-        v.sqrt_()
-        th.sub_(self.lr * (m * (1.0 / (1.0 - self.b1 ** t)) /
-                           (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
-                           + self.wd * th))
+        with rf("optimizer"):
+            t = self.t
+            th, gr, m, v = self.theta, self.grads, self.m, self.v
+            m.mul_(self.b1).add_((1.0 - self.b1) * gr)
+            v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
+            v.sqrt_()
+            th.sub_(self.lr * (m * (1.0 / (1.0 - self.b1 ** t)) /
+                               (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
+                               + self.wd * th))
         return loss
 
     # ---------------- persistence / bridging -------------

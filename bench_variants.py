@@ -166,11 +166,19 @@ def run_variant(path, B, steps, device, cs, ns, ends, variant, reference):
     return result
 
 
-def profile_baseline(path, B, steps, device):
-    """Record actual kernel attribution rather than relying on traffic estimates."""
+def profile_baseline(path, B, steps, device, nsteps=3):
+    """Kernel + PHASE attribution.
+
+    The phase table is the actionable part: it uses the record_function regions
+    in gpu_port.step_batch, so time is attributed to ring_credit / tail_credit /
+    optimizer / fwd_layers / bwd_layers rather than to anonymous kernels. The
+    'accounted' line compares the sum of leaf kernel device time with the wall
+    clock of the same steps, so the gap (launch overhead, gaps, unaccounted
+    ops) is explicit instead of being silently assumed away.
+    """
     from torch.profiler import ProfilerActivity, profile
     m = model_for(path, B, device, "baseline")
-    cs, ns, ends = bytes_for(B, steps + 2, device)
+    cs, ns, ends = bytes_for(B, max(steps, nsteps) + 2, device)
     for i in range(2):
         m.step_batch(cs[i], ns[i], ends[i])
     if device.type == "cuda":
@@ -178,22 +186,67 @@ def profile_baseline(path, B, steps, device):
     acts = [ProfilerActivity.CPU]
     if device.type == "cuda":
         acts.append(ProfilerActivity.CUDA)
+
+    def us_of(e):
+        # torch >=2.6 renamed self_cuda_time_total -> self_device_time_total;
+        # probe the ladder so this works across versions.
+        for attr in ("self_device_time_total", "self_cuda_time_total"):
+            v = getattr(e, attr, None)
+            if v:
+                return float(v), "device"
+        return float(getattr(e, "self_cpu_time_total", 0.0) or 0.0), "cpu"
+
     with profile(activities=acts, record_shapes=True) as prof:
-        m.step_batch(cs[2], ns[2], ends[2])
+        t_wall = time.perf_counter()
+        for i in range(nsteps):
+            m.step_batch(cs[2 + i], ns[2 + i], ends[2 + i])
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-    print("\n[profile] baseline top kernel/operator averages")
-    rows = []
-    for e in prof.key_averages():
-        # torch >=2.6 exposes self_device_time_total; older builds use
-        # self_cuda_time_total (CUDA) / self_cpu_time_total.
-        us = (getattr(e, "self_device_time_total", None)
-              or getattr(e, "self_cuda_time_total", None)
-              or e.self_cpu_time_total or 0.0)
-        if us > 0:
-            rows.append((float(us), e.key, int(e.count)))
-    for us, name, count in sorted(rows, reverse=True)[:25]:
-        print(f"  {us:10.1f} us  n={count:<3d} {name}")
+        wall_us = (time.perf_counter() - t_wall) / nsteps * 1e6
+    events = prof.key_averages()
+    src = "device" if device.type == "cuda" else "cpu"
+    # phase table
+    phases, kernels = {}, []
+    REGIONS = ("fwd_layers", "decoder", "loss_metrics", "bwd_decoder",
+               "bwd_layers", "ring_credit", "tail_credit", "decaytrace",
+               "grad_copy", "optimizer")
+    for e in events:
+        us, kind = us_of(e)
+        if us <= 0:
+            continue
+        key = e.key
+        if not key.startswith("aten::"):
+            kernels.append((us, kind, key, int(e.count)))
+        short = key.split("/")[-1] if "/" in key else key
+        if short in REGIONS:
+            phases[short] = phases.get(short, 0.0) + us
+    print(f"\n[profile] baseline, B={B}, {nsteps} steps, "
+          f"wall {wall_us/1000:.2f} ms/step, time source = {src}")
+    if phases:
+        tot = sum(phases.values())
+        print(f"  {'phase':<14s} {'ms/step':>9s} {'% wall':>7s}")
+        for name, us in sorted(phases.items(), key=lambda kv: -kv[1]):
+            # key_averages() totals span the WHOLE profiled window, so divide by
+            # nsteps before comparing against a per-step wall clock (otherwise
+            # the table sums to nsteps x 100% and lies).
+            print(f"  {name:<14s} {us/1000/nsteps:9.3f} "
+                  f"{100*us/tot:6.1f}%")
+        print(f"  {'TOTAL':<14s} {tot/1000/nsteps:9.3f} "
+              f"{100.0:6.1f}%")
+    else:
+        print("  (no phase regions found -- was gpu_port regenerated?)")
+    acct = sum(phases.values())
+    print(f"  accounted by phase regions: {acct/1000/nsteps:.3f} ms/step "
+          f"= {100*acct/(wall_us*nsteps):.1f}% of wall; the remainder is "
+          f"launch overhead / profiler gaps / ops outside the regions")
+    if device.type == "cuda" and acct < 0.7 * wall_us * nsteps:
+        print("  WARNING: phases explain <70% of wall on CUDA -- the missing "
+              "time is outside the instrumented regions (check for graph "
+              "replay, unplanned syncs, or allocator stalls).")
+    print(f"  top kernels ({src} time, per step; NOTE aten:: parents include "
+          f"their children, so do NOT sum this column):")
+    for us, kind, key, count in sorted(kernels, reverse=True)[:20]:
+        print(f"  {us/1000/nsteps:9.3f} ms  n={count//nsteps:<4d} {key[:110]}")
 
 
 def atomic_microbench(B, device, steps=10):
@@ -231,6 +284,9 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--variants", default="baseline,a1-cold,a2-kloop,b1-ring,b2-tail,b1-b2,c-segmented")
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--profile-steps", type=int, default=3,
+                    help="steps to profile (>=1); more steps amortize profiler "
+                         "overhead and make the phase table stabler")
     ap.add_argument("--atomic-microbench", action="store_true")
     args = ap.parse_args()
     device = torch.device(args.device)
@@ -284,8 +340,11 @@ def main():
               f"{r['state_abs']:10.2e} {r['state_nrel']:10.2e}")
     if args.profile:
         try:
-            profile_baseline(args.checkpoint, args.B, args.steps, device)
+            profile_baseline(args.checkpoint, args.B, args.steps, device,
+                             nsteps=args.profile_steps)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[profile] unavailable: {type(e).__name__}: {e}")
     if args.atomic_microbench:
         try:
