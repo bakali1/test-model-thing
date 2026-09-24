@@ -291,7 +291,12 @@ if triton is not None:
         value = tl.load(wp, mask=valid, other=0.0)
         value *= tl.load(grad_ptr + b * D + cols, mask=valid, other=0.0)
         if HAS_FACTOR:
-            value *= tl.load(factor_ptr + b * K + k)
+            # factor is (B,K,D): the decay is per (stream, slot, dim), so the
+            # load must be strided by D like w. Loading a bare scalar here
+            # (factor[b,k,0]) scales the whole row by one dim's decay, which
+            # measured 11x RMS state error.
+            value *= tl.load(factor_ptr + (b * K + k) * D + cols,
+                             mask=valid, other=0.0)
         if HAS_MASK:
             value = tl.where(tl.load(hot_ptr + cols, mask=valid, other=1), 0.0,
                              value)

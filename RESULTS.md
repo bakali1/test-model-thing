@@ -106,7 +106,77 @@ remote pruning; crash-safe versioned corpus publication; HF pagination with
 revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
 exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
 
-### Ruler verdict on the banked leg checkpoint (t=94,747 vs baseline t=64,747)
+### Phase-0 optimization board — MEASURED on T4 (2026-09-24)
+
+`bench_variants.py` run on the live checkpoint (t=94,747, B=1024, 12 timed
+steps, 2 warmups, digest-verified hub pull), one process, 6.1 min for the whole
+board including the CUDA profile and the atomic micro-benchmark.
+
+| variant | B/s | ms/step | vs baseline | peak GB | state/RMS |
+|---|---|---|---|---|---|
+| **a2-compiled** (Inductor-fused ring credit) | **23,933** | 42.8 | **1.20x** | 1.17 | 3.6e-05 |
+| a1-cold (cold-column ring credit) | 20,679 | 49.5 | 1.03x | 1.23 | 1.4e-04 |
+| baseline (legacy) | 20,023 | 51.1 | 1.00x | 1.17 | — |
+| b2-tail (factored tail decay) | 19,791 | 51.7 | 0.99x | 1.18 | 7.3e-05 |
+| a2-kloop | 19,298 | 53.1 | 0.96x | 1.17 | 3.6e-05 |
+| c-triton (fused ring kernel) | 18,287 | 56.0 | 0.91x | 1.17 | 3.6e-05 |
+| b1-triton | 18,010 | 56.9 | 0.90x | 1.78 | 3.6e-05 |
+| b1-b2 | 17,170 | 59.6 | 0.86x | 1.78 | 7.3e-05 |
+| b1-ring (factored ring decay) | 17,014 | 60.2 | 0.85x | 1.78 | 4.1e-05 |
+| c-segmented (sort + segment-sum) | 14,105 | 72.6 | 0.71x | 1.19 | 1.3e-04 |
+| a3-compile (`torch.compile` reduce-overhead) | 68 | 14,994 | 0.003x | 1.18 | 1.0e-03 |
+
+Isolated ring-scatter micro-benchmark at production shape (one layer):
+`index_add_` **0.320 ms**, sort+segment-sum **0.661 ms**.
+
+**Verdict: exactly one candidate is worth adopting — `a2-compiled`, +20%.**
+Every prediction in the optimization plan that was based on traffic arithmetic
+rather than measurement was wrong, in both directions:
+
+- **B1 (factored ring decay) is a 15% REGRESSION, not a 1.2 GB/step win.** The
+  plan assumed the decay factor is `(B,K)`; it is `(B,K,D)` because `dec` is
+  per-(stream, dim). Factoring therefore trades a 37.7 MB multiply for an
+  identical-size factor multiply *plus* an extra multiply in the credit path,
+  and costs +0.61 GB of VRAM for nothing. The implementer's own code comment
+  said as much; the measurement confirms it.
+- **C (kill the atomics) was aimed at a cost that does not exist.** The plan
+  budgeted ~25 ms/step for atomics; the isolated measurement is 0.320 ms per
+  layer, ~5.1 ms for all 16. And sort+segment-sum is **2x slower** than the
+  atomics it replaces, because the gather costs more than the contention it
+  saves — exactly the caveat the plan carried but still ranked too high.
+- **The fused Triton kernel is slower** (0.91x), so the ring path is not
+  bandwidth-bound the way the model implied; one program per (b,k) slot with a
+  512-wide row is not a good access shape.
+- **A1 is within noise** (1.03x), consistent with the arithmetic correction:
+  hot dims are 57-115 *total* across 8,192 ring dimensions (0.7-1.4%), not the
+  22% first claimed.
+- **A3 (`torch.compile` reduce-overhead over the whole step) is catastrophic**
+  (0.003x): graph-capture plus per-step data-dependent control flow recompiles
+  instead of replaying. Must not be attempted again in this shape.
+
+### Bugs found while verifying (all three fixed, all now gated)
+
+1. **Factored tail added `a` instead of `a/c`** — the recurrence `E = P*c` with
+   `c_{t+1} = sig*c_t` requires `P += a/c`; adding `a` over-decays every byte
+   add by one factor of `sig`. Measured **35x RMS** divergence from legacy, with
+   the loss moving only 3.8e-04 — invisible at the precision anyone would eyeball.
+2. **Factored-ring tail seeding** multiplied the adopted `(B,K,H1)` ring gather
+   by the ungathered `(B,K,D)` factor: crash on shape mismatch, and silent
+   corruption of the wrong dims if `H1 == D`.
+3. **Triton kernel loaded the decay factor as a scalar** (`factor[b,k,0]`) and
+   scaled the whole 512-wide row by one dimension's decay: **11x RMS** state
+   error. Fixed to a strided `(B,K,D)` load; b1-triton now agrees at 3.6e-05.
+4. `bench_variants.py` forced a host sync per timed step (`float(loss)` inside
+   the timing loop), which silently cancelled the entire point of the A3
+   async-metrics candidate; and its profiler used a torch attribute removed
+   after 2.6, crashing the profile section.
+
+`tests/check_variants.py` (new, CPU, free) now gates every candidate against
+legacy: ring-credit paths at 1e-4, factored at 1e-3, scale-aware. The default
+legacy path is bit-identical to the committed engine over 120 steps, so
+production is unaffected by any of the candidates.
+
+
 
 | metric | baseline t=64,747 | after 30k steps t=94,747 | delta |
 |---|---|---|---|
