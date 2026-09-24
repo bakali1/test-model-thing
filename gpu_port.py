@@ -195,6 +195,13 @@ class GpuModel:
             torch.backends.cuda.matmul.allow_tf32 = False  # fp32 only
         self.t = 0
         self.bytes_seen = 0
+        # same documented switch as numpy_port: TMT_TAIL=0 disables the exact
+        # long-lag credit entirely (ring-only embed credit, as pre-tail).
+        self.tail_enabled = os.environ.get("TMT_TAIL", "1") != "0"
+        # Tail memory = sum_layers B*256*H*4 bytes. At B=4096 with 512 hot
+        # dims/layer that is ~34 GB: guard before allocating (PLAN risk list:
+        # "hot-dim blowup: abort if tail > cap"). Override with TMT_TAIL_CAP_GB.
+        self.tail_cap_gb = float(os.environ.get("TMT_TAIL_CAP_GB", "4.0"))
         with torch.no_grad():
             lim = 1.0 / np.sqrt(dim)
             dmax = float(_sig(torch.tensor(
@@ -269,6 +276,8 @@ class GpuModel:
 
     # ---------------- tail credit --------------------
     def _ensure_tail(self):
+        if not self.tail_enabled:
+            return
         if self.tail is None or self.tail.B != self.B:
             self.tail = TorchTail(self.B, self.ring_k, device=self.device)
             if self.tail_state:
@@ -289,6 +298,17 @@ class GpuModel:
                            ).detach().cpu().numpy().astype(np.float32)
         self.tail.sync(sigs, [l.ring_w for l in self.layers],
                        self.ring_b, self.dim)
+        nhot = sum(int(c.numel()) for c in self.tail.cols.values())
+        e_bytes = sum(int(E.numel()) * 4 for E in self.tail.E.values())
+        if e_bytes > self.tail_cap_gb * 1e9:
+            raise RuntimeError(
+                f"tail-credit memory {e_bytes/1e9:.1f} GB exceeds cap "
+                f"{self.tail_cap_gb:.1f} GB ({nhot} hot dims at B={self.B}). "
+                f"Lower --batch, or TMT_TAIL=0 (ring-only credit), or raise "
+                f"TMT_TAIL_CAP_GB deliberately.")
+        if nhot > 256:
+            print(f"[tail] warning: {nhot} hot dims; accumulator "
+                  f"{e_bytes/1e6:.0f} MB", flush=True)
         self._tail_rebase_at = self.t
 
     def _tail_restore_from(self, d):
@@ -446,7 +466,7 @@ class GpuModel:
         out["v"] = self.v.detach().cpu().numpy()
         out["B"] = np.array(self.B, np.int64)
         out["ring_k"] = np.array(self.ring_k, np.int64)
-        if self.tail is not None:
+        if self.tail_enabled and self.tail is not None:
             for l, cols in self.tail.cols.items():
                 out[f"tail_cols.{l}"] = cols.cpu().numpy().astype(np.int64)
                 out[f"tail_E.{l}"] = self.tail.E[l].cpu().numpy()
@@ -504,10 +524,11 @@ class GpuModel:
                     else:
                         l.decaytrace.copy_(t)
         self.tail_state = {}
-        for i in range(self.layercount):
-            for key in (f"tail_cols.{i}", f"tail_E.{i}"):
-                if key in d:
-                    self.tail_state[key] = d[key]
+        if self.tail_enabled:
+            for i in range(self.layercount):
+                for key in (f"tail_cols.{i}", f"tail_E.{i}"):
+                    if key in d:
+                        self.tail_state[key] = d[key]
         self._ensure_tail()
         return True
 

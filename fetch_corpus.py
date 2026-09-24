@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -212,8 +213,14 @@ def _read_parquet(path, cols, batch_size=20000):
 # ----------------------------------------------------------------------------
 class CorpusWriter:
     def __init__(self, outdir, mb):
-        self.dir = outdir
-        os.makedirs(outdir, exist_ok=True)
+        # Stage into a hidden dir, then swap into place on close: an
+        # interrupted or smaller rerun must never leave stale corpus_*.txt
+        # that the trainer's glob would still read.
+        self.outdir = outdir
+        self.dir = os.path.join(outdir, ".staging")
+        if os.path.isdir(self.dir):
+            shutil.rmtree(self.dir)
+        os.makedirs(self.dir, exist_ok=True)
         self.target = int(mb * 1e6)
         self.parts = 0
         self.buf = []
@@ -247,6 +254,17 @@ class CorpusWriter:
             f.write(self.order.getvalue())
         with open(os.path.join(self.dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
+        # swap: drop old parts, move staged files in
+        for old in os.listdir(self.outdir):
+            if old.startswith("corpus_") and old.endswith(".txt"):
+                os.remove(os.path.join(self.outdir, old))
+        for name in sorted(os.listdir(self.dir)):
+            os.replace(os.path.join(self.dir, name),
+                       os.path.join(self.outdir, name))
+        try:
+            os.rmdir(self.dir)
+        except OSError:
+            pass
 
 
 def _auto_install(pkgs):
@@ -356,6 +374,11 @@ def main():
         transform = TRANSFORMS[spec["transform"]]
         lbudget = budgets[l]
         files = match_files(spec["repo"], spec["file_pat"])
+        # The seed really orders the fetch: file order is permuted with it
+        # (row order WITHIN a file stays source order — determinism by
+        # construction, and the manifest says so).
+        import random as _random
+        _random.Random(args.seed).shuffle(files)
         staged, docs = 0, 0
         stop = None
         print(f"\n[fetch] layer {l} {spec['label']} - {len(files)} files "
@@ -401,6 +424,8 @@ def main():
 
     manifest = {
         "spec_version": 1,
+        "ordering": "files shuffled with Random(seed); rows within a file in "
+                    "source order",
         "spec_hash": sh,
         "budgets_gb": {l: (None if budgets[l] is None else budgets[l] / 1e9)
                        for l in layers},

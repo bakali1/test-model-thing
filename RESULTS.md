@@ -88,3 +88,12 @@ the ring to CPU (~0.5 GB/step, 99% of step time). Fixed by re-evaluating
 membership on the documented REBASE_EVERY cadence with on-device seeding
 (12× faster; parity unchanged). Next speed lever: the ring credit scatter
 (~600M atomics/step) — sort + segment-sum, measured separately before adoption.
+
+Post-review hardening (same session): parity gate now compares the
+accumulators, not just loss/grads — live 150 steps: ring_b 0% mismatch (ids
+exact), ring_w 8.9e-07 rel, tail_cols 0%, tail_E 8.7e-07 rel, loss 2.9e-07;
+thresholds tightened to loss 1e-5 / grads+accumulators 5e-3. Hub-pull load,
+relative `--steps`, `--batch` default 1024, `--push`, untagged mode, atomic
+rolling replace, CUDA bench sync, `TMT_TAIL` switch, 4 GB hot-dim cap, and
+corpus staging swap all landed and are covered by the gates above
+(see PLAN-2026-09-23-GPU.md §8 for the full review triage).

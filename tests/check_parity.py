@@ -78,7 +78,24 @@ def run_steps(np_model, gpu_model, cs, ns, ends, n_steps, warm="", verbose=True)
             worst_grad = (name, r)
     rm = rel(np_model.m, gpu_model.m.detach().cpu().numpy())
     rv = rel(np_model.v, gpu_model.v.detach().cpu().numpy())
-    return bad_loss, bad_ce, worst_grad, rm, rv, time.time() - t0
+    # accumulator parity: ring ids, ring weights, tail cols, tail E
+    acc = {"ring_b": 0.0, "ring_w": 0.0, "tail_cols": 0.0, "tail_E": 0.0}
+    g_rb = gpu_model.ring_b.detach().cpu().numpy()
+    acc["ring_b"] = float((np_model.ring_b != g_rb).mean())     # ids: exact
+    for i, l in enumerate(np_model.layers):
+        acc["ring_w"] = max(acc["ring_w"],
+                            rel(l.ring_w, gpu_model.layers[i].ring_w
+                                .detach().cpu().numpy(), floor=1e-6))
+        nt = np_model.tail.nhot(i) if np_model.tail else 0
+        gt = gpu_model.tail.nhot(i) if gpu_model.tail else 0
+        if nt != gt:
+            acc["tail_cols"] = 1.0
+        elif nt:
+            e_np = np_model.tail.E[i]
+            e_gp = gpu_model.tail.E[i].detach().cpu().numpy()
+            acc["tail_E"] = max(acc["tail_E"],
+                                rel(e_np, e_gp, floor=1e-3))
+    return bad_loss, bad_ce, worst_grad, rm, rv, acc, time.time() - t0
 
 
 def main():
@@ -98,11 +115,16 @@ def main():
           f"B {args.B} | dim {args.dim} layers {args.layers} | "
           f"tail hot: {[(i, np_model.tail.nhot(i)) for i in range(args.layers) if np_model.tail and np_model.tail.nhot(i)]}")
 
-    bl, bce, wg, rm, rv, dt = run_steps(np_model, gpu_model, cs, ns, ends,
-                                        args.steps, "live")
+    bl, bce, wg, rm, rv, acc, dt = run_steps(np_model, gpu_model, cs, ns, ends,
+                                             args.steps, "live")
+    hot_total = (sum(np_model.tail.nhot(i) for i in range(args.layers))
+                 if np_model.tail else 0)
     print(f"\n  live {args.steps} steps in {dt:.1f}s: maxrel loss {bl:.2e} "
-          f"ce {bce:.2e}")
+          f"ce {bce:.2e} | tail engaged on {hot_total} dims")
     print(f"  worst grad rel {wg[0]} = {wg[1]:.2e} | m {rm:.2e} v {rv:.2e}")
+    print(f"  accumulators: ring_b mismatch {acc['ring_b']:.0%} | ring_w rel "
+          f"{acc['ring_w']:.2e} | tail_cols mismatch {acc['tail_cols']:.0%} | "
+          f"tail_E rel {acc['tail_E']:.2e}")
 
     # ---- continuation: save npz from torch, reload into BOTH, keep going ----
     gpu_model.save("/tmp/_parity_a.npz")
@@ -115,10 +137,12 @@ def main():
     gp2.load("/tmp/_parity_a.npz")
     assert np2.t == gp2.t == np_model.t, (np2.t, gp2.t, np_model.t)
     assert np2.ring_k == gp2.ring_k == np_model.ring_k
-    bl2, bce2, wg2, rm2, rv2, dt2 = run_steps(
+    bl2, bce2, wg2, rm2, rv2, acc2, dt2 = run_steps(
         np2, gp2, cs, ns, ends, 40, "continue", verbose=False)
     print(f"  continue 40 steps through npz bridge: maxrel loss {bl2:.2e} "
-          f"ce {bce2:.2e} worst grad {wg2[1]:.2e} m {rm2:.2e} v {rv2:.2e}")
+          f"ce {bce2:.2e} worst grad {wg2[1]:.2e} m {rm2:.2e} v {rv2:.2e} | "
+          f"acc ring_b {acc2['ring_b']:.0%} ring_w {acc2['ring_w']:.2e} "
+          f"tail_E {acc2['tail_E']:.2e}")
 
     # ---- round-trip bit-exactness: torch save -> numpy save -> compare ----
     gpu_model.save("/tmp/_parity_b.npz")
@@ -134,8 +158,17 @@ def main():
             assert np.array_equal(d1[k], d2[k]), f"round-trip mismatch: {k}"
     print("  npz round-trip bit-exact: PASS")
 
-    ok = (bl < 1e-3 and bce < 1e-2 and wg[1] < 2e-2 and rm < 2e-2 and rv < 2e-2
-          and bl2 < 1e-3 and bce2 < 1e-2 and wg2[1] < 2e-2)
+    # Tolerances: loss/ce are ~1e-7 (fp32 matmul reassociation only). Grads
+    # and the tail EMA use a relative floor because the embed gradient and the
+    # eligibility EMA span several orders of magnitude; the threshold is set
+    # ~1.5x above the measured worst (3.6e-3 / 1e-3) so a real divergence
+    # (orders of magnitude) fails loudly. ring_b must match EXACTLY (ids).
+    ok = (bl < 1e-5 and bce < 1e-5 and wg[1] < 5e-3 and rm < 5e-3
+          and rv < 1e-4
+          and acc["ring_b"] == 0.0 and acc["tail_cols"] == 0.0
+          and acc["ring_w"] < 5e-3 and acc["tail_E"] < 5e-3
+          and bl2 < 1e-5 and bce2 < 1e-5 and wg2[1] < 5e-3
+          and acc2["ring_b"] == 0.0 and acc2["ring_w"] < 5e-3)
     print("\nPARITY:", "PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1
 
