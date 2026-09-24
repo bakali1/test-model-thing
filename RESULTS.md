@@ -106,6 +106,41 @@ remote pruning; crash-safe versioned corpus publication; HF pagination with
 revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
 exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
 
+### Ruler verdict on the banked leg checkpoint (t=94,747 vs baseline t=64,747)
+
+| metric | baseline t=64,747 | after 30k steps t=94,747 | delta |
+|---|---|---|---|
+| in-domain held-out CE | 1.1741 ± 0.0415 | 1.1902 | +0.016 (inside SE) |
+| shift (TinyStoriesV2-GPT4) | 1.1425 ± 0.0165 | 1.1264 ± 0.0140 | −0.016 (inside SE) |
+| cross-domain (12 novels) | 3.1532 ± 0.4275 | 3.4042 ± 0.2985 | +0.251 (inside SE) |
+| hot dims | 57 | **115** | doubled |
+| mean half-life | 1.12 B | 1.14 B | stable |
+| stop-head AUC | — | 0.9710 | intact |
+
+Statistically neutral on all three rulers, which is the correct outcome for
+30.7 MB of extra training (~7% of one pass) and the PLAN's 0.03 CE bar: no
+regression, no divergence, trajectory continuity held across a real GPU resume.
+The informative change is **hot dims 57 -> 115**: the tail's exact-credit set
+grew during the leg, which is also why the checkpoint grew 181 MB -> 241 MB
+(the tail E buffer is `B x 256 x H_total x 4 B`; the eval reports 120.6 MB for
+H=115, and 180.7 − 59.8 + 120.6 = 241.5 MB matches the file exactly). Hub
+traffic therefore grows as training proceeds -- worth knowing before a long
+Kaggle leg starts pushing 240 MB tags.
+
+### What the diagnostics said about throughput (run 2)
+
+- `ends=0` 23,796 B/s vs `ends=2%` 23,600 B/s → **end-of-stream flags cost
+  0.8%**, so EOS is NOT the cause of the real-leg rate.
+- The 32,353 B/s figure was measured on a *synthetic* checkpoint; on the live
+  checkpoint the same synthetic bench gives 23,796 B/s, and the real leg
+  sustains 21,477 B/s (last window). Most of the "32k vs 21k" gap was never
+  about real data at all.
+- The remaining decline over the run tracks the hot set doubling (57 -> 115):
+  the per-step tail decay multiplies the whole `(B, 256, H)` buffer, so its
+  cost is linear in hot dims. That is the concrete next optimization target,
+  ahead of the ring scatter. The leg now also benches with the tail disabled
+  to put a number on it.
+
 ### Live-checkpoint 30k-step leg (Colab T4, t=64,747 -> 94,747)
 
 The first real training leg, run as an integration test. **All infrastructure
@@ -124,19 +159,19 @@ live `t`, tag steps strictly inside `(64747, 94747]`. Loss drifted
 
 The leg's throughput assertion FAILED against a 25,000 B/s floor taken from the
 synthetic bench. That floor was the wrong reference, not a regression: the old
-tail-sync bug measures 2,655 B/s, and this leg ran 8x faster than that. The
-real workload differs from the bench in two ways -- real text sets
-end-of-stream flags on ~2% of streams per step (the bench used zeros), and a
-30k-step run lets the tail's hot set grow across 60 rebases (the cumulative
-rate declined 22,954 -> 22,166 B/s). The leg now reports the last-window rate,
-an ends=0 vs ends=2% diagnostic, and the hot-dim count at the end, so the next
-run measures the cause instead of guessing. Floor set to 18,000 B/s, which
+tail-sync bug measures 2,655 B/s, and this leg ran 8x faster than that. See
+"What the diagnostics said about throughput" above for the measured cause. The
+leg now reports the last-window rate, an ends=0 vs ends=2% A/B, a tail-off
+comparison, and the hot-dim count at the end. Floor set to 18,000 B/s, which
 still catches the 2.6 kB/s bug by a wide margin.
 
 **Operational lesson (cost: one discarded 30k leg):** `colab run` releases the
 VM when the script exits, so the 7 tags (~1.2 GB) were lost. The leg now pushes
 the final tag to the hub at the end (one 181 MB push, verified locally) and
-asserts the push succeeded.
+asserts the push succeeded. Run 2 did this: `tmt_t094747.npz`
+(`sha=a678bfade88d`, `run=live-leg`) pushed in **12 s** from Colab (~20 MB/s,
+versus 513 kB/s from the laptop uplink), pulled back locally, digest verified,
+and evaluated above.
 
 ### CUDA state parity, CPU-torch vs CUDA (T4, 20 steps, B=1024, 192 hot dims)
 

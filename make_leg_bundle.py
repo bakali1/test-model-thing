@@ -207,6 +207,8 @@ def watched(self, c, n, e):
     return loss
 
 
+# Install the watcher AFTER the diagnostics: they call step_batch too, and
+# counting their steps made a 30k leg report 30,408.
 gpu_port.GpuModel.step_batch = watched
 
 # --- EOS diagnostic: is the real-text slowdown the end-of-stream path? The
@@ -239,12 +241,24 @@ def _bench(nsteps, eos_p):
 if DEVICE == "cuda" and os.environ.get("TMT_EOS_DIAG", "1") == "1":
     r0 = _bench(200, 0.0)
     r2 = _bench(200, 0.02)
+    # Tail cost: the SAME bench with the tail disabled (GpuModel reads
+    # TMT_TAIL at construction). Tells us what fraction of the step the
+    # hot-dim credit path costs, which grows with the hot set.
+    os.environ["TMT_TAIL"] = "0"
+    r_notail = _bench(200, 0.0)
+    os.environ["TMT_TAIL"] = "1"
     print(f"  [diag] synthetic, ends=0:    {r0:,.0f} B/s", flush=True)
     print(f"  [diag] synthetic, ends=2%:  {r2:,.0f} B/s "
           f"({100*(1-r2/r0):.1f}% cost)", flush=True)
-    result("diag-bench-baseline", r0 > 25000, f"ends=0 {r0:,.0f} B/s")
-    result("diag-eos-cost", r2 > r0 * 0.5,
+    print(f"  [diag] tail disabled:       {r_notail:,.0f} B/s "
+          f"(tail costs {100*(1-r0/r_notail):.1f}%)", flush=True)
+    # The old tail-sync bug is 2,655 B/s; anything near 20k is healthy. The
+    # earlier 32.4 kB/s figure came from a DIFFERENT (synthetic) checkpoint.
+    result("diag-bench-baseline", r0 > 18000, f"ends=0 {r0:,.0f} B/s")
+    result("diag-eos-cost", r2 > r0 * 0.9,
            f"2% ends costs {100*(1-r2/r0):.1f}% ({r2:,.0f} B/s)")
+    result("diag-tail-cost", r_notail > r0 * 0.9,
+           f"tail costs {100*(1-r0/r_notail):.1f}% of the step")
 
 tr = tg.Trainer(path=CKPT, batch=BATCH, save_every=SAVE_EVERY, keep_k=KEEP_K,
                 max_steps=STEPS, device=DEVICE, dim=512, layers=16, lr=5e-4)
