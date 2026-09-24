@@ -28,29 +28,25 @@ import gpu_port
 from gpu_port import GpuModel
 import numpy_port as np_
 
+import checkpoint_hub as hub
+
 Device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def hub_upload(repo, path):
-    from huggingface_hub import upload_file
-    return upload_file(repo_id=repo, path_or_fileobj=path,
-                       path_in_repo=os.path.basename(path), repo_type="model")
-
-
-def hub_pull_latest(repo, dest_dir="."):
-    from huggingface_hub import HfApi
-    api = HfApi()
-    files = [f for f in api.list_repo_files(repo, repo_type="model")
-             if f.startswith("tmt") and f.endswith(".npz")]
-    if not files:
-        return None
-    files.sort()
-    fname = files[-1]
-    from huggingface_hub import hf_hub_download
-    out = os.path.join(dest_dir, fname)
-    hf_hub_download(repo_id=repo, filename=fname, repo_type="model",
-                    local_dir=dest_dir)
-    return out
+def _with_hub(repo):
+    """Point checkpoint_hub at --hub-repo for the duration of the call."""
+    def wrap(fn, *a, **k):
+        old = os.environ.get("TMT_HUB_URL")
+        if repo:
+            os.environ["TMT_HUB_URL"] = repo
+        try:
+            return fn(*a, **k)
+        finally:
+            if old is None:
+                os.environ.pop("TMT_HUB_URL", None)
+            else:
+                os.environ["TMT_HUB_URL"] = old
+    return wrap
 
 
 def tagged_save(model, rolling, keep_k, tag_dir=None):
@@ -91,14 +87,10 @@ class Trainer:
     def train(self, save, dataset, hub_repo=None):
         m = self.model
         m.new_states(self.batch)
-        hub_pulled = None
-        if hub_repo:
-            hub_pulled = hub_pull_latest(hub_repo)
-            if hub_pulled and os.path.exists(hub_pulled):
-                m.load(hub_pulled)
-                print(f"[hub] pulled {hub_pulled} (t={m.t})", flush=True)
-        if hub_pulled is None and (os.path.exists(self.path)
-                                   and os.path.getsize(self.path) > 0):
+        with_hub = _with_hub(hub_repo)
+        pulled = with_hub(hub.pull, self.path) if hub_repo else None
+        if pulled is None and (os.path.exists(self.path)
+                               and os.path.getsize(self.path) > 0):
             m.load(self.path)
         files = sorted(glob.glob(dataset, recursive=True))
         if not files:
@@ -139,7 +131,7 @@ class Trainer:
                         tag = tagged_save(m, self.path,
                                           self.keep_k if self.tagged else 0)
                         if hub_repo:
-                            hub_upload(hub_repo, tag)
+                            with_hub(hub.push, tag)
                             print(f"  [hub] pushed {os.path.basename(tag)}",
                                   flush=True)
                     if total % (self.batch * 100) == 0:
