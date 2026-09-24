@@ -69,6 +69,11 @@ BATCH = 1024
 DATA_SEED = 42          # same ordering seed in every arm
 INIT_SEED = 0           # same init in every arm
 # Fetch enough corpus that a 15% re-read margin never wraps the file.
+# A pinned step count is BAKED IN AT GENERATION TIME, not read from the
+# environment at runtime. `colab run` forwards no environment variables, so a
+# runtime os.environ.get("TMT_FS_STEPS") always saw 0 on the VM: FS-L was
+# generated with TMT_FS_STEPS=60000 and still ran 97,426 steps.
+PINNED_STEPS = int(os.environ.get("TMT_FS_STEPS", "0") or 0)
 FETCH_MB = int(os.environ.get("TMT_FS_FETCH_MB", "130"))
 SAVE_EVERY = 2000
 # The locally staged TinyStories files cover the head of the train file; start
@@ -322,12 +327,13 @@ steps_by_data = int(nbytes * 0.87 / BATCH)      # inverse of the 1.15 re-read
 # A pinned step count OVERRIDES the calibration. Required for byte-matched
 # arms: two runs whose calibrations differ by 1.6x (FS-W 20,500 B/s -> 60,058
 # steps vs FS-N 34,000 B/s -> 99,603) would otherwise get different amounts of
-# training, confounding corpus with compute. The verdict script can compare at
-# a matched step, but pinning is cheaper than two long arms.
-PINNED = int(os.environ.get("TMT_FS_STEPS", "0") or 0)
+# training, confounding corpus with compute. The value is baked in by the
+# generator; reading the environment here would always yield 0 in Colab.
+PINNED = {pinned}
 if PINNED:
     STEPS = PINNED
-    print(f"  PINNED STEPS={{STEPS:,}} (TMT_FS_STEPS) for byte-matching", flush=True)
+    print(f"  PINNED STEPS={{STEPS:,}} (baked in at generation) "
+          f"for byte-matching", flush=True)
 else:
     STEPS = max(100, min(steps_by_time, steps_by_data))
 print(f"  rate {{rate:,.0f}} B/s | time allows {{steps_by_time:,}} steps | "
@@ -463,7 +469,7 @@ def build(arm, cfg):
         fetch_mb=FETCH_MB, data_seed=DATA_SEED, init_seed=INIT_SEED,
         save_every=SAVE_EVERY, ts_offset_mb=TS_OFFSET_MB, ts_url=TINYSTORIES,
         smoke_dim=SMOKE_DIM, smoke_layers=SMOKE_LAYERS,
-        token=local_token())
+        token=local_token(), pinned=PINNED_STEPS)
     body = body.replace(
         "__PAYLOAD__",
         "{" + ", ".join(f'"{k}": "{v}"' for k, v in payload.items()) + "}")
