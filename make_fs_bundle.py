@@ -91,7 +91,16 @@ import sys
 import time
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# `colab run` executes the script inside a notebook cell, where __file__ does
+# not exist and the repo lands in /content. Prefer whichever directory
+# actually holds train_gpu.py.
+HERE = (os.path.dirname(os.path.abspath(__file__))
+        if "__file__" in globals() else os.getcwd())
+if not os.path.isfile(os.path.join(HERE, "train_gpu.py")):
+    for _cand in ("/content", os.getcwd()):
+        if os.path.isfile(os.path.join(_cand, "train_gpu.py")):
+            HERE = _cand
+            break
 sys.path.insert(0, HERE)
 
 ARM          = "{name}"
