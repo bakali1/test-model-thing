@@ -125,7 +125,15 @@ class Trainer:
                     n_win += 1
                     total += self.batch
                     if self.max_steps and m.t >= self.max_steps:
-                        print(f"  [reached step budget {self.max_steps}, stopping]")
+                        print(f"  [reached step budget {self.max_steps}, "
+                              f"stopping]")
+                        if save:
+                            tag = tagged_save(m, self.path,
+                                              self.keep_k if self.tagged else 0)
+                            if hub_repo:
+                                with_hub(hub.push, tag)
+                            print(f"  [final] saved {os.path.basename(tag)}",
+                                  flush=True)
                         return
                     if save and self.save_every and m.t % self.save_every == 0:
                         tag = tagged_save(m, self.path,

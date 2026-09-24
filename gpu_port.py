@@ -92,10 +92,12 @@ class TorchTail:
                             dtype=torch.bool, device=self.device)
         return m
 
-    def sync(self, sigmas_np, ring_ws_np, ring_b_np, dim):
-        """numpy inputs (like tail_credit). sigmas_np: (L,D); ring_ws_np:
-        list of (B,K,D); ring_b_np: (B,K). Rebuilds E for layers whose hot set
-        changed; keeps existing columns' EMAs untouched."""
+    def sync(self, sigmas_np, ring_ws_t, ring_b_t, dim):
+        """sigmas_np: (L,D) numpy (small, from decay). ring_ws_t: list of
+        (B,K,D) torch tensors, ring_b_t: (B,K) torch long. Rebuilds E for
+        layers whose hot set changed; keeps existing columns' EMAs untouched.
+        Called every REBASE_EVERY steps (and at creation), NEVER per step: a
+        per-step sync would copy the whole ring to CPU on GPU (~0.5 GB/step)."""
         self.dim = dim
         self.mask = {l: torch.from_numpy(sigmas_np[l] ** self.ring_k >
                                          self.hot_frac).to(self.device)
@@ -120,15 +122,14 @@ class TorchTail:
                 E[:, :, :len(keep)] = self.E[l][:, :, pos]
             if len(adopt):
                 h0 = len(keep)
-                w = ring_ws_np[l][:, :, adopt]           # (B,K,H1)
-                ids = ring_b_np.astype(np.int64)         # (B,K)
+                adopt_t = torch.from_numpy(adopt.astype(np.int64)).to(self.device)
+                w = ring_ws_t[l][:, :, adopt_t]            # (B,K,H1) device
                 H1 = len(adopt)
                 for k in range(min(self.ring_k, w.shape[1])):
-                    idx_b = torch.from_numpy(ids[:, k]).to(self.device)  # (B,)
-                    val = torch.from_numpy(w[:, k, :]).to(self.device)   # (B,H1)
+                    idx_b = ring_b_t[:, k]                 # (B,) device long
                     for j in range(H1):
                         E[:, :, h0 + j].scatter_add_(
-                            1, idx_b[:, None], val[:, j:j + 1])
+                            1, idx_b[:, None], w[:, k, j:j + 1])
             self.cols[l] = torch.from_numpy(new.astype(np.int64)).to(self.device)
             self.E[l] = E
 
@@ -252,6 +253,7 @@ class GpuModel:
         self.new_states(1)
         self.tail = None
         self.tail_state = {}
+        self._tail_rebase_at = -1
 
     def new_states(self, B):
         self.B = B
@@ -272,15 +274,22 @@ class GpuModel:
             if self.tail_state:
                 self._tail_restore_from(self.tail_state)
                 self.tail_state = {}
-        self._tail_sync()
+        # Membership re-evaluated on the documented REBASE_EVERY cadence (and
+        # once at creation), NOT per step: a per-step sync copies the ring
+        # (~0.5 GB/step at B=1024,K=18) and was 99% of the GPU step time.
+        if self._tail_rebase_at < 0 or (self.t - self._tail_rebase_at) >= REBASE_EVERY:
+            self._tail_sync()
 
     def _tail_sync(self):
         if self.tail is None:
             return
+        # Only the small decay sigmas cross to CPU for the membership test;
+        # the ring stays on-device and is used for seeding in torch.
         sigs = torch.stack([_sig(l.decay) for l in self.layers]
                            ).detach().cpu().numpy().astype(np.float32)
-        rws = [l.ring_w.detach().cpu().numpy() for l in self.layers]
-        self.tail.sync(sigs, rws, self.ring_b.cpu().numpy(), self.dim)
+        self.tail.sync(sigs, [l.ring_w for l in self.layers],
+                       self.ring_b, self.dim)
+        self._tail_rebase_at = self.t
 
     def _tail_restore_from(self, d):
         if self.tail is None:
