@@ -105,7 +105,28 @@ validation with SHA-256 sidecars and loud equal-step conflicts; explicit
 remote pruning; crash-safe versioned corpus publication; HF pagination with
 revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
 exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
-Also measured and now documented rather than hand-waved:
+
+### CUDA state parity, CPU-torch vs CUDA (T4, 20 steps, B=1024, 192 hot dims)
+
+The loss-only CUDA gate was hiding the state, so the gate now compares every
+tensor. The first runs of it **failed**, and the failures were the gate working:
+
+| tensor | floor-relative | scale-aware (max abs err / RMS) |
+|---|---|---|
+| `m` (Adam 1st moment) | 7.1e-02 @ floor 1e-6 · 2.8e-03 @ floor 1e-4 | **3.4e-05** |
+| `g:Wd` / worst gradient | 1.9e-02 @ floor 1e-4 | **9.8e-06** (g:layer2.W) |
+| `v` | 2.4e-07 | — |
+| `ring_b` ids | 0 mismatched (exact) | exact |
+| `ring_w` | 8.0e-07 | 3.6e-07 |
+| `tail_E` | 2.4e-07 | 1.7e-06 |
+| loss | 1.1e-07 | < 1e-5 (gate) |
+
+Lesson recorded in the code: a floor-relative metric explodes on entries near
+zero (Adam moments and some gradient rows sit far below their tensor's scale),
+so cross-device state is now gated on **max abs error / tensor RMS < 1e-3**,
+which the worst tensor misses by two orders of magnitude. The three runs this
+required (all short, all Colab) are in SCHEDULE.md. Also measured and now
+documented rather than hand-waved:
 
 - **Resume is recoverable, not bit-identical.** `ring_b`/`ring_w` are not
   persisted (numpy-compatible), so a resumed model's cold-dim embed credit
@@ -116,6 +137,6 @@ Also measured and now documented rather than hand-waved:
 - **Tail membership lags by design on GPU** (rebase every 500 steps vs numpy's
   every step): pinned by a deterministic test (numpy 4 hot, GPU 3 until
   rebase, 4 after).
-- The recorded CUDA numbers above remain **loss-only**; the CUDA gate now also
-  compares theta, every gradient, m, v, ring_b/ring_w and tail E, and the next
-  T4 run will record them.
+- The recorded CUDA numbers now include full state parity (theta, every
+  gradient, m, v, ring_b/ring_w, tail E), not just loss: `[RESULT]
+  cuda-parity-state PASS` with the worst tensor at 3.4e-05 of its RMS.

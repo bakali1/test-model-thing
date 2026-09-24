@@ -18,17 +18,20 @@ Platform split rule: Colab = dev loop (<20 min answers), Kaggle = long haul.
 ## Running this week
 
 Week of: _(fill on first Kaggle session)_  ·  GPU hours used: **0.0 / 30 Kaggle** ·
-Colab validation runs: **2 short runs** (see below)
+Colab validation runs: **5 short runs** (see below)
 
 | date | platform | purpose | run_id | hours | outcome |
 |---|---|---|---|---|---|
 | night session | Colab T4 | GPU gate #1 (parity + bench) | gate-1 | ~0.1 | speed bug found (per-step ring→CPU sync, 2.6 kB/s); correctness PASS |
 | night session | Colab T4 | GPU gate #2 after fix | gate-2 | ~0.1 | **PASS**: 32.4–34.3 kB/s, CUDA loss parity 1.1e-07, roundtrip exact |
+| night session | Colab T4 | GPU gate #3: full CUDA state parity | gate-3a/b | ~0.2 | first two runs FAILED (metric floors), third **PASS**: worst tensor 3.4e-05 of RMS, ring ids exact |
 | — | Kaggle | *first long leg: NOT RUN yet* | — | 0.0 | morning decision after the live-checkpoint Colab leg |
 
-Notes: no Kaggle quota spent. The CUDA state-parity extension (theta, grads,
-m, v, ring, tail E) and the live-checkpoint leg are the next Colab runs; the
-ledger gains a row for each.
+Notes: no Kaggle quota spent. The three Colab runs were all short final tests:
+two for the original gate, three total attempts for the extended state-parity
+gate (the failures were measurement-definition bugs the new gate exposed, each
+caught before any training time). Still to run on Colab: the
+live-checkpoint 10k-step leg; then Kaggle. The ledger gains a row for each.
 
 ## Log
 
