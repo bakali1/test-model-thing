@@ -278,8 +278,12 @@ if left() < 600:
 
 # ---------------- calibrate: measure, then size the run -------------------
 banner("calibrate (measure B/s, then derive steps for the budget)")
-CAL = 24
-WARMUP = int(os.environ.get("TMT_FS_WARMUP", "60"))
+# Calibration must be long enough for the GPU to leave its idle clock state.
+# A 24-step window measured 4,718 B/s against a true ~27,500: under a second of
+# GPU work is not enough for a T4 to ramp. The bench uses 200 timed steps for
+# the same reason. ~200 warmup covers Inductor compile AND clock ramp.
+CAL = int(os.environ.get("TMT_FS_CAL_STEPS", "200"))
+WARMUP = int(os.environ.get("TMT_FS_WARMUP", "200"))
 cal_path = "./fs_cal.npz"
 if os.path.exists(cal_path):
     os.remove(cal_path)
@@ -289,7 +293,7 @@ cal = subprocess.run(
      "--data-seed", "9999",                      # a different order: init only
      "--batch", str(BATCH), "--dim", str(DIM), "--layers", str(LAYERS_N),
      "--steps", str(CAL), "--no-save", "--no-tagged",
-     "--log-every", str(CAL // 3), "--warmup", str(WARMUP),
+     "--log-every", str(max(1, CAL // 4)), "--warmup", str(WARMUP),
      "--dataset", data_path,
      "--device", DEVICE, "--ring-credit", "full" if SMOKE else "auto"],
     cwd=HERE, env=os.environ, capture_output=True, text=True)
@@ -297,6 +301,11 @@ if cal.returncode != 0:
     print(cal.stdout[-3000:]); print(cal.stderr[-3000:])
     print("FATAL: calibration run failed")
     sys.exit(2)
+else:
+    print("  --- calibration transcript ---", flush=True)
+    for _l in cal.stdout.splitlines():
+        if "warmup" in _l or "B/s" in _l or "from-scratch" in _l:
+            print("  " + _l, flush=True)
 rate = None
 for line in cal.stdout.splitlines():
     import re
@@ -334,9 +343,17 @@ if PUSH_ALLOWED:
 cmd += ["--dataset", data_path]
 print("  $ " + " ".join(cmd[:6]) + " ...", flush=True)
 t_train = time.time()
-proc = subprocess.run(cmd, cwd=HERE, env=os.environ, text=True,
-                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-sys.stdout.write(proc.stdout[-12000:])
+# Stream the trainer's output live: a 50-minute run must not be a black box,
+# and if it dies we need its last words, not a 12k-line tail.
+proc = subprocess.Popen(cmd, cwd=HERE, env=os.environ, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        bufsize=1)
+_captured = []
+for _line in proc.stdout:
+    _captured.append(_line)
+    sys.stdout.write(_line)
+    sys.stdout.flush()
+proc.wait()
 elapsed = time.time() - t_train
 result("train-exit", proc.returncode == 0, f"rc={{proc.returncode}}")
 result("within-budget", elapsed <= TOTAL_BUDGET_S + 120,
