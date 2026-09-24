@@ -550,3 +550,56 @@ sort+segment 0.81x, whole-step compile 0.003x), and `load()` now refuses
 factored checkpoints rather than silently misreading them. Full detail,
 including what was deliberately NOT tested, is in
 `OPTIMIZATION_TEST_STATUS.md`.
+
+## Three-way result (2026-09-24, later the same day) — the layered mix LOSES
+
+All three arms have a pushed tag at exactly **t=60,000**, so the comparison is
+byte-matched: identical 61,440,000 bytes, identical init, ruler at 3 slices x
+20,000 B for every arm.
+
+| arm | t | bytes seen | in-domain CE | novels CE | hot dims | mean half-life |
+|---|---|---|---|---|---|---|
+| **FS-W** TinyStories | 60,000 | 61,440,000 | **1.2097 +/- 0.0223** | 3.103 | **128** | 1.13 B |
+| **FS-N** Gutenberg | 60,000 | 61,440,000 | 1.7566 +/- 0.0361 | **2.141** | 54 | 1.07 B |
+| **FS-L** layered A+B+C | 60,000 | 61,440,000 | 1.8491 +/- 0.0160 | 2.146 | **40** | 1.06 B |
+
+Bar = 0.03 CE.
+
+- **FS-W vs FS-N: +0.5469 in-domain for W, but W is +0.962 worse on novels.**
+  Separated both ways, a genuine trade-off.
+- **FS-W vs FS-L: +0.6394 in-domain for W, but W is +0.957 worse on novels.**
+- **FS-L does not beat FS-N on novels**: 2.146 vs 2.141 is a 0.005 difference,
+  far inside the bar. The mix buys nothing over novels alone.
+
+### What this refutes
+
+**The corpus-v2 layered-mix strategy is not supported.** The mix is
+*dominated*: worst in-domain of the three, statistically tied with plain
+Gutenberg on novels, and carrying the **fewest hot dims of all three (40 vs
+128 for W)**. The ordering on hot dims (128 / 54 / 40) tracks in-domain
+performance exactly, i.e. richer data *diluted* long-memory growth rather than
+fostering it. This is the opposite of the hypothesis that a multi-domain mix
+would grow more long-memory dims than a single corpus.
+
+### The most important caveat — the ruler is in-domain TinyStories
+
+The held-out set is TinyStories-dominated, so **FS-W winning in-domain is
+partly tautological**: it is the only arm trained on that distribution. The
+informative signals are the non-tautological ones, and they are consistent:
+FS-W is ~0.96 CE worse on novels, and FS-L ties FS-N there while having the
+fewest hot dims.
+
+Two further limits on reading the mix's failure:
+- **Spread-thin confound.** At 60k steps every arm has seen 61.4 MB, so the
+  3-domain mix has seen ~20 MB per domain against 61 MB for the single-domain
+  arms. A mix may need longer before it pays off; 60k steps cannot distinguish
+  "the mix is worse" from "the mix converges more slowly."
+- **The novel probe is 12 books** (~8 KB each). It separates W from N/L by a
+  wide margin, but is too small to rank N against L.
+
+### Not tested here
+
+Seed variance (one seed, so the 0.55-0.64 CE gaps have no run-to-run error
+bar), B=4096, longer horizons, per-domain data scaling, and a ruler with a
+balanced multi-domain eval set. FS-L also completed a longer 97,426-step run
+that is **not** step-matched to the others and is reported separately.
