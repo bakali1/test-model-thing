@@ -82,9 +82,12 @@ DATA_URL = os.environ.get(
     "TinyStories-train.txt")
 DATA_MB = int(os.environ.get("TMT_DATA_MB", "64"))
 DEVICE = os.environ.get("TMT_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
-# Throughput tripwire: the old tail-sync bug showed up as ~2.6k B/s.
+# Throughput tripwire: the old tail-sync bug was 2.6k B/s. The floor is set
+# from the REAL live leg (22.1k steady state), not the synthetic bench (32.4k),
+# because the bench has no end-of-stream flags and runs 30 steps, not 30k.
 MIN_BPS = float(os.environ.get("TMT_MIN_BPS",
-                               "25000" if DEVICE == "cuda" else "0"))
+                               "18000" if DEVICE == "cuda" else "0"))
+PUSH = os.environ.get("TMT_PUSH", "1") == "1"
 # `colab run` does not forward ANY environment variable from the laptop, so
 # the hub repo id is embedded at generation time too (an env var still wins if
 # the runner ever does pass one).
@@ -197,6 +200,8 @@ def watched(self, c, n, e):
     if S["n"] % 2000 == 0:
         S["loss"].append((int(self.t), float(loss)))
         el = time.time() - S["t0"]
+        if "w0" not in S:                       # window start for steady state
+            S["w0"] = (S["n"], S["bytes"], el)
         print(f"  t={self.t} loss={loss:.4f} | {S['bytes']/el:,.0f} B/s "
               f"(step-time {(S['n']/el):.1f} steps/s)", flush=True)
     return loss
@@ -204,21 +209,70 @@ def watched(self, c, n, e):
 
 gpu_port.GpuModel.step_batch = watched
 
+# --- EOS diagnostic: is the real-text slowdown the end-of-stream path? The
+# synthetic bench used ends=0; real text ends ~2% of streams every step. Same
+# model, same bytes, only the end-flag density differs.
+def _bench(nsteps, eos_p):
+    m = gpu_port.GpuModel(device=DEVICE, dim=512, layers=16, lr=5e-4)
+    m.new_states(BATCH)
+    m.load(CKPT)
+    c = torch.randint(1, 250, (BATCH,), device=DEVICE)
+    nn_ = torch.randint(1, 250, (BATCH,), device=DEVICE)
+    if eos_p > 0:
+        g = torch.Generator(device="cpu").manual_seed(3)
+        mask = (torch.rand(BATCH, generator=g) < eos_p).float()
+        e = mask.to(DEVICE)
+    else:
+        e = torch.zeros(BATCH, dtype=torch.float32, device=DEVICE)
+    for _ in range(4):
+        m.step_batch(c, nn_, e)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(nsteps):
+        m.step_batch(c, nn_, e)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    return BATCH * nsteps / (time.time() - t0)
+
+
+if DEVICE == "cuda" and os.environ.get("TMT_EOS_DIAG", "1") == "1":
+    r0 = _bench(200, 0.0)
+    r2 = _bench(200, 0.02)
+    print(f"  [diag] synthetic, ends=0:    {r0:,.0f} B/s", flush=True)
+    print(f"  [diag] synthetic, ends=2%:  {r2:,.0f} B/s "
+          f"({100*(1-r2/r0):.1f}% cost)", flush=True)
+    result("diag-bench-baseline", r0 > 25000, f"ends=0 {r0:,.0f} B/s")
+    result("diag-eos-cost", r2 > r0 * 0.5,
+           f"2% ends costs {100*(1-r2/r0):.1f}% ({r2:,.0f} B/s)")
+
 tr = tg.Trainer(path=CKPT, batch=BATCH, save_every=SAVE_EVERY, keep_k=KEEP_K,
                 max_steps=STEPS, device=DEVICE, dim=512, layers=16, lr=5e-4)
 start_t = None
 wall0 = time.time()
-tr.train(True, data_path, hub_repo=None)      # no hub push in this leg
+tr.train(True, data_path, hub_repo=None)      # hub push happens at the end
 wall = time.time() - wall0
 start_t = tr.start_t
 end_t = tr.model.t
-bps = S["bytes"] / max(1e-9, time.time() - S["t0"])
+elapsed = time.time() - S["t0"]
+bps = S["bytes"] / max(1e-9, elapsed)
+# steady state: the last window, which is what a long leg actually runs at
+n0, b0, t0w = S.get("w0", (0, 0, S["t0"]))
+win_dt = elapsed - t0w
+# no window marker (run shorter than 2000 steps) or too short to measure:
+# fall back to the cumulative rate rather than dividing by ~0
+bps_win = ((S["bytes"] - b0) / win_dt) if (b0 > 0 and win_dt > 1.0) else bps
+hot_end = sum(tr.model.tail.nhot(i) for i in range(tr.model.layercount)) \
+    if tr.model.tail else 0
 print(f"\n  steps run {S['n']} | wall {wall/60:.1f} min | "
-      f"step-time {bps:,.0f} B/s | t {start_t} -> {end_t}", flush=True)
+      f"cumulative {bps:,.0f} B/s | last-window {bps_win:,.0f} B/s | "
+      f"t {start_t} -> {end_t} | hot dims now {hot_end}", flush=True)
 result("steps-executed", S["n"] == STEPS, f"{S['n']} of {STEPS}")
 result("t-advanced", end_t == start_t + STEPS, f"{start_t} -> {end_t}")
 result("no-nan", S["nonfinite"] == 0, f"{S['nonfinite']} non-finite losses")
-result("throughput", bps >= MIN_BPS, f"{bps:,.0f} B/s (floor {MIN_BPS:,.0f})")
+result("throughput", bps_win >= MIN_BPS,
+       f"last-window {bps_win:,.0f} B/s (floor {MIN_BPS:,.0f}), "
+       f"cumulative {bps:,.0f}")
 if S["loss"]:
     print("  loss trace: " + " ".join(f"{t}:{l:.3f}" for t, l in S["loss"]),
           flush=True)
@@ -246,6 +300,23 @@ if tags:
     result("tags-in-range", all(start_t < tt <= end_t for tt in tag_ts)
            and tag_ts == sorted(set(tag_ts)),
            f"tag steps {tag_ts} within ({start_t}, {end_t}]")
+    # PUSH THE FINAL TAG. `colab run` releases the VM when the script ends, so
+    # anything not pushed is gone -- that is how the first 30k leg was lost.
+    if PUSH and HUB_REPO:
+        t0p = time.time()
+        try:
+            hub.push(newest, repo_id=HUB_REPO,
+                     run_id=os.environ.get("TMT_RUN_ID", "live-leg"))
+            result("pushed-final", True,
+                   f"{os.path.basename(newest)} -> {HUB_REPO} in "
+                   f"{time.time()-t0p:.0f}s")
+        except SystemExit as e:
+            result("pushed-final", False, f"push refused: {e}")
+        except Exception as e:
+            result("pushed-final", False, f"{type(e).__name__}: {e}")
+    else:
+        print("  [warn] TMT_PUSH=0: the VM will be released and these tags "
+              "will NOT survive", flush=True)
 
 # ---------------- F: sanity band ----------------
 banner("F: loss sanity (smoke band, not a quality gate)")

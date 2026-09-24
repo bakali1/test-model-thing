@@ -45,9 +45,12 @@ tr = tg.Trainer(path="tmt.npz", batch=1024, save_every=5000, keep_k=3,
 tr.train(True, "corpus/current/**/corpus_*")   # corpus via fetch_corpus.py
 ```
 
-Saves land at t=5000 and t=10000 (the final save fires on the step budget),
-so two tags: `keep_k=3` is plenty. Budget ~6-8 min wall clock at the measured
-32.4 kB/s (10.24 MB of text), plus ~1 min of local 173 MB writes.
+Saves land at t=70000 and t=94747 (the final save fires on the step budget), so `keep_k=7` keeps both. The **first run of this leg completed all 30k steps and passed every infrastructure check**, but its tags were lost when `colab run` released the VM — the leg now pushes the final tag to the hub at the end (`TMT_PUSH=1`, the default) and asserts the push succeeded.
+
+Measured: **23.1 min wall for 30.7 MB at 22.1 kB/s** (the real rate; the
+synthetic bench's 32.4 kB/s does not hold once real text sets end-of-stream
+flags and the tail's hot set grows across rebases). At 22.1 kB/s a 12 h Kaggle
+session digests ~0.96 GB.
 
 Run **without `--hub-repo` for this first leg** — pushing 173 MB per save
 would cost more time than the training itself. Prove the hub round-trip
@@ -66,9 +69,10 @@ python fetch_corpus.py --layers A,B,C --gb 4.5 --out ./corpus   # prints ETA
 ```
 
 It prints the ETA from this session's measured B/s. Sizing rule of thumb at the
-**measured 34 kB/s**: 1 h ≈ 123 MB · a 4.5 GB one-epoch pass ≈ 37 h → too big
+**measured real-leg 22.1 kB/s**: 1 h ≈ 80 MB · a 12 h session ≈ 0.96 GB · a
+4.5 GB one-epoch pass ≈ 56 h → too big
 for one 12 h Kaggle session, so either raise throughput first (scatter
-optimization) or run 1.2 GB per session and resume. The fetch is
+optimization) or run ~0.9 GB per session and resume. The fetch is
 **cache-backed and restartable from scratch** (the HF download cache is
 reused; staged bytes are redone, not resumed mid-layer). Publication is
 crash-safe: each run writes `./corpus/vNNNN/` and flips a `./corpus/current`

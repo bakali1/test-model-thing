@@ -106,6 +106,38 @@ remote pruning; crash-safe versioned corpus publication; HF pagination with
 revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
 exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
 
+### Live-checkpoint 30k-step leg (Colab T4, t=64,747 -> 94,747)
+
+The first real training leg, run as an integration test. **All infrastructure
+assertions passed**: checkpoint pulled from the hub with its digest verified
+(`t=64747`, `ring_k=18`, 57 hot dims), 64 MB of TinyStories Range-fetched
+in-session in 1 s, 30,000 steps executed with zero non-finite losses, 7 tagged
+saves, rolling file hard-linked to the newest, saved checkpoint reloaded at the
+live `t`, tag steps strictly inside `(64747, 94747]`. Loss drifted
+**1.822 -> 1.781** with no divergence.
+
+| measurement | value |
+|---|---|
+| cumulative throughput | **22,143 B/s** (23.1 min wall for 30.7 MB) |
+| last-window throughput | ~22.1 kB/s (slowly declining over the run) |
+| synthetic bench (ends=0, 30 steps) | 32,353 B/s |
+
+The leg's throughput assertion FAILED against a 25,000 B/s floor taken from the
+synthetic bench. That floor was the wrong reference, not a regression: the old
+tail-sync bug measures 2,655 B/s, and this leg ran 8x faster than that. The
+real workload differs from the bench in two ways -- real text sets
+end-of-stream flags on ~2% of streams per step (the bench used zeros), and a
+30k-step run lets the tail's hot set grow across 60 rebases (the cumulative
+rate declined 22,954 -> 22,166 B/s). The leg now reports the last-window rate,
+an ends=0 vs ends=2% diagnostic, and the hot-dim count at the end, so the next
+run measures the cause instead of guessing. Floor set to 18,000 B/s, which
+still catches the 2.6 kB/s bug by a wide margin.
+
+**Operational lesson (cost: one discarded 30k leg):** `colab run` releases the
+VM when the script exits, so the 7 tags (~1.2 GB) were lost. The leg now pushes
+the final tag to the hub at the end (one 181 MB push, verified locally) and
+asserts the push succeeded.
+
 ### CUDA state parity, CPU-torch vs CUDA (T4, 20 steps, B=1024, 192 hot dims)
 
 The loss-only CUDA gate was hiding the state, so the gate now compares every

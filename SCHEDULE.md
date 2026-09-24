@@ -25,13 +25,14 @@ Colab validation runs: **5 short runs** (see below)
 | night session | Colab T4 | GPU gate #1 (parity + bench) | gate-1 | ~0.1 | speed bug found (per-step ring→CPU sync, 2.6 kB/s); correctness PASS |
 | night session | Colab T4 | GPU gate #2 after fix | gate-2 | ~0.1 | **PASS**: 32.4–34.3 kB/s, CUDA loss parity 1.1e-07, roundtrip exact |
 | night session | Colab T4 | GPU gate #3: full CUDA state parity | gate-3a/b | ~0.2 | first two runs FAILED (metric floors), third **PASS**: worst tensor 3.4e-05 of RMS, ring ids exact |
-| — | Kaggle | *first long leg: NOT RUN yet* | — | 0.0 | morning decision after the live-checkpoint Colab leg |
+| 2026-09-24 08:24 | Colab T4 | **live 30k-step leg** (t 64,747 -> 94,747) | live-leg-1 | 0.4 | all infra checks PASS; throughput 22.1 kB/s vs a 25k floor taken from the synthetic bench; **tags lost when the VM was released** — leg now pushes the final tag |
+| — | Kaggle | *first long leg: NOT RUN yet* | — | 0.0 | next step, now unblocked |
 
-Notes: no Kaggle quota spent. The three Colab runs were all short final tests:
-two for the original gate, three total attempts for the extended state-parity
-gate (the failures were measurement-definition bugs the new gate exposed, each
-caught before any training time). Still to run on Colab: the
-live-checkpoint 10k-step leg; then Kaggle. The ledger gains a row for each.
+Notes: no Kaggle quota spent. All Colab time so far is short validation
+(~1 h total). The live leg proved the full path — hub pull with digest
+verification, in-session corpus fetch, 30k steps, tagged saves, reload — and
+corrected the real throughput to 22.1 kB/s (the synthetic bench's 32.4 kB/s
+was optimistic), which is the number corpus sizing now uses.
 
 ## Log
 
