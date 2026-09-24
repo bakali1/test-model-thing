@@ -24,24 +24,16 @@ import gpu_port
 from gpu_port import GpuModel
 
 VARIANTS = {
-    # name: (ring_algorithm, tail_algorithm, ring_credit[, grad_assembly])
-    # grad_assembly defaults to "cat" (one fused gradient-buffer write);
-    # "g-loop" pins the legacy 69-copy assembly so the board can A/B it.
-    "baseline": ("legacy", "legacy", "full"),
-    "a1-cold": ("legacy", "legacy", "cold"),
-    "a2-kloop": ("legacy", "legacy", "kloop"),
-    "a2-compiled": ("legacy", "legacy", "compiled"),
-    "a3-compile": ("legacy", "legacy", "full"),
-    "b1-ring": ("factored", "legacy", "full"),
-    "b2-tail": ("legacy", "factored", "full"),
-    "b1-b2": ("factored", "factored", "full"),
-    "c-segmented": ("legacy", "legacy", "segmented"),
-    "c-triton": ("legacy", "legacy", "triton"),
-    "b1-triton": ("factored", "legacy", "triton"),
-    "g-loop": ("legacy", "legacy", "full", "loop"),
-    "g-cat": ("legacy", "legacy", "full", "cat"),
-    "a2c-gcat": ("legacy", "legacy", "compiled", "cat"),
+    # name: (ring_credit, grad_assembly) -- only measured survivors remain.
+    #   full   -- the portable reference (materialize + mask + index_add)
+    #   auto   -- THE DEFAULT on CUDA: compiled (Inductor-fused ring credit)
+    #   triton -- the fused-kernel fallback when Inductor is unavailable
+    "full": ("full", "cat"),
+    "auto": ("auto", "cat"),
+    "triton": ("triton", "cat"),
+    "g-loop": ("full", "loop"),
 }
+DEFAULT_VARIANTS = "full,auto,triton,g-loop"
 
 
 def bytes_for(B, steps, device, seed=0xBEEF):
@@ -110,7 +102,7 @@ def real_bytes_for(B, steps, device, mb=64):
 
 
 def model_for(path, B, device, variant):
-    ra, ta, rc, ga = (tuple(VARIANTS[variant]) + ("cat",))[:4]
+    rc, ga = VARIANTS[variant]
     # The board is intended for the live 512x16 checkpoint, but infer the
     # shape so a small CPU fixture can exercise the same harness.
     with np.load(path) as d:
@@ -118,21 +110,10 @@ def model_for(path, B, device, variant):
         layers = 1 + max((int(k.split(".")[1]) for k in d.files
                           if k.startswith("state.")), default=0)
     m = GpuModel(dim=dim, layers=layers, device=str(device),
-                 ring_algorithm=ra, tail_algorithm=ta, ring_credit=rc,
-                 grad_assembly=ga,
-                 # The explicit board selection is the migration request for
-                 # factored candidates; the baseline remains strict.
-                 allow_algo_migration=(ra != "legacy" or ta != "legacy"))
+                 ring_credit=rc, grad_assembly=ga)
     m.new_states(B)
     if not m.load(path):
         raise FileNotFoundError(path)
-    if variant == "a3-compile":
-        if str(device) == "cpu":
-            raise RuntimeError("a3-compile is a CUDA graph/compile candidate")
-        # This is the measured A3 candidate. Async metrics are mandatory: a
-        # Python float(loss) forces a host sync inside every captured step.
-        m.sync_metrics = False
-        m.step_batch = torch.compile(m.step_batch, mode="reduce-overhead", dynamic=False)
     return m
 
 
@@ -230,6 +211,43 @@ def run_variant(path, B, steps, device, cs, ns, ends, variant, reference):
     return result
 
 
+def rebase_check(path, B, device, variant, total=620, window=100):
+    """Does the candidate survive a tail rebase without a recompile stall?
+
+    `_tail_sync` runs Python-level membership work inside step_batch, so a
+    compiled step can recompile (or graph-break) every REBASE_EVERY steps. A
+    short board run never reaches the first rebase, which is exactly how the
+    12-step and 200-step runs missed this. Reports per-window B/s so a stall
+    at the rebase step is visible.
+    """
+    m = model_for(path, B, device, variant)
+    cs, ns, ends = bytes_for(B, total + 4, device)
+    for i in range(2):
+        m.step_batch(cs[i], ns[i], ends[i])
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    print(f"\n[rebase-check] {variant}: {total} steps, REBASE_EVERY="
+          f"{gpu_port.REBASE_EVERY}, per-{window}-step B/s")
+    rates = []
+    for w0 in range(0, total, window):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
+        for i in range(w0, w0 + window):
+            m.step_batch(cs[2 + i], ns[2 + i], ends[2 + i])
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dt = (time.perf_counter() - t0) / window
+        rates.append(B / dt)
+        print(f"  steps {w0:4d}-{w0+window:4d}: {B/dt:8.0f} B/s"
+              f"{'   <-- rebase window' if w0 // 500 != (w0+window-1) // 500 else ''}")
+    del m
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return rates
+
+
 def profile_baseline(path, B, steps, device, nsteps=3):
     """Kernel + PHASE attribution.
 
@@ -241,7 +259,7 @@ def profile_baseline(path, B, steps, device, nsteps=3):
     ops) is explicit instead of being silently assumed away.
     """
     from torch.profiler import ProfilerActivity, profile
-    m = model_for(path, B, device, "baseline")
+    m = model_for(path, B, device, "full")
     cs, ns, ends = bytes_for(B, max(steps, nsteps) + 2, device)
     for i in range(2):
         m.step_batch(cs[i], ns[i], ends[i])
@@ -346,7 +364,7 @@ def main():
     ap.add_argument("--B", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--variants", default="baseline,a1-cold,a2-kloop,b1-ring,b2-tail,b1-b2,c-segmented")
+    ap.add_argument("--variants", default="full,auto,triton,g-loop")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--profile-steps", type=int, default=3,
                     help="steps to profile (>=1); more steps amortize profiler "
@@ -355,6 +373,10 @@ def main():
     ap.add_argument("--data", choices=["synth", "text"], default="synth",
                     help="synth = uniform random bytes; text = real "
                          "TinyStories sliced through make_streams like a leg")
+    ap.add_argument("--rebase-check", default="",
+                    help="comma-separated variants to run for 620 steps with "
+                         "per-100-step rates (catches recompile stalls at the "
+                         "tail rebase that short runs never reach)")
     args = ap.parse_args()
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -375,11 +397,11 @@ def main():
           f"checkpoint={args.checkpoint}")
     # The baseline is always built first and is the state/quality reference.
     base = run_variant(args.checkpoint, args.B, args.steps, device, cs, ns, ends,
-                       "baseline", {})
+                       "full", {})
     base_ref_state = None
-    # Re-run baseline once to retain its state for comparisons; this is also
-    # explicit about the fresh-model rule instead of reusing a mutated model.
-    mref = model_for(args.checkpoint, args.B, device, "baseline")
+    # Re-run the reference once to retain its state for comparisons; this is
+    # also explicit about the fresh-model rule instead of reusing a mutated one.
+    mref = model_for(args.checkpoint, args.B, device, "full")
     for i in range(2 + args.steps):
         mref.step_batch(cs[i], ns[i], ends[i])
     base_ref_state = snapshot(mref)
@@ -391,12 +413,9 @@ def main():
 
     results = [base]
     for name in names:
-        if name == "baseline":
+        if name == "full":
             continue
-        if name in ("a2-compiled", "a3-compile") and device.type != "cuda":
-            print("skip a2-compiled on CPU (compile is a CUDA benchmark candidate)")
-            continue
-        if name in ("c-triton", "b1-triton") and (triton_missing(device)):
+        if name == "triton" and triton_missing(device):
             print(f"skip {name}: Triton/CUDA unavailable")
             continue
         result = run_variant(args.checkpoint, args.B, args.steps, device, cs, ns,
@@ -408,6 +427,14 @@ def main():
         print(f"  {r['variant']:<18s} {r['B/s']:8.0f} {r['ms']:9.3f} "
               f"{r['peak_GB']:8.2f} {r['loss_delta']:9.2e} "
               f"{r['state_abs']:10.2e} {r['state_nrel']:10.2e} {r.get('hot',0):4d}")
+    if args.rebase_check:
+        for v in [x.strip() for x in args.rebase_check.split(",") if x.strip()]:
+            if v in ("a2-compiled", "a3-compile") and device.type != "cuda":
+                continue
+            try:
+                rebase_check(args.checkpoint, args.B, device, v)
+            except Exception as e:
+                print(f"[rebase-check] {v} failed: {type(e).__name__}: {e}")
     if args.profile:
         try:
             profile_baseline(args.checkpoint, args.B, args.steps, device,

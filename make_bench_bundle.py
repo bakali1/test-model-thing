@@ -51,12 +51,7 @@ B = int(os.environ.get("TMT_B_BENCH", "1024"))
 # and clock state, so sub-5% differences become readable.
 STEPS = int(os.environ.get("TMT_BENCH_STEPS", "200"))
 CKPT = "tmt_bench.npz"
-VARIANTS = os.environ.get(
-    "TMT_VARIANTS",
-    # baseline / ring-fusion / gradient-assembly, isolated and combined, plus
-    # the two previously-adopted-or-rejected references.
-    "baseline,g-cat,a2-compiled,a2c-gcat,a1-cold,b1-ring,b2-tail,c-triton,"
-    "c-segmented,b1-triton,a2-kloop,b1-b2,g-loop")
+VARIANTS = os.environ.get("TMT_VARIANTS", bv.DEFAULT_VARIANTS)
 FAILS = []
 
 
@@ -84,7 +79,7 @@ if not (os.path.exists(CKPT) and os.path.getsize(CKPT) > 0):
 t0 = time.time()
 sys.argv = ["bench_variants.py", CKPT, "--B", str(B), "--steps", str(STEPS),
             "--device", "cuda", "--variants", VARIANTS, "--data", "text",
-            "--profile", "--profile-steps", "3",
+            "--rebase-check", "full,auto", "--profile", "--profile-steps", "3",
             "--atomic-microbench"]
 rc = 0
 try:

@@ -29,6 +29,15 @@ sys.path.insert(0, ".")
 import gpu_port
 from gpu_port import GpuModel
 
+DEVICE_CPU_COMPILE_SKIP = False
+
+# The candidates that survived measurement on the T4 (RESULTS.md, board run 4).
+# Everything else -- factored ring/tail decay, cold-column credit, k-loop,
+# sort+segment, and whole-step torch.compile -- was removed after measuring
+# 0.81x-0.98x or being unsafe, and its code is gone from gpu_port.py.
+RING_PATHS = ("full", "compiled", "triton")
+GRAD_PATHS = ("cat", "loop")
+
 # variant -> (ring_algorithm, tail_algorithm, ring_credit, tolerance)
 CANDIDATES = {
     "a1-cold":       ("legacy", "legacy", "cold",      1e-4),
@@ -51,17 +60,11 @@ def effective_state(m):
     for name in m.gviews:
         out["g:" + name] = m.gviews[name].detach().cpu().numpy().astype(np.float64)
     for i, l in enumerate(m.layers):
-        raw = l.ring_w.detach().cpu().numpy().astype(np.float64)
-        f = getattr(l.ring_w, "_factor", None)
-        out[f"ring_eff.{i}"] = raw * (f.detach().cpu().numpy()
-                                      if f is not None else 1.0)
+        out[f"ring_eff.{i}"] = l.ring_w.detach().cpu().numpy().astype(np.float64)
     if m.tail is not None:
         for i in m.tail.E:
-            E = m.tail.E[i].detach().cpu().numpy().astype(np.float64)
-            f = m.tail.factor.get(i) if hasattr(m.tail, "factor") else None
-            # factor is (B,H); E is (B,256,H) -> broadcast over the bins
-            out[f"tail_eff.{i}"] = E * (f.detach().cpu().numpy()[:, None, :]
-                                        if f is not None else 1.0)
+            out[f"tail_eff.{i}"] = (m.tail.E[i].detach().cpu().numpy()
+                                    .astype(np.float64))
             out[f"tail_cols.{i}"] = m.tail.cols[i].detach().cpu().numpy()
     return out
 
@@ -82,10 +85,9 @@ def state_error(a, b):
     return worst, sorted(missing)
 
 
-def build(ring_algorithm, tail_algorithm, ring_credit, dim, layers, B, n_hot):
+def build(ring_credit, grad_assembly, dim, layers, B, n_hot):
     m = GpuModel(dim=dim, layers=layers, device="cpu",
-                 ring_algorithm=ring_algorithm, tail_algorithm=tail_algorithm,
-                 ring_credit=ring_credit, allow_algo_migration=True)
+                 ring_credit=ring_credit, grad_assembly=grad_assembly)
     with torch.no_grad():                    # force hot dims so the tail engages
         for i, l in enumerate(m.layers):
             l.decay[:n_hot] = 4.0
@@ -93,9 +95,8 @@ def build(ring_algorithm, tail_algorithm, ring_credit, dim, layers, B, n_hot):
     return m
 
 
-def run(ring_algorithm, tail_algorithm, ring_credit, dim, layers, B, steps,
-        n_hot, seed=17):
-    m = build(ring_algorithm, tail_algorithm, ring_credit, dim, layers, B, n_hot)
+def run(ring_credit, grad_assembly, dim, layers, B, steps, n_hot, seed=17):
+    m = build(ring_credit, grad_assembly, dim, layers, B, n_hot)
     rng = np.random.default_rng(seed)
     losses = []
     for _ in range(steps):
@@ -116,29 +117,28 @@ def main():
     ap.add_argument("--variants", default="all")
     args = ap.parse_args()
 
-    base_m, base_losses = run("legacy", "legacy", "full", args.dim, args.layers,
+    base_m, base_losses = run("full", "cat", args.dim, args.layers,
                               args.B, args.steps, args.n_hot)
     base = effective_state(base_m)
     print(f"baseline: {args.steps} steps, B={args.B}, loss "
           f"{base_losses[0]:.4f} -> {base_losses[-1]:.4f}, "
           f"hot={sum(base_m.tail.nhot(i) for i in range(args.layers))}")
 
-    names = ([n for n in CANDIDATES if n != "b1-triton"]
-             if args.variants == "all" else
-             [x.strip() for x in args.variants.split(",") if x.strip()])
     bad = []
-    print(f"\n{'variant':16s} {'tol':>8s} {'state/RMS':>12s} {'loss d':>10s}  verdict")
+    names = ["full", "cat", "loop", "compiled", "triton"]
+    tol = 1e-4
+    print(f"\n{'ring path':16s} {'tol':>8s} {'state/RMS':>12s} {'loss d':>10s}  verdict")
     for name in names:
-        if name not in CANDIDATES:
-            print(f"  unknown variant {name}")
-            bad.append(name)
-            continue
-        ra, ta, rc, tol = CANDIDATES[name]
-        if rc == "triton" and gpu_port.triton is None:
+        if name == "triton" and gpu_port.triton is None:
             print(f"{name:16s} {'-':>8s} {'-':>12s} {'-':>10s}  SKIP (no triton)")
             continue
-        m, losses = run(ra, ta, rc, args.dim, args.layers, args.B,
-                        args.steps, args.n_hot)
+        if name == "compiled" and DEVICE_CPU_COMPILE_SKIP:
+            print(f"{name:16s} {'-':>8s} {'-':>12s} {'-':>10s}  SKIP")
+            continue
+        rc = "full" if name in ("full", "cat", "loop") else name
+        ga = "loop" if name == "loop" else "cat"
+        m, losses = run(rc, ga, args.dim, args.layers, args.B, args.steps,
+                        args.n_hot)
         err, missing = state_error(base, effective_state(m))
         dl = abs(losses[-1] - base_losses[-1])
         ok = err <= tol and not missing
@@ -147,23 +147,6 @@ def main():
         extra = f"  [key mismatch: {missing}]" if missing else ""
         print(f"{name:16s} {tol:8.0e} {err:12.3e} {dl:10.2e}  "
               f"{'PASS' if ok else 'FAIL'}{extra}")
-
-    # Factored tails must not produce non-finite losses over a LONG run. The
-    # renormalization interval is derived from sigma_min so the per-column
-    # factor cannot underflow; a fixed interval (100) with the live model's
-    # sigma_min ~0.205 underflows to ~1e-70 and E.div_(c) then yields NaN --
-    # which is exactly what the 200-step T4 board surfaced.
-    if "b2-tail" in names or args.variants == "all":
-        m, losses = run("legacy", "factored", "full", args.dim, args.layers,
-                        args.B, 300, args.n_hot, seed=23)
-        finite = all(np.isfinite(l) for l in losses)
-        every = getattr(m, "_tail_renorm_every", 0)
-        print(f"{'b2-tail 300 steps':16s} {1e-3:8.0e} "
-              f"{'0' if finite else float('nan'):>12s} {0.0:10.2e}  "
-              f"{'PASS' if finite else 'FAIL (non-finite loss)'} "
-              f"[renorm every {every}]")
-        if not finite:
-            bad.append("b2-tail-long")
 
     print("\nCHECK_VARIANTS:", "PASS" if not bad else f"FAIL {bad}", flush=True)
     return 1 if bad else 0
