@@ -37,15 +37,22 @@ anything that needs the repo modules, regenerate the self-contained bundle:
 Write `colab_leg.py` (or adapt): the bundle pattern — unpack modules, then:
 
 ```python
-# 10k steps from the LIVE checkpoint, B=1024, save every 500
+# 10k steps from the LIVE checkpoint, B=1024, save every 5k
 import gpu_port, train_gpu as tg, os
 # 1. pull tmt.npz to /content (upload it once, or fetch from the hub)
-tr = tg.Trainer(path="tmt.npz", batch=1024, save_every=500, keep_k=4,
+tr = tg.Trainer(path="tmt.npz", batch=1024, save_every=5000, keep_k=3,
                 max_steps=10_000, device="cuda", dim=512, layers=16)
 tr.train(True, "corpus/current/**/corpus_*")   # corpus via fetch_corpus.py
 ```
 
-Run: `colab run --gpu T4 --timeout 3600 colab_leg.py`, then
+Saves land at t=5000 and t=10000 (the final save fires on the step budget),
+so two tags: `keep_k=3` is plenty. Budget ~6-8 min wall clock at the measured
+32.4 kB/s (10.24 MB of text), plus ~1 min of local 173 MB writes.
+
+Run **without `--hub-repo` for this first leg** — pushing 173 MB per save
+would cost more time than the training itself. Prove the hub round-trip
+separately with a short `--steps 500` leg that has `--hub-repo` set (one push).
+`colab run --gpu T4 --timeout 3600 colab_leg.py`, then
 `colab download` the `tmt_t*.npz` back. Judge the result with the CPU ruler
 (`eval.py`) — the numbers must be comparable to the baseline row in RESULTS.md.
 
