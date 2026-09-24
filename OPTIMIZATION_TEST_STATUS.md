@@ -42,8 +42,18 @@ Correctness gates, all green, all free (CPU):
 `check_gradients`, `check_ring_k`, `check_parity`, `check_trainer`,
 `check_variants`, `test_tail`, `check_fetch`.
 
-`check_variants` now gates the three surviving ring paths against the `full`
+| `check_variants` now gates the three surviving ring paths against the `full`
 reference at 1e-4 (measured: 3.0e-07 for `compiled`).
+
+**Exercised in anger (2026-09-24, after the above was written):**
+
+| gap now closed | evidence |
+|---|---|
+| `train_gpu` / leg integration | the from-scratch arms trained 60k steps end to end |
+| Real training with the shipped default | 60,058 steps at 28.5 kB/s on the T4 |
+| `ring_credit="auto"` under a real trainer | every arm used it, at +27% over `full` |
+| hub push + pull-back + eval | FS-W and FS-N scored from pushed tags, sha256-verified |
+| corpus A/B at matched steps | W vs N byte-matched at t=60,000 (`RESULTS.md`) |
 
 ---
 

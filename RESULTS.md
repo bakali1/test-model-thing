@@ -424,3 +424,129 @@ documented rather than hand-waved:
 - The recorded CUDA numbers now include full state parity (theta, every
   gradient, m, v, ring_b/ring_w, tail E), not just loss: `[RESULT]
   cuda-parity-state PASS` with the worst tensor at 3.4e-05 of its RMS.
+
+---
+
+## From-scratch corpus experiment (2026-09-24) — the unconfounded Experiment D
+
+### Why from scratch instead of continuing the live checkpoint
+
+The incumbent (`tmt_t094747`, 94,747 steps) was trained on **TinyStories**.
+A continuation A/B of "incumbent data vs novels" is therefore confounded: the
+incumbent arm is simply *more of what the model already knows*, and any
+inherited exposure to the arm's own data contaminates the verdict. Every arm
+instead starts at **t=0 from a bit-identical seeded init** (`--seed 0`,
+`default_rng(0)`), so the corpus is the only axis that differs.
+
+This also tests the two live hypotheses about the memory wall (8,064 of 8,192
+dims stuck at 1-byte half-life) that a continuation run structurally cannot:
+is it architectural (from scratch hits it too) or induced by the single-layer
+corpus (a different mix grows more long-memory dims)?
+
+### Arms
+
+| arm | corpus | source |
+|---|---|---|
+| **FS-W** | TinyStories, Range-fetched at a **+220 MB offset** (past the locally staged 165 MB, so it cannot overlap the ruler's decontaminated eval) | `roneneldan/TinyStories` |
+| **FS-N** | Gutenberg narrative prose | `Despina/project_gutenberg` · fiction_books (MIT) |
+| **FS-L** | layered mix: Gutenberg + FineWeb-Edu (score>=3) + UltraChat | 4.32 GB, staged in-session |
+
+### Result — W vs N, byte-matched at exactly t=60,000
+
+| arm | t | bytes seen | in-domain CE | novels CE | hot dims | mean half-life |
+|---|---|---|---|---|---|---|
+| **FS-W** | 60,000 | 61,440,000 | **1.2097 +/- 0.0223** | 3.103 | **128** | 1.13 B |
+| **FS-N** | 60,000 | 61,440,000 | 1.7566 +/- 0.0361 | **2.141** | 54 | 1.07 B |
+
+Identical bytes (61,440,000), identical steps, identical init. The in-domain
+gap is **0.5469 CE — 18x the 0.03 bar**, so this is a real separation, not
+noise. Ruler setting: 3 slices x 20,000 B, identical for both arms.
+
+### The finding: a trade-off, not a winner
+
+- **FS-W wins in-domain by 0.547 CE.**
+- **FS-N is 0.962 CE better on novels** — a large, real cross-domain advantage.
+- **FS-W grows 128 hot dims vs FS-N's 54** — TinyStories drives 2.4x more
+  long-memory dims from the identical compute budget.
+
+The two corpora buy **different things**: TinyStories buys in-domain fit and
+long-memory dim growth; novels buy transfer. **The plan's working assumption
+that Gutenberg would simply become the corpus-v2 base is not supported** — it
+costs 0.55 CE in-domain and 74 hot dims. Whether the layered mix (FS-L) buys
+both is the open question, and it is the arm that decides the mix.
+
+### Budget discipline
+
+One hour of wall clock per arm, with training length **derived from a measured
+in-session calibration** rather than guessed, and clamped by both the time and
+the data envelope. FS-W ran 60,058 steps at 28.5 kB/s; FS-N was held to the
+same step count for matching.
+
+### NOT tested / known gaps
+
+- **FS-L was not in this comparison** (it was still running when these arms
+  were scored). The verdict is W-vs-N only.
+- This is **arm-vs-arm**, not vs the incumbent. A t=0 run is missing the
+  incumbent's 64,747 steps of history, so an absolute comparison at equal wall
+  clock would be unfair. FS-W's 1.2097 vs the incumbent's 1.1741 is *not* a
+  meaningful difference.
+- One seed (0), one batch (1024), 60k steps. No seed-variance estimate, so the
+  0.547 CE gap has no run-to-run error bar.
+- The novels arm is Gutenberg only, not the full corpus-v2 layer set.
+- Contamination guard for FS-W is by byte offset, not by the near-duplicate
+  filter `fetch_eval_data.py` applies; a residual risk remains.
+
+## Bugs found 2026-09-24 that would have produced confidently wrong numbers
+
+Each of these produced a *plausible-looking* result. The ruler is cheap to run
+and expensive to trust blindly.
+
+1. **`checkpoint_hub.pull(dest)` is a "get the newest remote" API** — it
+   ignores the filename it is handed. Requesting the arm tags downloaded
+   `tmt_t094747.npz` (the incumbent) into *both* `fs_fs-w_t060000.npz` and
+   `fs_fs-n_t060000.npz`. The verdict would have compared the incumbent
+   against itself. Fixed: exact `hf_hub_download` + sha256 sidecar verify.
+2. **HF downloads are relative symlinks into the cache.** Relocating one with
+   `os.replace` left a dangling link, and `np.load` failed with
+   `FileNotFoundError` on a path that plainly existed. Fixed: resolve the real
+   blob, copy it.
+3. **The eval cache key omitted the eval args**, so a transcript produced at
+   `--slices 1 --bytes 2000` was served for a ruler-grade request and printed
+   under the ruler's heading. Fixed: args are hashed into the cache filename.
+4. **Two sign errors in the verdict logic.** `best` is the *minimum* CE, so the
+   margin is `other - best`; the code computed `best - other`, which is always
+   negative and therefore reported a **0.52 CE gap as "within noise"**. The
+   cross-domain guard had the mirror-image error, so a winner that was 0.96 CE
+   *worse* on novels was not flagged.
+5. **A smoke test pushed 18 toy checkpoints to the live private hub**, because
+   `huggingface_hub` picks up the cached login implicitly and SMOKE mode did
+   not disable it. Deleted; the guard is now `HF_HUB_OFFLINE=1` plus no
+   `--hub-repo`.
+6. **Calibration measured 1,081 B/s against a true ~27,500** because the 24-step
+   timing window included Inductor's compile time. A second layer remained:
+   under a second of GPU work does not let a T4 leave idle clocks. Fixed with
+   `--warmup` and 200-step calibration.
+7. **`train_gpu --push` uploads every tagged save from inside the training
+   loop** (240 MB each). At ~50 tags that burns the budget and lets a stalled
+   upload block training — FS-N hung this way at t=86,000. Fixed: the bundle
+   pushes only the final tag.
+8. **`train_gpu` still passed the deleted factored kwargs to `GpuModel`** after
+   the optimization cleanup, so *every* GPU training run raised `TypeError`.
+   This is the exact gap the "train_gpu integration — NOT TESTED" row
+   predicted.
+9. **`--seed` was a silent no-op** against a hardcoded `default_rng(0)`, so a
+   seed sweep would have appeared to do nothing.
+10. **The ruler prints thousands separators** (`60,000`); a `\\d+` regex left
+    `t` and `bytes` as `None` and crashed the table mid-render.
+
+## Optimization outcome (2026-09-24)
+
+The +27% Inductor-fused ring credit is now the **default** on CUDA
+(`ring_credit="auto"`), verified bit-identical to the pre-optimization engine
+(`max|dtheta| = 0.0` over 150 steps) and holding 28,696 B/s across a tail
+rebase with no recompile stall. Six measured losers were removed outright
+(factored ring 0.84x, factored tail 0.98x, cold-column 0.95x, k-loop 0.90x,
+sort+segment 0.81x, whole-step compile 0.003x), and `load()` now refuses
+factored checkpoints rather than silently misreading them. Full detail,
+including what was deliberately NOT tested, is in
+`OPTIMIZATION_TEST_STATUS.md`.
