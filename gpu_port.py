@@ -19,6 +19,7 @@ Author: baku (night session 2026-09-23). If another port variant exists,
 merge toward THIS file only if it passes tests/check_parity.py.
 """
 import argparse
+import math
 import os
 import warnings
 
@@ -244,11 +245,22 @@ class TorchTail:
         return torch.einsum("bvh,bh->vh", E, g)
 
     def end_step(self, layer):
+        """Renormalize: fold the decay factor back into E and reset c to 1.
+
+        The effective accumulator is E * c (credit multiplies the gathered
+        gradient by c), so preserving it under c' = 1 requires E' = E * c --
+        i.e. MULTIPLY. Dividing here looked harmless in short tests but jumped
+        the tail state by ~50x RMS on the first renorm step.
+        """
         if self.decay_mode == "factored" and layer in self.factor:
             E = self.E[layer]
             c = self.factor[layer]
-            E.div_(c[:, None, :])
+            E.mul_(c[:, None, :])
             c.fill_(1.0)
+
+    def min_factor(self, layer):
+        c = self.factor.get(layer)
+        return float(c.min()) if c is not None else 1.0
 
     def add_byte(self, layer, c_arr):
         E = self.E.get(layer)
@@ -509,6 +521,24 @@ class GpuModel:
             i: (~m).nonzero(as_tuple=False).squeeze(1)
             for i, m in self.tail.mask.items()
         }
+        # Renormalization interval for factored tails. It must be derived from
+        # the SLOWEST-decaying hot dim, not a fixed constant: fp32 underflows
+        # below ~1e-38, and the live model has sigma_min ~0.205, so a fixed
+        # 100-step interval means 0.205^100 ~ 1e-70 -> c hits 0 and E.div_(c)
+        # produces inf/NaN. That bug only appeared once the benchmark ran 200
+        # steps (short runs never reached the first renormalization).
+        if self.tail_algorithm == "factored" and self.tail is not None:
+            smin = float(np.clip(sigs.min(), 1e-6, 0.999999))
+            env_every = int(os.environ.get("TMT_TAIL_RENORM_EVERY", "0") or 0)
+            if env_every > 0:
+                self._tail_renorm_every = env_every
+            else:
+                self._tail_renorm_every = max(
+                    4, int(math.log(1e-20) / math.log(smin)))
+            if self._tail_rebase_at == self.t:      # only print on change
+                print(f"[tail] factored renorm every "
+                      f"{self._tail_renorm_every} steps (sigma_min {smin:.3f})",
+                      flush=True)
         self._tail_rebase_at = self.t
 
     def _tail_restore_from(self, d):
@@ -780,10 +810,17 @@ class GpuModel:
                     if tailc is not None:
                         cols = self.tail.cols_of(i)
                         dembed[:, cols] = dembed[:, cols] + tailc
-                    self.tail.add_byte(i, c_arr)
+                    # Renormalize AFTER the credit and BEFORE the add. Doing it
+                    # after add_byte silently rescales the byte just added: it
+                    # was stored as 1/c, so resetting c to 1 would give it
+                    # effective weight a/c instead of a (legacy adds it
+                    # un-decayed). This is why the interval must also be derived
+                    # from sigma_min -- and why a fixed interval appeared to
+                    # pass whenever no renorm landed inside the test window.
                     if (self.tail_algorithm == "factored"
                             and self.t % self._tail_renorm_every == 0):
                         self.tail.end_step(i)
+                    self.tail.add_byte(i, c_arr)
             with rf("decaytrace"):
                 l.decaytrace = (dec[None, :] * l.decaytrace +
                                 dec[None, :] * (1.0 - dec[None, :]) * l.states)

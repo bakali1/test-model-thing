@@ -148,6 +148,23 @@ def main():
         print(f"{name:16s} {tol:8.0e} {err:12.3e} {dl:10.2e}  "
               f"{'PASS' if ok else 'FAIL'}{extra}")
 
+    # Factored tails must not produce non-finite losses over a LONG run. The
+    # renormalization interval is derived from sigma_min so the per-column
+    # factor cannot underflow; a fixed interval (100) with the live model's
+    # sigma_min ~0.205 underflows to ~1e-70 and E.div_(c) then yields NaN --
+    # which is exactly what the 200-step T4 board surfaced.
+    if "b2-tail" in names or args.variants == "all":
+        m, losses = run("legacy", "factored", "full", args.dim, args.layers,
+                        args.B, 300, args.n_hot, seed=23)
+        finite = all(np.isfinite(l) for l in losses)
+        every = getattr(m, "_tail_renorm_every", 0)
+        print(f"{'b2-tail 300 steps':16s} {1e-3:8.0e} "
+              f"{'0' if finite else float('nan'):>12s} {0.0:10.2e}  "
+              f"{'PASS' if finite else 'FAIL (non-finite loss)'} "
+              f"[renorm every {every}]")
+        if not finite:
+            bad.append("b2-tail-long")
+
     print("\nCHECK_VARIANTS:", "PASS" if not bad else f"FAIL {bad}", flush=True)
     return 1 if bad else 0
 

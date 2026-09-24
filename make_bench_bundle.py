@@ -46,7 +46,10 @@ import checkpoint_hub as hub
 import bench_variants as bv
 
 B = int(os.environ.get("TMT_B_BENCH", "1024"))
-STEPS = int(os.environ.get("TMT_BENCH_STEPS", "12"))
+# 200 timed steps, not 12: at 12 steps the run-to-run spread was +-3-4%, which
+# is the same size as the effects being tested. 200 steps amortizes allocator
+# and clock state, so sub-5% differences become readable.
+STEPS = int(os.environ.get("TMT_BENCH_STEPS", "200"))
 CKPT = "tmt_bench.npz"
 VARIANTS = os.environ.get(
     "TMT_VARIANTS",
@@ -80,7 +83,8 @@ if not (os.path.exists(CKPT) and os.path.getsize(CKPT) > 0):
 # ---- the board ----
 t0 = time.time()
 sys.argv = ["bench_variants.py", CKPT, "--B", str(B), "--steps", str(STEPS),
-            "--device", "cuda", "--variants", VARIANTS, "--profile",
+            "--device", "cuda", "--variants", VARIANTS, "--data", "text",
+            "--profile", "--profile-steps", "3",
             "--atomic-microbench"]
 rc = 0
 try:

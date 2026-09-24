@@ -53,6 +53,62 @@ def bytes_for(B, steps, device, seed=0xBEEF):
     return c.to(device), n.to(device), e.to(device)
 
 
+TINY_URL = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
+            "main/TinyStories-train.txt")
+TEXT_CACHE = os.environ.get("TMT_BENCH_TEXT", "tinystories_bench.txt")
+
+
+def real_bytes_for(B, steps, device, mb=64):
+    """The REAL training case: a 64 MB slice of TinyStories-train.txt shaped
+    through numpy_port.Runtime.make_streams exactly as train_gpu does, so the
+    benchmark sees the same byte matrix, end-of-stream density and stream
+    structure as a live leg instead of uniform random bytes."""
+    import urllib.request
+    import numpy_port as np_
+    # make_streams splits the buffer into B streams, so L (steps available per
+    # stream) is roughly len(data)/B. Ask for 2.5x the requirement so the
+    # shortest stream still clears `steps` with margin.
+    need = int(steps * B * 2.5)
+    if not (os.path.exists(TEXT_CACHE)
+            and os.path.getsize(TEXT_CACHE) >= need):
+        want = max(mb * 1_000_000, need)
+        req = urllib.request.Request(TINY_URL, headers={"Range": f"bytes=0-{want}"})
+        print(f"[data] fetching {want/1e6:.0f} MB TinyStories slice ...", flush=True)
+        with urllib.request.urlopen(req, timeout=180) as r, \
+                open(TEXT_CACHE + ".part", "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(TEXT_CACHE + ".part", TEXT_CACHE)
+    with open(TEXT_CACHE, "rb") as f:
+        blob = f.read()
+    # make_streams' bytes-per-step ratio is not simply len/B, so grow the
+    # prefix until the shortest stream clears `steps` (the cache is 64 MB).
+    prefix = max(need, int(steps * B * 4))
+    last = None
+    for _ in range(8):
+        data = blob[:prefix]
+        streams, endss = np_.Runtime.make_streams(data, B)
+        L = min(len(s) for s in streams) - 1
+        if L >= steps:
+            break
+        last = L
+        prefix *= 2
+    else:
+        raise RuntimeError(f"corpus slice yields only {last} steps, need {steps} "
+                           f"(have {len(blob)/1e6:.1f} MB, B={B})")
+    cs = np.stack([np.frombuffer(s[:steps], dtype=np.uint8) for s in streams], axis=1)
+    ns = np.stack([np.frombuffer(s[1:steps + 1], dtype=np.uint8) for s in streams], axis=1)
+    es = np.array([e[:steps] for e in endss], dtype=np.float32).T
+    print(f"[data] real TinyStories: {len(data)/1e6:.2f} MB, {steps} steps at "
+          f"B={B}, end-of-stream density {float((es > 0).mean()):.3%}", flush=True)
+    return (torch.from_numpy(cs.astype(np.int64)).to(device),
+            torch.from_numpy(ns.astype(np.int64)).to(device),
+            torch.from_numpy(es).to(device))
+
+
 def model_for(path, B, device, variant):
     ra, ta, rc, ga = (tuple(VARIANTS[variant]) + ("cat",))[:4]
     # The board is intended for the live 512x16 checkpoint, but infer the
@@ -159,9 +215,11 @@ def run_variant(path, B, steps, device, cs, ns, ends, variant, reference):
         err_abs, err_nrel = 0.0, 0.0
         reference_loss = last_loss
     # Release the large ring/tail before constructing the next fresh model.
+    hot = (sum(m.tail.nhot(i) for i in range(m.layercount))
+           if m.tail is not None else 0)
     result = {
         "variant": variant, "B/s": B / elapsed, "ms": elapsed * 1e3,
-        "peak_GB": peak, "loss": last_loss,
+        "peak_GB": peak, "loss": last_loss, "hot": hot,
         "loss_delta": abs(last_loss - reference_loss),
         "state_abs": err_abs, "state_nrel": err_nrel,
     }
@@ -294,6 +352,9 @@ def main():
                     help="steps to profile (>=1); more steps amortize profiler "
                          "overhead and make the phase table stabler")
     ap.add_argument("--atomic-microbench", action="store_true")
+    ap.add_argument("--data", choices=["synth", "text"], default="synth",
+                    help="synth = uniform random bytes; text = real "
+                         "TinyStories sliced through make_streams like a leg")
     args = ap.parse_args()
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -303,12 +364,15 @@ def main():
     if args.steps < 3:
         ap.error("--steps must be >= 3 (two warmups plus at least one timed step)")
 
-    cs, ns, ends = bytes_for(args.B, args.steps + 2, device)
+    cs, ns, ends = (real_bytes_for(args.B, args.steps + 2, device)
+                    if args.data == "text" else
+                    bytes_for(args.B, args.steps + 2, device))
     names = [x.strip() for x in args.variants.split(",") if x.strip()]
     unknown = [x for x in names if x not in VARIANTS]
     if unknown:
         ap.error(f"unknown variants: {unknown}; choose from {sorted(VARIANTS)}")
-    print(f"device={device} B={args.B} steps={args.steps} checkpoint={args.checkpoint}")
+    print(f"device={device} B={args.B} steps={args.steps} data={args.data} "
+          f"checkpoint={args.checkpoint}")
     # The baseline is always built first and is the state/quality reference.
     base = run_variant(args.checkpoint, args.B, args.steps, device, cs, ns, ends,
                        "baseline", {})
@@ -339,11 +403,11 @@ def main():
                              ends, name, base_ref_state)
         results.append(result)
 
-    print("\n[board] variant             B/s       ms/step   peak GB   loss d   state abs  state/RMS")
+    print("\n[board] variant             B/s       ms/step   peak GB   loss d   state abs  state/RMS  hot")
     for r in sorted(results, key=lambda x: x["B/s"], reverse=True):
         print(f"  {r['variant']:<18s} {r['B/s']:8.0f} {r['ms']:9.3f} "
               f"{r['peak_GB']:8.2f} {r['loss_delta']:9.2e} "
-              f"{r['state_abs']:10.2e} {r['state_nrel']:10.2e}")
+              f"{r['state_abs']:10.2e} {r['state_nrel']:10.2e} {r.get('hot',0):4d}")
     if args.profile:
         try:
             profile_baseline(args.checkpoint, args.B, args.steps, device,

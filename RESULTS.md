@@ -159,6 +159,65 @@ Top device kernels per step (from the same run):
    is why `b2-tail` (factored decay) was ~1.0x: it removed the `E.mul_` traffic
    but added a per-step factor update and a division at renormalization.
 
+### Board run 4 — 200 steps, REAL TinyStories, live HF checkpoint (t=94,747, 115 hot)
+
+The benchmark now trains on the real thing: the 200-step board loads
+`tmt_t094747.npz` from the private hub (241 MB, 115 hot dims — the checkpoint
+the live leg banked) and feeds a 64 MB Range-fetched slice of
+`TinyStories-train.txt` shaped through `numpy_port.Runtime.make_streams`,
+exactly as `train_gpu` does. Measured end-of-stream density is **0.63%** — the
+synthetic bench had assumed 2%, a 3x overstatement.
+
+| variant | B/s | ms/step | vs baseline | peak GB | state/RMS |
+|---|---|---|---|---|---|
+| **a2-compiled** | **27,706** | 36.96 | **1.27x** | 1.18 | 5.4e-04 |
+| a2c-gcat (compiled + grad-cat) | 27,331 | 37.47 | 1.26x | 1.18 | 3.1e-04 |
+| c-triton | 23,682 | 43.24 | 1.09x | 1.18 | 3.9e-04 |
+| b1-triton | 22,698 | 45.11 | 1.04x | 1.78 | 5.7e-04 |
+| baseline | 21,771 | 47.04 | 1.00x | 1.17 | — |
+| g-cat | 21,667 | 47.26 | 0.995x | 1.18 | 3.0e-04 |
+| b2-tail | 21,354 | 47.95 | 0.98x | 1.18 | 3.8e-04 |
+| a1-cold | 20,779 | 49.28 | 0.95x | 1.23 | 2.1e-03 |
+| g-loop | 20,415 | 50.16 | 0.94x | 1.18 | 4.0e-04 |
+| a2-kloop | 19,540 | 52.41 | 0.90x | 1.18 | 3.9e-04 |
+| b1-ring | 18,301 | 55.95 | 0.84x | 1.78 | 3.9e-04 |
+| b1-b2 | 17,943 | 57.07 | 0.82x | 1.78 | 4.5e-04 |
+| c-segmented | 17,592 | 58.21 | 0.81x | 1.19 | 1.8e-03 |
+
+Run-to-run agreement between the two 200-step runs is ~1% for the leaders
+(baseline 21,681 / 21,771; a2-compiled 27,264 / 27,706), so **200 steps gives a
+~1% noise floor versus ~3-4% at 12 steps** — the step count the user asked for
+is what makes the small effects readable. At that resolution:
+
+- `a2-compiled` is **+27%** and is the only large, reproducible win.
+- `g-cat` (+6% over `g-loop`) and `c-triton` (+9%) are now **above** the noise
+  floor and worth keeping as candidates; `c-triton` flipped from a 0.91x loss at
+  12 steps to a 1.09x win at 200, which is why the earlier number was not
+  trustworthy.
+- `b2-tail`, `a1-cold`, `b1-*` and `c-segmented` remain neutral-to-negative.
+
+### Three more bugs in the factored tail, all found only at 200 steps
+
+Running long enough to cross a renormalization boundary exposed defects that
+short runs never reached — and one of them had been passing:
+
+1. **`end_step` divided instead of multiplied.** The effective accumulator is
+   `E * c`, so folding `c` away with `c' = 1` requires `E' = E * c`. The
+   `E.div_(c)` version jumped the tail state by **~50x RMS on the first
+   renorm step**. The 60-step gate had passed at 3e-07 purely because with the
+   old fixed 100-step interval no renorm ever landed inside the test window.
+2. **Fixed renormalization interval underflowed.** 100 steps at the live
+   model's `sigma_min ~ 0.205` is `0.205^100 ~ 1e-70`, below fp32's ~1e-38, so
+   `c` hit zero and the board reported **NaN losses** for `b2-tail`/`b1-b2`.
+   The interval is now derived from `sigma_min` (29-60 steps depending on the
+   checkpoint), which bounds `c >= 1e-20` by construction.
+3. **Renormalization ran after `add_byte`**, which would rescale the byte just
+   added (stored as `1/c`, so resetting `c` gives it weight `a/c` instead of
+   `a`). Fixed by renormalizing after the credit and before the add.
+
+`tests/check_variants.py` now also runs `b2-tail` for 300 steps and asserts no
+non-finite loss, so a renorm boundary is always inside the gate's window.
+
 ### Board run 3 + the measurement noise floor (T4)
 
 A fourth candidate was added from the profile: the gradient buffer was being
