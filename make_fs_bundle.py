@@ -339,7 +339,7 @@ result("steps-fit-budget", steps_by_time >= STEPS and steps_by_data >= STEPS,
 
 # ---------------- train from t=0 -----------------------------------------
 banner(f"train {{STEPS:,}} steps from t=0 on {{ARM}}")
-out = os.path.join(HERE, f"fs_{{ARM.lower()}}.npz")
+out = os.path.join(HERE, f"fs_{{ARM.split('-')[-1].lower()}}.npz")
 if os.path.exists(out):
     os.remove(out)
 cmd = [sys.executable, os.path.join(HERE, "train_gpu.py"), out, "train",
@@ -349,7 +349,12 @@ cmd = [sys.executable, os.path.join(HERE, "train_gpu.py"), out, "train",
        "--steps", str(STEPS), "--save-every", str(SAVE_EVERY),
        "--device", DEVICE, "--ring-credit", "full" if SMOKE else "auto"]
 if PUSH_ALLOWED:
-    cmd += ["--hub-repo", HUB_REPO, "--push"]
+    # Deliberately NO --push here. train_gpu --push uploads EVERY tagged save
+    # from inside the training loop; at 240 MB per tag and ~50 tags that both
+    # burns the hour's budget and lets a stalled upload block training
+    # outright -- which is exactly how FS-N hung, at step 70,600 of 99,603.
+    # The final tag is pushed once, below, the way make_leg_bundle does it.
+    cmd += ["--hub-repo", HUB_REPO]
 cmd += ["--dataset", data_path]
 print("  $ " + " ".join(cmd[:6]) + " ...", flush=True)
 t_train = time.time()
@@ -373,7 +378,7 @@ result("within-budget", elapsed <= TOTAL_BUDGET_S + 120,
 banner("artifacts")
 import glob as _glob
 import numpy as np
-tags = sorted(_glob.glob(HERE + f"/fs_{{ARM.lower()}}_t*.npz"))
+tags = sorted(_glob.glob(HERE + f"/fs_{{ARM.split('-')[-1].lower()}}_t*.npz"))
 result("tag-exists", len(tags) > 0, f"{{len(tags)}} tag(s)")
 if tags:
     d = np.load(tags[-1])
@@ -400,9 +405,17 @@ if tags:
     print(f"  hot dims: {{hot}} | bytes_seen: {{int(d.get('bytes_seen', 0)):,}}",
           flush=True)
     if PUSH_ALLOWED and TMT_TOKEN:
-        pushed = [p for p in tags if os.path.getsize(p) > 0]
-        result("push-attempted", bool(pushed),
-               "final tag pushed by train_gpu --push")
+        try:
+            import checkpoint_hub as _hub
+            _hub.push(os.path.basename(tags[-1]), repo_id=HUB_REPO,
+                      run_id=f"fs-{{ARM.split('-')[-1].lower()}}")
+            result("push-attempted", True,
+                   f"final tag {{os.path.basename(tags[-1])}} -> {{HUB_REPO}}")
+        except SystemExit as e:
+            result("push-attempted", False, f"push refused: {{e}}")
+        except Exception as e:
+            result("push-attempted", False,
+                   f"{{type(e).__name__}}: {{e}}")
     elif SMOKE:
         print("  [smoke] push intentionally skipped", flush=True)
 

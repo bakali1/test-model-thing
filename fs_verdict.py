@@ -23,6 +23,7 @@ Verdict rules (PLAN §6 / RESULTS.md ruler):
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -38,6 +39,55 @@ ARMS = ("W", "N", "L")
 # smoke-test THIS script quickly; never use it for a real verdict.
 EVAL_ARGS = os.environ.get("TMT_FS_EVAL_ARGS", "").split() or [
     "--slices", "3", "--bytes", "20000", "--xd-bytes", "8000"]
+
+
+def pull_exact(repo, filename):
+    """Download ONE exact tag. Deliberately NOT checkpoint_hub.pull().
+
+    pull(dest) is a "get the newest remote" API: it ignores the name you give
+    it and downloads whatever is latest. Calling it for an arm tag silently
+    fetched tmt_t094747.npz (the incumbent) into fs_fs-w_t060000.npz, which
+    would have compared the incumbent against itself. Verify by filename here.
+    """
+    import hashlib
+    from huggingface_hub import hf_hub_download
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # 28x faster on this host
+    path = hf_hub_download(repo_id=repo, filename=filename, repo_type="model")
+    # hf_hub_download returns a snapshot path whose RELATIVE symlink points
+    # into the cache's blob store. Moving it elsewhere leaves a dangling link
+    # (np.load then fails with FileNotFoundError on a path that clearly
+    # exists), so resolve to the real blob and copy that.
+    real = os.path.realpath(path)
+    side = filename + ".sha256"
+    try:
+        s = hf_hub_download(repo_id=repo, filename=side, repo_type="model")
+        want = open(s).read().split()[0].lower()
+        h = hashlib.sha256()
+        with open(real, "rb") as f:
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        got = h.hexdigest()
+        if got != want:
+            sys.exit(f"digest mismatch for {filename}: {got} != {want}")
+        print(f"    digest verified {got[:12]}")
+    except Exception as e:
+        print(f"    [warn] no sidecar for {filename} ({type(e).__name__})")
+    return real
+
+
+def arm_tags(arm):
+    """Local tags for an arm. Tolerates the old 'fs_fs-w_*' naming (arms run
+    before the double-prefix fix) alongside the current 'fs_w_*'."""
+    pats = [f"fs_{arm.lower()}_t*.npz", f"fs_fs-{arm.lower()}_t*.npz"]
+    out = []
+    for p in pats:
+        out.extend(glob.glob(os.path.join(HERE, p)))
+    return sorted(set(out))
+
+
+def arm_matches(name, arm):
+    n = name.lower()
+    return f"fs_{arm.lower()}_" in n or f"fs_fs-{arm.lower()}_" in n
 
 
 def pick_at_step(tags, target):
@@ -117,16 +167,24 @@ def fmt_pair(p):
 
 def main():
     argv = sys.argv[1:]
+    # Parse --at-step ONCE, before any block consumes argv, so both the pull
+    # and the selection use the same target.
+    at_step = None
+    if "--at-step" in argv:
+        i = argv.index("--at-step")
+        val = argv[i + 1] if i + 1 < len(argv) else ""
+        at_step = int(val.split("=")[1] if "=" in val else val)
+        del argv[i:i + 2]
+
     if argv and argv[0] == "--pull":
+        import checkpoint_hub as hub
         argv = argv[1:]
-        if argv and argv[0].startswith("--at-step"):
-            at_step = int(argv.pop(0).split("=")[1])
         for arm in ARMS:
-            pat = f"fs_{arm.lower()}_t*.npz"
-            tags = sorted(glob.glob(os.path.join(HERE, pat)))
+            tags = arm_tags(arm)
             if not tags:
-                tags = [os.path.basename(x) for x in
-                        hub.remote_tags(HUB_REPO, prefix=f"fs_{arm.lower()}_")]
+                # remote_tags returns (step, filename) for the whole repo.
+                tags = [fn for _st, fn in hub.remote_tags(HUB_REPO)
+                        if arm_matches(fn, arm) and fn.endswith(".npz")]
             if not tags:
                 print(f"  [warn] no tag for FS-{arm}")
                 continue
@@ -136,29 +194,30 @@ def main():
                     print(f"  [warn] FS-{arm} has no tag at or before "
                           f"t={at_step:,}")
                     continue
-                tags = [chosen if os.path.isabs(chosen)
-                        else os.path.join(HERE, chosen)]
+                tags = [chosen]
             newest = tags[-1]
             print(f"  pulling FS-{arm}: {os.path.basename(newest)} ...",
                   flush=True)
             try:
-                hub.pull(os.path.basename(newest), repo_id=HUB_REPO,
-                         expect_n=4481793, require_digest=True)
-            except SystemExit as e:
-                print(f"  [warn] pull refused: {e}")
+                got = pull_exact(HUB_REPO, os.path.basename(newest))
+                dst = os.path.join(HERE, os.path.basename(newest))
+                if os.path.abspath(got) != os.path.abspath(dst):
+                    if os.path.lexists(dst):
+                        os.remove(dst)
+                    shutil.copy2(got, dst)   # real file, not a cache symlink
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"  [warn] pull failed: {type(e).__name__}: {e}")
     if not argv:
         argv = sorted(glob.glob(os.path.join(HERE, "fs_*_t*.npz")))
     paths = []
     for a in argv:
         paths.extend(sorted(glob.glob(a)))
-    # --at-step N: restrict every arm to the tag at or before N steps.
-    at_step = None
-    if argv and argv[0].startswith("--at-step"):
-        at_step = int(argv[0].split("=")[1])
-        argv = [x for x in argv if not x.startswith("--at-step")]
+    if at_step:
         paths = []
         for a in ARMS:
-            tags = sorted(glob.glob(os.path.join(HERE, f"fs_{a.lower()}_t*.npz")))
+            tags = arm_tags(a)
             chosen = pick_at_step(tags, at_step) if tags else None
             if chosen:
                 print(f"  FS-{a}: matched tag {os.path.basename(chosen)}")
@@ -173,7 +232,7 @@ def main():
     for p in paths:
         arm = None
         for a in ARMS:
-            if f"fs_{a.lower()}_" in os.path.basename(p).lower():
+            if arm_matches(os.path.basename(p), a):
                 arm = a
         if arm is None:
             continue
