@@ -90,11 +90,19 @@ def validate_npz(path, expect_t=None, expect_n=None):
 
 
 def _read_sidecar(path):
-    """Parse '<file>.sha256' sidecar, or None."""
+    """Parse a '<file>.sha256' sidecar, or None.
+
+    Written in sha256sum format ("<hex>  <name>", optional "# run_id ...").
+    The file is named "<name>.sha256" and names the npz inside, so compare
+    against the basename with the .sha256 suffix stripped.
+    """
     try:
         with open(path) as f:
             txt = f.read().split()
-        if len(txt) >= 2 and txt[1] in ("*", path):
+        named = os.path.basename(path)
+        if named.endswith(".sha256"):
+            named = named[:-len(".sha256")]
+        if len(txt) >= 2 and txt[1].lstrip("*") == named:
             return txt[0]
     except OSError:
         pass
@@ -207,9 +215,20 @@ def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
     got = hf_hub_download(repo_id, best_f, repo_type=repo_type,
                           token=token or _token(), local_dir=os.path.dirname(dest))
     validate_npz(got, expect_t=best_t, expect_n=expect_n)
-    # sidecar: "<name>.sha256" written next to the npz by push()
-    side = got + ".sha256"
-    remote_sha = _read_sidecar(side)
+    # Fetch the sidecar (105 bytes) and verify the digest. It is NOT part of
+    # the npz download, so it must be requested explicitly -- otherwise this
+    # check silently never runs.
+    side_path = None
+    try:
+        side_path = hf_hub_download(repo_id, best_f + ".sha256",
+                                    repo_type=repo_type, token=token or _token(),
+                                    local_dir=os.path.dirname(dest))
+    except Exception as e:
+        print(f"[hub] note: no sidecar for {best_f} ({type(e).__name__}); "
+              f"content validated, digest NOT verified")
+    remote_sha = _read_sidecar(side_path) if side_path else None
+    if remote_sha is None and side_path:
+        print(f"[hub] note: {best_f}.sha256 unreadable; digest NOT verified")
     if remote_sha and remote_sha != sha256_file(got):
         sys.exit(f"[hub] {best_f}: content hash does not match its sidecar "
                  f"— refusing corrupted download")

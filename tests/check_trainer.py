@@ -142,6 +142,16 @@ def item9_content_validation():
         print("  FAIL: truncated accepted")
     except SystemExit as ex:
         print(f"  rejected truncated: {str(ex)[:60]}...")
+    # sidecar parsing: sha256sum format, named <file>.npz inside <file>.npz.sha256
+    side = p + ".sha256"
+    with open(side, "w") as f:
+        f.write("deadbeefcafe  x_t000005.npz\n# run_id expD-W\n")
+    ok &= hub._read_sidecar(side) == "deadbeefcafe"
+    bad = os.path.join(d, "y_t000005.npz.sha256")
+    with open(bad, "w") as f:
+        f.write("deadbeefcafe  other.npz\n")
+    ok &= hub._read_sidecar(bad) is None          # names a different file
+    ok &= hub._read_sidecar(os.path.join(d, "nope.sha256")) is None
     shutil.rmtree(d)
     return ok
 
