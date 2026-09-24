@@ -440,6 +440,7 @@ class Model:
         data["v"] = self.v
         data["B"] = np.array(self.B, np.int64)
         data["ring_k"] = np.array(self.ring_k, np.int64)
+        data["algorithm_version"] = np.array(0, np.int64)
         if self.tail is not None:
             data.update(self.tail.save_dict())
         tmp = path + ".tmp.npz"
@@ -450,6 +451,10 @@ class Model:
         if not os.path.exists(path):
             return
         d = np.load(path)
+        if "algorithm_version" in d and int(np.ravel(d["algorithm_version"])[0]) != 0:
+            raise ValueError(
+                f"checkpoint {path} uses factored GPU algorithm state; "
+                f"numpy_port is the version-0 reference and cannot reinterpret it")
         # ring_k is a property of the checkpoint, not of this process's
         # RING_TOL: the run that wrote it sized its ring for its own decay
         # range, and re-deriving it here (from an unrelated --decay-init or

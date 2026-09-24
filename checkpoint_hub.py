@@ -162,7 +162,7 @@ def local_t(path):
 
 
 def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
-         expect_n=None):
+         expect_n=None, require_digest=True):
     """Download the newest checkpoint if it is newer than ``dest``.
 
     Writes the tagged file next to ``dest`` and points ``dest`` at it (hard
@@ -224,11 +224,19 @@ def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
                                     repo_type=repo_type, token=token or _token(),
                                     local_dir=os.path.dirname(dest))
     except Exception as e:
+        if require_digest:
+            sys.exit(f"[hub] no usable digest sidecar for {best_f} "
+                     f"({type(e).__name__}: {e}); refusing unverified remote")
         print(f"[hub] note: no sidecar for {best_f} ({type(e).__name__}); "
               f"content validated, digest NOT verified")
     remote_sha = _read_sidecar(side_path) if side_path else None
     if remote_sha is None and side_path:
+        if require_digest:
+            sys.exit(f"[hub] {best_f}.sha256 unreadable; refusing "
+                     f"unverified remote")
         print(f"[hub] note: {best_f}.sha256 unreadable; digest NOT verified")
+    if remote_sha is None and require_digest:
+        sys.exit(f"[hub] {best_f} has no usable digest; refusing unverified remote")
     if remote_sha and remote_sha != sha256_file(got):
         sys.exit(f"[hub] {best_f}: content hash does not match its sidecar "
                  f"— refusing corrupted download")
@@ -267,10 +275,13 @@ def push(path, repo_id=None, token=None, repo_type=None, run_id=None):
         f.write(f"{digest}  {name}\n")
         if run:
             f.write(f"# run_id {run}\n")
-    api.upload_file(path_or_fileobj=path, path_in_repo=name, repo_id=repo_id,
-                    repo_type=repo_type)
+    # Publish the sidecar first. If the NPZ upload fails, the orphan sidecar
+    # is not selectable; if the sidecar upload fails, no unverified NPZ is
+    # published. This is safer than uploading the NPZ first.
     api.upload_file(path_or_fileobj=side_local, path_in_repo=name + ".sha256",
                     repo_id=repo_id, repo_type=repo_type)
+    api.upload_file(path_or_fileobj=path, path_in_repo=name, repo_id=repo_id,
+                    repo_type=repo_type)
     print(f"[hub] pushed {name} (t={t}, sha={digest[:12]}"
           f"{f', run={run}' if run else ''}) -> {repo_id}")
     return t
@@ -323,16 +334,22 @@ def prune_remote(keep, repo_id=None, token=None, repo_type=None, dry_run=True):
         print(f"[hub] nothing to prune ({len(tagged)} tagged, keep={keep})")
         return []
     print(f"[hub] would delete {len(victims)} of {len(tagged)} remote tags "
-          f"(keep newest {keep}):")
+          f"(keep newest {keep}); each includes its digest sidecar:")
     for v in victims:
         print(f"  - {v}")
+        print(f"  - {v}.sha256")
     if dry_run:
         print("[hub] dry run; pass --yes to delete")
         return victims
     api = HfApi(token=token or _token())
     for v in victims:
         api.delete_file(v, repo_id=repo_id, repo_type=repo_type)
-    print(f"[hub] deleted {len(victims)} remote tag(s)")
+        try:
+            api.delete_file(v + ".sha256", repo_id=repo_id, repo_type=repo_type)
+        except Exception as e:
+            print(f"[hub] warning: could not delete {v}.sha256 "
+                  f"({type(e).__name__}: {e})")
+    print(f"[hub] deleted {len(victims)} remote tag(s) and sidecars")
     return victims
 
 

@@ -45,19 +45,23 @@ tr = tg.Trainer(path="tmt.npz", batch=1024, save_every=5000, keep_k=3,
 tr.train(True, "corpus/current/**/corpus_*")   # corpus via fetch_corpus.py
 ```
 
-Saves land at t=70000 and t=94747 (the final save fires on the step budget), so `keep_k=7` keeps both. The **first run of this leg completed all 30k steps and passed every infrastructure check**, but its tags were lost when `colab run` released the VM — the leg now pushes the final tag to the hub at the end (`TMT_PUSH=1`, the default) and asserts the push succeeded.
+Saves for a fresh 10k leg land at t=70000 and t=74747 (the final save fires
+on the step budget), so `keep_k=3` keeps both. The separate 30k integration
+run previously completed and passed; its tags were lost when `colab run`
+released the VM, so the generated leg now pushes the final tag at the end
+(`TMT_PUSH=1`, the default) and asserts the push succeeded.
 
 Measured: **23.1 min wall for 30.7 MB at 22.1 kB/s** (the real rate; the
 synthetic bench's 32.4 kB/s does not hold once real text sets end-of-stream
 flags and the tail's hot set grows across rebases). At 22.1 kB/s a 12 h Kaggle
 session digests ~0.96 GB.
 
-Run **without `--hub-repo` for this first leg** — pushing 173 MB per save
-would cost more time than the training itself. Prove the hub round-trip
-separately with a short `--steps 500` leg that has `--hub-repo` set (one push).
-`colab run --gpu T4 --timeout 3600 colab_leg.py`, then
-`colab download` the `tmt_t*.npz` back. Judge the result with the CPU ruler
-(`eval.py`) — the numbers must be comparable to the baseline row in RESULTS.md.
+For a private Hub, configure a Colab secret named `TMT_TOKEN` before running
+`colab_leg.py`; the generated bundle does not contain credentials. Public
+repositories need no token. `colab run --gpu T4 --timeout 3600 colab_leg.py`
+then uses the embedded repository id and the runtime secret. Judge the
+result with the CPU ruler (`eval.py`) — the numbers must be comparable to
+the baseline row in RESULTS.md.
 
 ### 1b. Only if a leg looks wrong: `colab run --gpu T4 colab_final_test.py`
 (the full gate; ~4 min; regenerable with `make_colab_bundle.py`).

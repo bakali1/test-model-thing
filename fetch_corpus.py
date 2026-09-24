@@ -181,14 +181,16 @@ def _next_link(header):
     return None
 
 
-def repo_files(repo, max_pages=500):
+def repo_files(repo, revision="main", max_pages=500):
     """Every file in a dataset repo, FOLLOWING PAGINATION.
 
     The tree endpoint returns one page and a Link: rel="next" header; a 2 TB
     repo like FineWeb-Edu has thousands of files, so stopping after page one
     would silently shrink the candidate pool (and change the corpus hash).
     """
-    url = (f"https://huggingface.co/api/datasets/{repo}/tree/main"
+    from urllib.parse import quote
+    url = (f"https://huggingface.co/api/datasets/{repo}/tree/"
+           f"{quote(str(revision), safe='')}"
            f"?recursive=true&expand=false")
     out, pages = [], 0
     while url and pages < max_pages:
@@ -217,11 +219,11 @@ def repo_revision(repo):
         return None
 
 
-def match_files(repo, pattern):
+def match_files(repo, pattern, revision="main"):
     """files matching glob pattern, sorted; excludes the README collision."""
     import fnmatch
     out = []
-    for f in repo_files(repo):
+    for f in repo_files(repo, revision=revision):
         p = f["path"]
         if fnmatch.fnmatch(p, pattern) and not p.lower().startswith("readme"):
             out.append((p, f.get("size", 0)))
@@ -229,7 +231,7 @@ def match_files(repo, pattern):
     return out
 
 
-def download(repo, filename, install_ok):
+def download(repo, filename, install_ok, revision="main"):
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:
@@ -238,7 +240,8 @@ def download(repo, filename, install_ok):
             from huggingface_hub import hf_hub_download
         else:
             sys.exit("huggingface_hub missing; run: python -m pip install -q huggingface_hub")
-    return hf_hub_download(repo_id=repo, filename=filename, repo_type="dataset")
+    return hf_hub_download(repo_id=repo, filename=filename,
+                           repo_type="dataset", revision=revision)
 
 
 def _read_parquet(path, cols, batch_size=20000):
@@ -394,7 +397,9 @@ def main():
         gtot = est_dl_total = staged_est = 0.0
         for l in layers:
             spec = SPEC[l]
-            files = match_files(spec["repo"], spec["file_pat"])
+            revision = repo_revision(spec["repo"]) or "main"
+            files = match_files(spec["repo"], spec["file_pat"],
+                                revision=revision)
             dgb = sum(s for _, s in files) / 1e9
             gtot += dgb
             lb = budgets[l]
@@ -450,7 +455,11 @@ def main():
         spec = SPEC[l]
         transform = TRANSFORMS[spec["transform"]]
         lbudget = budgets[l]
-        files = match_files(spec["repo"], spec["file_pat"])
+        revision = repo_revision(spec["repo"])
+        if not revision:
+            raise RuntimeError(f"could not pin dataset revision for {spec['repo']}")
+        files = match_files(spec["repo"], spec["file_pat"],
+                            revision=revision)
         # The seed really orders the fetch: file order is permuted with it
         # (row order WITHIN a file stays source order — determinism by
         # construction, and the manifest says so).
@@ -469,7 +478,7 @@ def main():
             if args.limit and writer.docs >= args.limit:
                 stop = f"limit {args.limit} docs"
                 break
-            local = download(spec["repo"], fname, install_ok)
+            local = download(spec["repo"], fname, install_ok, revision=revision)
             used[l].append(fname)
             print(f"  {fname} ({_fsize/1e9:.2f} GB) -> {local}", flush=True)
             for row in _read_parquet(local, spec["cols"]):
@@ -491,7 +500,7 @@ def main():
         per_layer[l] = {"label": spec["label"], "staged_bytes": staged,
                         "docs": docs, "budget_bytes": lbudget, "stop": stop,
                         "repo": spec["repo"],
-                        "revision": repo_revision(spec["repo"]),
+                        "revision": revision,
                         "selected_files": used[l]}
         total_staged += staged
         if stop:

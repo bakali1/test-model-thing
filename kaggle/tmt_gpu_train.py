@@ -16,7 +16,7 @@ just `!python kaggle/tmt_gpu_train.py` with secrets attached:
   TMT_KEEP_K      local tagged checkpoints to keep                        [8]
   TMT_DATA_SEED   file-order seed (pin per arm)                           [0]
   TMT_CHECKPOINT  rolling checkpoint path                                 [tmt.npz]
-  TMT_DATASET     training glob                                           [data/corpus/current/**/corpus_*]
+  TMT_DATASET     training glob                                           [corpus/current/**/corpus_*]
   TMT_FETCH       1 = run fetch_corpus.py first (in-session download)     [0]
   TMT_FETCH_ARGS  extra args for fetch_corpus.py            [--layers A,B,C --gb 4.5]
   TMT_HUB_URL     HF repo for pull+push      (TMT_HUB_REPO also accepted)
@@ -24,6 +24,9 @@ just `!python kaggle/tmt_gpu_train.py` with secrets attached:
   TMT_RUN_ID      arm/run label recorded in checkpoint sidecars
   TMT_FRESH       1 = allow training from scratch (no checkpoint/hub needed) [0]
   TMT_DEVICE      cuda | cpu                                               [cuda]
+  TMT_RING_ALGORITHM  legacy | factored (experimental)                   [legacy]
+  TMT_TAIL_ALGORITHM  legacy | factored (experimental)                   [legacy]
+  TMT_RING_CREDIT     full | cold | kloop | compiled | triton | segmented [full]
   TMT_EXTRA       extra args appended to train_gpu.py
 
 Quota discipline: this script NEVER discovers datasets or spends time on
@@ -49,7 +52,9 @@ def main():
     steps = int(env("TMT_STEPS", "120000"))
     batch = int(env("TMT_BATCH", "1024"))
     ckpt = env("TMT_CHECKPOINT", "tmt.npz")
-    dataset = env("TMT_DATASET", "data/corpus/current/**/corpus_*")
+    # fetch_corpus.py publishes <out>/current by default. Keep this path
+    # aligned with that default so TMT_FETCH=1 can feed the trainer directly.
+    dataset = env("TMT_DATASET", "corpus/current/**/corpus_*")
     repo = env("TMT_HUB_REPO") or env("TMT_HUB_URL")
     device = env("TMT_DEVICE", "cuda")
     run_id = env("TMT_RUN_ID")
@@ -81,7 +86,10 @@ def main():
            "--save-every", env("TMT_SAVE_EVERY", "1000"),
            "--keep-k", env("TMT_KEEP_K", "8"),
            "--data-seed", env("TMT_DATA_SEED", "0"),
-           "--steps", str(steps), "--device", device]
+           "--steps", str(steps), "--device", device,
+           "--ring-algorithm", env("TMT_RING_ALGORITHM", "legacy"),
+           "--tail-algorithm", env("TMT_TAIL_ALGORITHM", "legacy"),
+           "--ring-credit", env("TMT_RING_CREDIT", "full")]
     if repo:
         cmd += ["--hub-repo", repo]
     if run_id:
