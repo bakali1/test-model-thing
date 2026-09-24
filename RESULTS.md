@@ -159,6 +159,41 @@ Top device kernels per step (from the same run):
    is why `b2-tail` (factored decay) was ~1.0x: it removed the `E.mul_` traffic
    but added a per-step factor update and a division at renormalization.
 
+### Board run 3 + the measurement noise floor (T4)
+
+A fourth candidate was added from the profile: the gradient buffer was being
+assembled with **69 separate `copy_` calls** (5 + 16x4 parameter views), which
+the profiler charged to `direct_copy_kernel` at 5.8 ms/step. `grad_assembly`
+now concatenates the pieces in `self.shapes` order into the flat buffer with
+one `torch.cat(..., out=)`. Verified **bit-identical** (theta/m/v/grads all
+`max|Δ| = 0.0` over 30 steps), and gated by `tests/check_variants.py`.
+
+| variant | B/s | vs baseline | verdict |
+|---|---|---|---|
+| a2-compiled | 24,159 | **1.21x** | robust across 3 runs |
+| a2c-gcat (compiled + cat) | 23,175 | 1.17x | does not stack with a2-compiled |
+| b2-tail | 20,912 | 1.05x | noise-level |
+| g-cat (fused grad write) | 20,508 | 1.03x | **within noise** |
+| g-loop (69 copies) | 20,143 | 1.01x | reference |
+| baseline | 19,895 | 1.00x | |
+| c-segmented | 15,037 | 0.76x | rejected |
+
+**The most important number from three independent board runs is the noise
+floor: ±3-4%.** Baseline measured 20,632 / 20,023 / 19,895 B/s; `b2-tail`
+20,868 / 19,791 / 20,912; `c-triton` 19,268 / 18,287 / 19,783. Consequences:
+
+- `a2-compiled` (mean 23,978 vs baseline mean 20,183) is a **real +19%** — it
+  clears the noise by 5x.
+- `g-cat` (+1.8% over `g-loop`) and `b2-tail` (+1 to +5%) are **inside the
+  noise band** and must not be claimed as wins on 12-step runs. The direct_copy
+  time the profiler attributed to gradient assembly evidently also covers the
+  `w[:, p] = 1.0` and tail-add copies, which `cat` does not remove.
+- The two do not stack: `a2-compiled` + `g-cat` (23,175) is *slower* than
+  `a2-compiled` alone (24,159), so Inductor is already absorbing some of what
+  `cat` was doing.
+- Any future decision on a <5% effect needs more timed steps (the board takes
+  `--steps`; 12 is cheap, 40+ is what a 3% effect requires) or repeated runs.
+
 ### Phase-0 optimization board — MEASURED on T4 (2026-09-24)
 
 `bench_variants.py` run on the live checkpoint (t=94,747, B=1024, 12 timed

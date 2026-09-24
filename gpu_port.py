@@ -332,7 +332,7 @@ class GpuModel:
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
                  device=None, ring_algorithm="legacy", tail_algorithm="legacy",
                  ring_credit="full", allow_algo_migration=False,
-                 sync_metrics=True):
+                 sync_metrics=True, grad_assembly="cat"):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
@@ -348,6 +348,9 @@ class GpuModel:
         if ring_credit not in ("full", "cold", "kloop", "compiled", "triton",
                                "segmented"):
             raise ValueError(f"unknown ring_credit={ring_credit!r}")
+        if grad_assembly not in ("cat", "loop"):
+            raise ValueError(f"unknown grad_assembly={grad_assembly!r}")
+        self.grad_assembly = grad_assembly
         self.ring_algorithm = ring_algorithm
         self.tail_algorithm = tail_algorithm
         self.ring_credit = ring_credit
@@ -790,18 +793,33 @@ class GpuModel:
         self.ring_b[:, p] = c_arr
         dembed.index_add_(0, c_arr, denc)                # autograd part
 
-        with rf("grad_copy"):
-            gv = self.gviews
-            gv["embed"].copy_(dembed.reshape_as(gv["embed"]))
-        gv["Wd"].copy_(dWd.reshape_as(gv["Wd"]))
-        gv["bd"].copy_(dbd.reshape_as(gv["bd"]))
-        gv["Ws"].copy_(dWs.reshape_as(gv["Ws"]))
-        gv["bs"].copy_(dbs.reshape_as(gv["bs"]))
+        # ---- assemble the flat gradient buffer ----
+        # The legacy path issued one copy_ per parameter tensor (69 kernels per
+        # step: 5 + 16x4). The profiler charged that to direct_copy at
+        # 5.8 ms/step. The pieces are concatenated in self.shapes order -- the
+        # exact order the per-view copies wrote -- so this is a pure copy
+        # reorganization: bit-identical output, one kernel.
+        srcs = {
+            "embed": dembed.reshape(self.gviews["embed"].shape),
+            "Wd": dWd.reshape(self.gviews["Wd"].shape),
+            "bd": dbd.reshape(self.gviews["bd"].shape),
+            "Ws": dWs.reshape(self.gviews["Ws"].shape),
+            "bs": dbs.reshape(self.gviews["bs"].shape),
+        }
         for i in range(self.layercount):
-            gv[f"layer{i}.W"].copy_(lw[i].reshape_as(gv[f"layer{i}.W"]))
-            gv[f"layer{i}.g"].copy_(lg[i].reshape_as(gv[f"layer{i}.g"]))
-            gv[f"layer{i}.b"].copy_(lb[i].reshape_as(gv[f"layer{i}.b"]))
-            gv[f"layer{i}.decay"].copy_(decay_grads[i].reshape_as(gv[f"layer{i}.decay"]))
+            srcs[f"layer{i}.W"] = lw[i].reshape(self.gviews[f"layer{i}.W"].shape)
+            srcs[f"layer{i}.g"] = lg[i].reshape(self.gviews[f"layer{i}.g"].shape)
+            srcs[f"layer{i}.b"] = lb[i].reshape(self.gviews[f"layer{i}.b"].shape)
+            srcs[f"layer{i}.decay"] = decay_grads[i].reshape(
+                self.gviews[f"layer{i}.decay"].shape)
+        with rf("grad_copy"):
+            if self.grad_assembly == "cat":
+                torch.cat([srcs[name].reshape(-1) for name, _ in self.shapes],
+                          out=self.grads.view(-1))
+            else:
+                gv = self.gviews
+                for name, _ in self.shapes:
+                    gv[name].copy_(srcs[name])
 
         # ---- flat inline AdamW (mirror numpy_port exactly) ----
         with rf("optimizer"):

@@ -24,7 +24,9 @@ import gpu_port
 from gpu_port import GpuModel
 
 VARIANTS = {
-    # name: (ring_algorithm, tail_algorithm, ring_credit)
+    # name: (ring_algorithm, tail_algorithm, ring_credit[, grad_assembly])
+    # grad_assembly defaults to "cat" (one fused gradient-buffer write);
+    # "g-loop" pins the legacy 69-copy assembly so the board can A/B it.
     "baseline": ("legacy", "legacy", "full"),
     "a1-cold": ("legacy", "legacy", "cold"),
     "a2-kloop": ("legacy", "legacy", "kloop"),
@@ -36,6 +38,9 @@ VARIANTS = {
     "c-segmented": ("legacy", "legacy", "segmented"),
     "c-triton": ("legacy", "legacy", "triton"),
     "b1-triton": ("factored", "legacy", "triton"),
+    "g-loop": ("legacy", "legacy", "full", "loop"),
+    "g-cat": ("legacy", "legacy", "full", "cat"),
+    "a2c-gcat": ("legacy", "legacy", "compiled", "cat"),
 }
 
 
@@ -49,7 +54,7 @@ def bytes_for(B, steps, device, seed=0xBEEF):
 
 
 def model_for(path, B, device, variant):
-    ra, ta, rc = VARIANTS[variant]
+    ra, ta, rc, ga = (tuple(VARIANTS[variant]) + ("cat",))[:4]
     # The board is intended for the live 512x16 checkpoint, but infer the
     # shape so a small CPU fixture can exercise the same harness.
     with np.load(path) as d:
@@ -58,6 +63,7 @@ def model_for(path, B, device, variant):
                           if k.startswith("state.")), default=0)
     m = GpuModel(dim=dim, layers=layers, device=str(device),
                  ring_algorithm=ra, tail_algorithm=ta, ring_credit=rc,
+                 grad_assembly=ga,
                  # The explicit board selection is the migration request for
                  # factored candidates; the baseline remains strict.
                  allow_algo_migration=(ra != "legacy" or ta != "legacy"))

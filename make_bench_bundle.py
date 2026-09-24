@@ -50,8 +50,10 @@ STEPS = int(os.environ.get("TMT_BENCH_STEPS", "12"))
 CKPT = "tmt_bench.npz"
 VARIANTS = os.environ.get(
     "TMT_VARIANTS",
-    "baseline,a1-cold,a2-kloop,a2-compiled,a3-compile,b1-ring,b2-tail,b1-b2,"
-    "c-segmented,c-triton,b1-triton")
+    # baseline / ring-fusion / gradient-assembly, isolated and combined, plus
+    # the two previously-adopted-or-rejected references.
+    "baseline,g-cat,a2-compiled,a2c-gcat,a1-cold,b1-ring,b2-tail,c-triton,"
+    "c-segmented,b1-triton,a2-kloop,b1-b2,g-loop")
 FAILS = []
 
 
