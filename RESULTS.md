@@ -70,3 +70,21 @@ Memory histogram (half-life): <1 B: 2131 | 1–2 B: 5926 | 2–4 B: 124 |
 The in-domain SE (0.04) is currently the coarse number: one held-out file, 3
 slices. A win inside ~1 SE is not a win. Raise `--slices` before trusting a
 sub-0.1 CE difference, or add a second held-out file.
+
+## GPU port (PLAN-2026-09-23-GPU), night session 2026-09-23/24
+
+| gate | result |
+|---|---|
+| `tests/check_parity.py` — numpy ≡ torch, 150 live steps, 12 hot dims/layer | loss rel ≤ 2.9e-07, ce ≤ 1.7e-07, worst grad rel 3.6e-03 |
+| live `tmt.npz` (t=64,747, K=18, 57 hot dims) continued on both engines | loss rel 1.1e-07 |
+| npz round trip torch→numpy→torch | bit-exact |
+| Colab T4 bench, fresh init, fp32 | **B=1024 32,353 B/s · B=2048 32,806 · B=4096 34,259** (33× CPU ~1,000 B/s) |
+| Colab T4: CUDA vs CPU torch loss, 192 hot dims (tail on GPU) | rel 1.10e-07 |
+| Colab T4: save → reload → continue | exact (0.0) |
+| Colab T4: `train_gpu.py` + tagged saves | PASS |
+
+Notes: first T4 run measured 2.6k B/s — a per-step tail-membership sync copied
+the ring to CPU (~0.5 GB/step, 99% of step time). Fixed by re-evaluating
+membership on the documented REBASE_EVERY cadence with on-device seeding
+(12× faster; parity unchanged). Next speed lever: the ring credit scatter
+(~600M atomics/step) — sort + segment-sum, measured separately before adoption.
