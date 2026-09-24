@@ -201,11 +201,20 @@ def main():
         import checkpoint_hub as hub
         argv = argv[1:]
         for arm in ARMS:
-            tags = arm_tags(arm)
-            if not tags:
-                # remote_tags returns (step, filename) for the whole repo.
-                tags = [fn for _st, fn in hub.remote_tags(HUB_REPO)
-                        if arm_matches(fn, arm) and fn.endswith(".npz")]
+            # Union of local and remote tags. Using local-only when any file
+            # happens to exist means a second run silently re-picks the
+            # already-downloaded step instead of the one requested: --at-step
+            # 86000 returned the 60,000 tag because that file was local.
+            tags = set(arm_tags(arm))
+            try:
+                remote = [fn for _st, fn in hub.remote_tags(HUB_REPO)
+                          if arm_matches(fn, arm) and fn.endswith(".npz")]
+            except Exception as e:
+                print(f"  [warn] remote tag list failed for FS-{arm}: {e}")
+                remote = []
+            have = {os.path.basename(t) for t in tags}
+            tags = sorted(tags | {r for r in remote
+                                  if os.path.basename(r) not in have})
             if not tags:
                 print(f"  [warn] no tag for FS-{arm}")
                 continue
@@ -238,7 +247,18 @@ def main():
     if at_step:
         paths = []
         for a in ARMS:
-            tags = arm_tags(a)
+            # Same union rule as the pull, so the selection sees every tag
+            # that is actually available, not just the ones on disk.
+            tags = set(arm_tags(a))
+            try:
+                import checkpoint_hub as _h
+                remote = [fn for _st, fn in _h.remote_tags(HUB_REPO)
+                          if arm_matches(fn, a) and fn.endswith(".npz")]
+                have = {os.path.basename(t) for t in tags}
+                tags = sorted(tags | {r for r in remote
+                                      if os.path.basename(r) not in have})
+            except Exception:
+                pass
             chosen = pick_at_step(tags, at_step) if tags else None
             if chosen:
                 print(f"  FS-{a}: matched tag {os.path.basename(chosen)}")
