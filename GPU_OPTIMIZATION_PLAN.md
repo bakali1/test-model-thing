@@ -1,8 +1,11 @@
 # GPU Optimization Plan — TMT (4.5M byte-level continual LM)
 
-**Status:** ready to execute. Written 2026-09-24 after the first live 30k-step
-Colab T4 leg. Supersedes the "next lever" note in
-`PLAN-2026-09-23-GPU.md` §0.3.
+**Status: EXECUTED on 2026-09-24. Read §0 first — it supersedes the phase
+targets below.** One candidate is worth adopting (`a2-compiled`, +20%); the
+headline traffic-arithmetic predictions in this plan were refuted by
+measurement. The phase text is kept as the record of what was believed when
+written, with corrections marked. This plan supersedes the "next lever" note
+in `PLAN-2026-09-23-GPU.md` §0.3/§0.4.
 
 **Baseline to beat:** **21,477 B/s** last-window (47.6 ms/step at B=1024),
 measured on the live checkpoint (t=94,747, `ring_k=18`, 115 hot dims, dim=512,
@@ -11,16 +14,67 @@ Reference points: the old tail-sync bug was 2,655 B/s; the synthetic-checkpoint
 micro-bench says 32,353 B/s but does **not** reproduce on the live checkpoint
 (23,796 B/s there), so plan against 21.5 kB/s.
 
+**Arithmetic correction:** at the live H=115, the hot fraction is
+`115 / (16 × 512) = 1.40%`, not 22%. A1's speedup must therefore be measured,
+not predicted from the old 22% estimate. The traffic table below is a
+hypothesis until the Phase 0 CUDA profiler confirms its convention and
+kernel-time attribution.
+
 ---
 
-## 1. Where the time actually goes
+## 0. MEASURED OUTCOME (supersedes the targets below)
 
-Profiled analytically at the live config, and confirmed by the leg's own
-diagnostics (end-of-stream flags cost 0.8%, so EOS is *not* a factor).
+Board run on the live checkpoint, B=1024, 12 timed steps, one T4 process
+(`bench_variants.py`; full table in RESULTS.md):
+
+| variant | B/s | vs baseline | verdict |
+|---|---|---|---|
+| **a2-compiled** | **23,933** | **1.20x** | **ADOPT** (state/RMS 3.6e-05) |
+| a1-cold | 20,679 | 1.03x | noise — as the 1.4% arithmetic predicts |
+| b2-tail | 19,791 | 0.99x | no win (tail is 9% of traffic) |
+| a2-kloop | 19,298 | 0.96x | worse than the compiled path |
+| c-triton | 18,287 | 0.91x | the fused kernel is slower |
+| b1-triton | 18,010 | 0.90x | — |
+| b1-b2 | 17,170 | 0.86x | regression |
+| b1-ring | 17,014 | 0.85x | **regression**, +0.61 GB VRAM |
+| c-segmented | 14,105 | 0.71x | 2x slower than the atomics it replaces |
+| a3-compile | 68 | 0.003x | catastrophic; do not retry in this shape |
+
+Isolated ring scatter: `index_add_` **0.320 ms/layer** (~5.1 ms/step across 16
+layers); sort+segment **0.661 ms**.
+
+**Three corrections to this plan, all from measurement:**
+
+1. **A1 was never 22%.** Hot dims are 57–115 *total* across 16×512 = 8,192
+   ring dimensions (0.7–1.4%). The original text divided by 512 as though the
+   count were per-layer. Real value ≈ 0.5% of traffic; measured 1.03x (noise).
+2. **B1's premise was wrong.** The decay factor is `(B,K,D)`, not `(B,K)`,
+   because `dec` is per-(stream, dim). Factoring trades a 37.7 MB multiply for
+   an equally large factor multiply *plus* an extra multiply in the credit
+   path, and costs +0.61 GB of VRAM. The planned "biggest single win" is a 15%
+   regression.
+3. **The ~25 ms/step atomic budget does not exist** — it is 5.1 ms — and the
+   sort+segment replacement is 2x slower than the atomics it targets, because
+   the gather costs more than the contention it saves. The ring is not
+   bandwidth-bound as the traffic model implied: a single-pass fused kernel is
+   *slower*.
+
+**What actually worked** is the one prediction that did not rest on the
+traffic model: deleting the materialized `ring_vals` temporary, which Inductor
+fuses into the scatter. That single change is +20%, and it is the whole of the
+remaining Phase-A win — not the 1.5x the phase targeted.
+
+---
+
+## 1. Where the time goes (as believed at writing time — corrected by §0)
+
+The traffic figures below are an analytical hypothesis at the live config;
+the leg diagnostics establish that end-of-stream flags cost about 0.8%, so EOS
+is not the factor. Phase 0 must confirm the actual kernel-time split.
 
 | component | traffic per step | share |
 |---|---|---|
-| **ring** — `w.mul_(dec)` 75.5 MB + `ring_vals` temp 75.5 MB + zero-hot 17 MB + scatter read 37.7 MB, **per layer × 16** | **3,325 MB** | **87%** |
+| **ring** — `w.mul_(dec)` 75.5 MB + `ring_vals` write 37.7 MB + scatter read 37.7 MB + hot-column zeroing ~0.53 MB average/layer, **per layer × 16** | **~2,420 MB** | **hypothesis; verify with profiler** |
 | tail — `E.mul_(sig)` 241 MB + credit einsum read 121 MB | 362 MB | 9% |
 | optimizer (8 passes over 4.5M params) + layer activations | 814 MB | — |
 | matmul | 26.6 GFLOP ≈ 7.6 ms at ~3.5 TFLOPS fp32 | — |
@@ -28,7 +82,7 @@ diagnostics (end-of-stream flags cost 0.8%, so EOS is *not* a factor).
 Budget for the observed 47.6 ms/step:
 
 ```
-  ~15 ms   elementwise bandwidth (3.83 GB at ~250 GB/s effective)
+  ~15 ms   elementwise bandwidth (about 3.6 GB at ~250 GB/s effective)
   ~8 ms    matmul
   ~25 ms   151M fp32 atomics/step from dembed.index_add_ + ~300-400 launches
 ```
@@ -36,7 +90,8 @@ Budget for the observed 47.6 ms/step:
 **The ring is the target, not the tail.** The ring carries full `dim`-wide
 embedding vectors for `K` lags, so its cost scales with
 `B x K x dim x layers` (1024 × 18 × 512 × 16). The tail scales with
-`B x 256 x hot` and is 3× smaller today. This inverts the assumption we made
+`B x 256 x hot` and is roughly 6–7× smaller today. This inverts the
+assumption we made
 when hot dims doubled 57 → 115 and the tail looked like the problem.
 
 The hot-dim growth still matters — it makes A1 more valuable over time — but
@@ -53,11 +108,12 @@ baseline and every candidate variant **in one process on one T4**, with
 reported. ~3 minutes for the whole board.
 
 Requirements:
-- Each variant is a patch applied to the *same* `GpuModel` (a flag or a
-  subclass), so comparisons are apples-to-apples in one process.
-- Report: B/s, ms/step, peak MB, and a scale-aware parity number
-  (`max|a-b| / RMS`) of the resulting `theta` against the baseline after N
-  steps from the same checkpoint and bytes.
+- Each variant is a patch applied to a fresh `GpuModel` loaded from the same
+  immutable checkpoint and the same input bytes. Do not reuse a mutated model
+  object between variants; reset peak-memory counters and release state.
+- Report: B/s, ms/step, peak MB, and scale-aware state parity metrics
+  (`max|a-b| / RMS`, plus max absolute error) for theta, gradients, moments,
+  ring, and tail state after N steps.
 - Print a one-line table sorted by B/s. This table becomes the RESULTS.md row.
 
 This is the single highest-leverage half hour available: it turns every later
@@ -65,30 +121,34 @@ phase from a 25-min experiment into a 3-min one.
 
 ---
 
-## 3. Phase A — no math change (safe; target 1.3–1.5×)
+## 3. Phase A — no intended model change (measure; no fixed speed target)
 
 Identical arithmetic, identical results. Any drift here is a bug, not
 reassociation.
 
-### A1. Stop computing ring credit for hot columns (best risk/reward)
+### A1. Stop computing ring credit for hot columns (small at current H; measure)
 
 Today, per layer:
 
 ```python
 w.mul_(dec[None, None, :])                    # decay the whole ring
 torch.mul(w, dlds[:, None, :], out=ring_vals) # full dim-wide multiply
-ring_vals[:, :, hot_mask] = 0.0               # ...then discard 22% of it
+ring_vals[:, :, hot_mask] = 0.0               # discard the hot subset (1.4% at H=115)
 dembed.index_add_(0, rows, ring_vals.view(B*K, -1))
 ```
 
 The hot columns are multiplied and scattered, then **zeroed and thrown away** —
-22% of the ring's two most expensive ops, and that fraction grows as the hot
-set grows. Fix: index only the cold columns in the credit path.
+1.4% of the ring's two most expensive ops at the current live configuration,
+and that fraction grows as the hot set grows. A cold-only implementation must
+accumulate a `(256, D_cold)` temporary and then add it to `dembed[:, cold]`;
+it cannot pass a `D_cold` source directly to a `D`-column `dembed.index_add_`.
 
 ```python
 cold = self.cold_idx[i]                       # int64 (Dc,) built at rebase
-torch.mul(w.index_select(2, cold), dlds[:, cold][:, None, :], out=vals_cold)
-dembed.index_add_(0, rows, vals_cold.reshape(B*K, -1))   # then scatter into [:, cold]
+vals_cold = w.index_select(2, cold) * dlds[:, cold][:, None, :]
+cold_dembed = torch.zeros((256, len(cold)), dtype=F, device=w.device)
+cold_dembed.index_add_(0, rows, vals_cold.reshape(B * K, -1))
+dembed[:, cold] += cold_dembed
 ```
 
 **Keep the full ring stored.** The hot columns' stored values are still needed:
@@ -96,9 +156,11 @@ dembed.index_add_(0, rows, vals_cold.reshape(B*K, -1))   # then scatter into [:,
 later drops *out* of the hot set resumes with its ring history intact. Dropping
 them from storage is a *science* change (see §6), not an optimization.
 
-Expected: −22% of ring multiply + scatter traffic, growing with the hot set.
+Expected: only the measured hot fraction of the credit path, about 1.4% at
+H=115; the speedup is currently **TBD**, not a 1.1× claim. It becomes more
+valuable only if the hot set grows substantially.
 
-### A2. Fuse the `ring_vals` temp (removes ~1.2 GB/step)
+### A2. Fuse the `ring_vals` temp (potentially removes ~1.2 GB/step)
 
 `torch.mul(w, dlds, out=ring_vals)` **writes** 37.7 MB/layer that `index_add_`
 immediately **reads back** — 1.2 GB/step of pure round-trip. Fuse the
@@ -106,14 +168,17 @@ multiply into the scatter with `torch.compile` (or a `K`-loop of
 `index_add_(0, ring_b[:, k], w[:, k, :] * dlds)`), so `w` is read once.
 
 Watch for: `torch.compile` reassociating the reduction inside `index_add_`.
-Check the parity number from Phase 0; if it moves, fall back to the explicit
-k-loop (more launches, same traffic saving).
+An explicit K-loop lowers temporary peak but does **not** by itself remove
+the multiply-write/scatter-read round trip. Only a genuinely fused kernel
+should be credited with that traffic reduction. Check the full parity state
+from Phase 0; if it moves, keep the K-loop as a separately measured fallback.
 
-### A3. CUDA-graph the step (removes launch + sync overhead)
+### A3. CUDA-graph the step (removes launch + sync overhead; medium risk)
 
 ~300–400 launches per step plus a `float(loss)` host sync per step. Capture the
-step as a CUDA graph (static shapes, static input buffers) and read the loss
-from a device tensor instead of syncing. Low risk, no math change.
+step as a CUDA graph only after the host sync is removed/isolated. Measure
+launch overhead first: a graph cannot remove ring bandwidth or atomic
+contention. Treat graph capture as medium risk, not low risk.
 
 ---
 
@@ -122,7 +187,7 @@ from a device tensor instead of syncing. Low risk, no math change.
 These change the *order* of floating-point operations. Mathematically
 identical products, different rounding. See §7 for the mandatory gate.
 
-### B1. Ring decay factoring — biggest single win (1.2 GB/step)
+### B1. Ring decay factoring — **corrected: not the advertised 1.2 GB win** (format change)
 
 The ring is decayed in full every step:
 
@@ -130,28 +195,36 @@ The ring is decayed in full every step:
 w.mul_(dec[None, None, :])        # 37.7 MB read + 37.7 MB write, per layer
 ```
 
-but each slot is overwritten every `K` steps (`w[:, p] = 1.0`), so a slot only
-ever accumulates `K` decay factors. Store `w` **undecayed** and keep the decay
-product per `(b, k)` instead:
+The first draft incorrectly described the decay as one scalar per `(b,k)`.
+That is false: `dec` is a `(D,)` vector of dimension-specific decay values, so
+the factored state must retain a factor for every `(b,k,d)`:
 
 ```python
-# c[b,k] = product of dec[b] since slot (b,k) was written
-c.mul_(dec[:, None])              # 18k floats = 147 KB  (was 75.5 MB)
-c[:, p] = 1.0                     # this slot is fresh
-# contribution uses the scaled gradient, same product, no stored decay:
-w_scaled = w * (c.reshape(B, K, 1) * dlds[:, None, :])
+# c[b,k,d] = product of dec[d] since slot (b,k,d) was written
+c.mul_(dec[None, None, :])        # B*K*D floats, the same ring-sized state
+c[:, p, :] = 1.0
+w_scaled = w * c * dlds[:, None, :]
 ```
 
-- No underflow: `c` resets every `K = 18` steps; worst case ~0.5¹⁸ ≈ 4e-6.
-- Touches 147 KB instead of 604 MB per step. Also removes A2's temp problem
-  from the decay side entirely.
-- `torch.compile` fuses `c` scaling into the multiply for free.
+This removes the explicit `w` mutation and is useful for state-space
+experiments, but it does **not** reduce the dominant memory traffic: both the
+legacy decay and the factored factor read/write `(B,K,D)` values. It therefore
+must not be credited with the claimed 1.2 GB/step saving. A future compressed
+age representation would need a different proof and measurement.
 
-### B2. Tail decay factoring (saves ~240 MB/step)
+The implementation keeps this corrected `(B,K,D)` representation behind the
+versioned `ring_algorithm='factored'` flag. The ring is still ephemeral under
+the existing checkpoint contract, so resume explicitly cold-starts `c=1` and
+`w=0`; the factor is saved to prevent a future state-format change from
+silently reinterpreting it.
+
+### B2. Tail decay factoring (potential ~240 MB/step; versioned state required)
 
 Same trick for `E.mul_(sig_hot)`, with one difference: `E` is never
 overwritten, so an undecayed `c` underflows to zero within ~50–100 steps.
-Renormalize periodically:
+The per-layer/B-column factor must be persisted with the checkpoint; the
+current saved E is already decayed and cannot be reinterpreted as factored
+state. Renormalize periodically:
 
 ```python
 c.mul_(sig)                       # B x H scalars
@@ -168,7 +241,9 @@ Amortized cost: one 120 MB pass per 100 steps ≈ 1.2 MB/step, replacing
 
 The ~25 ms unaccounted for is 151M fp32 atomic adds/step:
 `dembed.index_add_` scatters 9.4M floats **per layer** into only **256** target
-rows, so ~72 atomic row-adds contend per target row per layer.
+rows, so the average source-to-target contribution count is about
+`9.4M / 256 ≈ 36,864` per target row per layer; actual contention must be
+profiled rather than inferred from an incorrect factor of 72.
 
 **Measure before building.** Phase 0 should add a micro-bench of the isolated
 `index_add_` at these exact shapes. If it is 5 ms, sort+segment-sum is not
@@ -185,8 +260,8 @@ Options, in increasing ambition:
    into `dembed`, all in a single pass:
 
    ```
-   ring traffic today:   208 MB/layer  (3 passes: decay r+w, multiply r+w, scatter r)
-   fused kernel:         ~38 MB/layer  (1 pass)  => ring 3.3 GB -> ~0.7 GB/step
+   ring traffic today:   ~151 MB/layer  (decay r+w, multiply write, scatter read)
+   fused kernel:         ~38 MB/layer  (1 pass)  => ring ~2.4 GB -> ~0.7 GB/step
    ```
 
    This is the single change that could take the step from 47.6 ms toward the
@@ -212,47 +287,74 @@ Options, in increasing ambition:
 
 1. **Local CPU gates after every single change**, before any quota:
    `tests/check_gradients.py`, `tests/check_parity.py`, `tests/check_trainer.py`.
-   Free, and they catch semantic errors immediately.
+   The CUDA profiler/harness must also compare all state tensors, not only theta.
+   These gates catch semantic errors before cloud time is spent.
 2. **One `bench_variants.py` T4 run per batch of changes** (~3 min), never one
    25-min leg per idea.
-3. **Phase A must be bit-identical.** Any drift in theta means a bug — stop.
+3. **Phase A uses the strictest feasible state parity.** A true fused or
+   cold-subset scatter may change CUDA atomic scheduling, so use a documented
+   tolerance for the complete state rather than claiming universal bitwise
+   equality. Any large drift is a bug — stop.
 4. **Phase B/C reassociate floating point and therefore move the trajectory.**
-   For each: apply the *identical* change to `numpy_port.py` so CPU ≡ GPU
-   parity is preserved, snapshot the current checkpoint, then re-run the ruler.
-   Accept only if in-domain CE stays within the **0.03 CE** bar of the
-   t=94,747 baseline (1.1741 ± 0.0415 in-domain, 1.1425 ± 0.0165 shift).
-   Record the ruler delta in RESULTS.md alongside the speed delta.
+   Keep the old engine as the reference; implement the candidate behind a
+   versioned flag, compare it against the old CPU/Torch trajectory, snapshot
+   the old checkpoint, then run the ruler. Do not silently replace the old
+   NumPy semantics. Accept only if the documented state tolerance and the
+   **0.03 CE** quality bar pass. Factored state must add an algorithm/checkpoint
+   version and persist or explicitly migrate its new decay factors.
 5. **Rollback discipline:** tag the commit before each phase
    (`git tag opt-before-B1`). Checkpoints are immutable and content-verified,
-   so the worst case is "revert the code, keep training from t=94,747".
+   so the worst case is "revert the code, keep training from t=94,747". A
+   factored-decay variant must never silently load an old checkpoint: require
+   an explicit version check and migration/warmup policy.
 6. **Nothing is recorded as an improvement without before/after numbers** in
    RESULTS.md, from the Phase 0 harness.
 
 ---
 
-## 8. Work order and expected payoff
+## 8.1 Implementation status in this worktree
+
+The candidate paths are implemented behind explicit flags, with the legacy path
+unchanged as the default:
+
+- `bench_variants.py` provides the fresh-model, synchronized Phase-0 board,
+  profiler, and isolated `index_add_`/segmented microbenchmark.
+- A1 (`--ring-credit cold`), A2 controls (`kloop` / `compiled`), and C
+  (`segmented` / CUDA-only `triton`) are available for T4 measurement.
+- A3 is exposed as `--compile-step` plus `--async-metrics`; it deliberately
+  refuses to run with the per-step host metric sync.
+- B1/B2 are versioned candidates with explicit migration and saved factors.
+  B1's factor is `(B,K,D)`, correcting the invalid scalar `(B,K)` proposal;
+  therefore it is not credited with a traffic win.
+- `tests/check_optimizations.py` is the local CPU gate for all candidate state,
+  loss, and checkpoint-version behavior.
+
+No GPU result is claimed in this worktree: the laptop environment has
+`torch 2.14.0+cpu` and no CUDA device. The T4 board and the documented 0.03 CE
+ruler still need to be run before accepting any candidate as an improvement.
+
+
+## 9. Work order and expected payoff
 
 | # | item | effort | risk | expected B/s | cumulative |
 |---|---|---|---|---|---|
 | 0 | `bench_variants.py` harness | 30 min | none | — | enables everything |
-| A1 | skip hot columns in ring credit | 1–2 h | none (bit-identical) | ~24 k | 1.1× |
-| A2 | fuse the `ring_vals` temp | 1–2 h | low | ~28 k | 1.3× |
-| A3 | CUDA-graph the step | 2–3 h | low | ~31 k | 1.45× |
-| B1 | factored ring decay | 2–3 h | medium (trajectory) | ~37 k | 1.7× |
-| B2 | factored tail decay | 1–2 h | medium (trajectory) | ~39 k | 1.8× |
-| C | measure atomics, then fused Triton kernel | 1 day | high | ~45 k+ | 2.1×+ |
+| A1 | skip hot columns in ring credit | 1–2 h | low | TBD (small at H=115) | measure |
+| A2 | fuse the `ring_vals` temp | 1–2 h | low/medium | TBD | measure |
+| A3 | CUDA-graph the step | 2–3 h | medium | TBD | measure |
+| B1 | factored ring decay (corrected D-factor, no promised traffic win) | 2–3 h | medium (trajectory + format) | TBD | measure |
+| B2 | factored tail decay | 1–2 h | medium (trajectory + format) | TBD | measure |
+| C | measure atomics, then fused Triton kernel | 1 day | high | TBD | measure |
 
 Consequences at each level:
 
 | throughput | 12 h Kaggle session | 4.5 GB one-epoch pass |
 |---|---|---|
 | 21.5 kB/s (now) | 0.93 GB | 58 h |
-| 31 kB/s (after A) | 1.34 GB | 43 h |
-| 39 kB/s (after B) | 1.69 GB | 32 h |
+| 31 kB/s (hypothetical) | 1.34 GB | 43 h |
+| 39 kB/s (hypothetical) | 1.69 GB | 32 h |
 
-**Recommended order given limited time:** Phase 0 → A1 → A2 → A3 → B1 → B2 →
-C. A1–A3 are worth doing even if nothing else happens: they are pure deletion
-of wasted work, they cannot change the model's mathematics, and together they
-recover the throughput the synthetic bench promised. B1 is the best
-speed-per-line in the plan but is the first change that requires a ruler
-re-baseline, so do it only with time left to validate properly.
+**Recommended order given limited time:** Phase 0 → A2 → B1 (versioned
+experiment) → A3 → A1 → B2 → C. A1 is small at the current H=115; A2 and B1
+are the first candidates worth measuring, while B1 also requires a format and
+ruler migration plan.
