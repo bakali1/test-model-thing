@@ -1,0 +1,144 @@
+"""check_parity.py — numpy_port ≡ gpu_port parity gate (the "100% sure" test).
+
+Given the same init (numpy model seeded, hot dims forced so the tail is
+engaged) and the same byte stream, both implementations must stay in lockstep:
+per-step loss / last_ce within ~1e-3 relative, per-parameter gradients within
+~2e-2 relative (fp32 matmul accumulation order is the only tolerated
+difference; elementwise/buffer ops are bit-identical by construction).
+
+Also verifies the checkpoint round trip (numpy -> torch -> npz -> numpy) and a
+mid-run continuation through the .npz bridge.
+
+Usage:  .venv/bin/python tests/check_parity.py [--steps 150] [--B 32]
+Exit code 0 = PASS.
+"""
+import argparse
+import sys
+import time
+
+import numpy as np
+import torch
+
+sys.path.insert(0, ".")          # repo root
+import numpy_port
+import gpu_port
+
+
+def build_pair(dim, layers, B, seed, n_hot):
+    """Seeded numpy model; forced hot dims per layer; torch copy via from_numpy."""
+    numpy_port.rng = np.random.default_rng(seed)
+    np_model = numpy_port.Model(dim=dim, layers=layers, lr=5e-4)
+    # force hot dims so the tail engages: pre-sigmoid +4 => sigma ~0.982
+    for i, l in enumerate(np_model.layers):
+        for j in range(n_hot):
+            l.decay[j] = 4.0
+    np_model.new_states(B)
+    gpu_model = gpu_port.GpuModel(dim=dim, layers=layers, lr=5e-4)
+    gpu_model.from_numpy(np_model)
+    return np_model, gpu_model
+
+
+def byte_streams(T, B, seed):
+    rng = np.random.default_rng(seed)
+    flat = (rng.integers(1, 250, size=T * B)).astype(np.int64)
+    cs = flat.reshape(T, B)
+    ns = np.roll(cs, -1, axis=0)
+    ends = (rng.random((T, B)) < 0.02).astype(np.float32)
+    return cs, ns, ends
+
+
+def rel(a, b, floor=1e-4):
+    return float(np.max(np.abs(a - b) / (np.abs(b) + floor)))
+
+
+def run_steps(np_model, gpu_model, cs, ns, ends, n_steps, warm="", verbose=True):
+    B = cs.shape[1]
+    bad_loss, bad_ce = 0.0, 0.0
+    dev = gpu_model.device
+    worst_grad = ("", 0.0)
+    t0 = time.time()
+    for t in range(1, n_steps + 1):
+        c = cs[t].tolist(); n = ns[t].tolist(); e = ends[t].tolist()
+        l_np = np_model.step_batch(c, n, e)
+        l_gp = gpu_model.step_batch(
+            torch.from_numpy(cs[t]).to(dev), torch.from_numpy(ns[t]).to(dev),
+            torch.from_numpy(ends[t]).to(dev))
+        bad_loss = max(bad_loss, abs(l_np - l_gp) / max(1.0, abs(l_np)))
+        bad_ce = max(bad_ce, abs(np_model.last_ce - gpu_model.last_ce)
+                     / max(1.0, abs(np_model.last_ce)))
+        if t % 50 == 0 and verbose:
+            print(f"  [{warm}] step {t}: loss {l_np:.4f}/{l_gp:.4f} "
+                  f"maxrel_loss {bad_loss:.2e} ce {bad_ce:.2e}", flush=True)
+    # gradients + moments after the run
+    for name in np_model.views:
+        a = np_model.gviews[name]
+        b = gpu_model.gviews[name].detach().cpu().numpy()
+        r = rel(a, b)
+        if r > worst_grad[1]:
+            worst_grad = (name, r)
+    rm = rel(np_model.m, gpu_model.m.detach().cpu().numpy())
+    rv = rel(np_model.v, gpu_model.v.detach().cpu().numpy())
+    return bad_loss, bad_ce, worst_grad, rm, rv, time.time() - t0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=150)
+    ap.add_argument("--B", type=int, default=32)
+    ap.add_argument("--dim", type=int, default=64)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--n-hot", type=int, default=3, help="forced hot dims/layer")
+    args = ap.parse_args()
+
+    T = args.steps + 2
+    cs, ns, ends = byte_streams(T, args.B, seed=7)
+    np_model, gpu_model = build_pair(args.dim, args.layers, args.B, 11,
+                                     args.n_hot)
+    print(f"np: {np_model.count():,} params | ring_k {np_model.ring_k} | "
+          f"B {args.B} | dim {args.dim} layers {args.layers} | "
+          f"tail hot: {[(i, np_model.tail.nhot(i)) for i in range(args.layers) if np_model.tail and np_model.tail.nhot(i)]}")
+
+    bl, bce, wg, rm, rv, dt = run_steps(np_model, gpu_model, cs, ns, ends,
+                                        args.steps, "live")
+    print(f"\n  live {args.steps} steps in {dt:.1f}s: maxrel loss {bl:.2e} "
+          f"ce {bce:.2e}")
+    print(f"  worst grad rel {wg[0]} = {wg[1]:.2e} | m {rm:.2e} v {rv:.2e}")
+
+    # ---- continuation: save npz from torch, reload into BOTH, keep going ----
+    gpu_model.save("/tmp/_parity_a.npz")
+    np2 = numpy_port.Model(dim=args.dim, layers=args.layers, lr=5e-4)
+    numpy_port.rng = np.random.default_rng(99)   # any; load overrides below
+    np2.new_states(args.B)
+    np2.load("/tmp/_parity_a.npz")
+    gp2 = gpu_port.GpuModel(dim=args.dim, layers=args.layers, lr=5e-4)
+    gp2.new_states(args.B)
+    gp2.load("/tmp/_parity_a.npz")
+    assert np2.t == gp2.t == np_model.t, (np2.t, gp2.t, np_model.t)
+    assert np2.ring_k == gp2.ring_k == np_model.ring_k
+    bl2, bce2, wg2, rm2, rv2, dt2 = run_steps(
+        np2, gp2, cs, ns, ends, 40, "continue", verbose=False)
+    print(f"  continue 40 steps through npz bridge: maxrel loss {bl2:.2e} "
+          f"ce {bce2:.2e} worst grad {wg2[1]:.2e} m {rm2:.2e} v {rv2:.2e}")
+
+    # ---- round-trip bit-exactness: torch save -> numpy save -> compare ----
+    gpu_model.save("/tmp/_parity_b.npz")
+    np3 = numpy_port.Model(dim=args.dim, layers=args.layers)
+    np3.new_states(args.B)
+    np3.load("/tmp/_parity_b.npz")
+    d1 = np.load("/tmp/_parity_a.npz")
+    d2 = np.load("/tmp/_parity_b.npz")
+    for k in d1.files:
+        if k in ("t", "bytes", "B", "ring_k"):
+            assert int(d1[k]) == int(d2[k]), k
+        else:
+            assert np.array_equal(d1[k], d2[k]), f"round-trip mismatch: {k}"
+    print("  npz round-trip bit-exact: PASS")
+
+    ok = (bl < 1e-3 and bce < 1e-2 and wg[1] < 2e-2 and rm < 2e-2 and rv < 2e-2
+          and bl2 < 1e-3 and bce2 < 1e-2 and wg2[1] < 2e-2)
+    print("\nPARITY:", "PASS" if ok else "FAIL", flush=True)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

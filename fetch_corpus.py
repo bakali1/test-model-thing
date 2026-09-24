@@ -203,7 +203,8 @@ def _read_parquet(path, cols, batch_size=20000):
     with pq.ParquetFile(path) as pf:
         for batch in pf.iter_batches(batch_size=batch_size, columns=cols,
                                      use_threads=False):
-            yield batch.to_pylist()
+            for row in batch.to_pylist():
+                yield row
 
 
 # ----------------------------------------------------------------------------
