@@ -52,7 +52,7 @@ PAYLOAD = __PAYLOAD__
 TMT_TOKEN = __TOKEN__
 if TMT_TOKEN:
     os.environ["TMT_TOKEN"] = TMT_TOKEN
-    print(f"[auth] embedded HF token ({TMT_TOKEN[:7]}...{TMT_TOKEN[-4:]})",
+    print(f"[auth] embedded HF token ({len(TMT_TOKEN)} chars, not shown)",
           flush=True)
 
 for name, b64 in PAYLOAD.items():
@@ -85,7 +85,11 @@ DEVICE = os.environ.get("TMT_DEVICE") or ("cuda" if torch.cuda.is_available() el
 # Throughput tripwire: the old tail-sync bug showed up as ~2.6k B/s.
 MIN_BPS = float(os.environ.get("TMT_MIN_BPS",
                                "25000" if DEVICE == "cuda" else "0"))
-HUB_REPO = os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL")
+# `colab run` does not forward ANY environment variable from the laptop, so
+# the hub repo id is embedded at generation time too (an env var still wins if
+# the runner ever does pass one).
+HUB_REPO = (os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL")
+            or __REPO__)
 CKPT_URL = os.environ.get("TMT_CKPT_URL", "")
 FAILS = []
 
@@ -264,6 +268,20 @@ sys.exit(1 if FAILS else 0)
 '''
 
 
+def _repo():
+    """Hub repo id to embed: env if given, else checkpoint_hub's default."""
+    raw = (os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL")
+           or "").strip().rstrip("/")
+    if not raw:
+        return "bakali1/tmt-checkpoints"
+    for prefix in ("https://huggingface.co/", "http://huggingface.co/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+    parts = [p for p in raw.split("/") if p and p not in ("tree", "main",
+                                                          "datasets")]
+    return "/".join(parts[:2]) if len(parts) >= 2 else raw
+
+
 def _token():
     """HF token for embedding: env first, then the cached CLI login."""
     t = os.environ.get("TMT_TOKEN")
@@ -287,6 +305,7 @@ def main():
     out = DRIVER.replace("__PAYLOAD__", "{" + ", ".join(
         f"{k!r}: {v!r}" for k, v in payload.items()) + "}")
     out = out.replace("__TOKEN__", repr(_token()))
+    out = out.replace("__REPO__", repr(_repo()))
     path = os.path.join(HERE, "colab_leg.py")
     with open(path, "w") as f:
         f.write(out)
