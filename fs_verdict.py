@@ -132,17 +132,24 @@ def pull_tags(at_step=None):
 def score(path):
     """Run eval.py on one checkpoint and pull the ruler numbers out.
 
-    A non-zero exit prints the tail of both streams: a silent failure here
-    would otherwise look like a missing number in the verdict table.
+    Caches the raw transcript next to the checkpoint so re-rendering the table
+    (or fixing a regex) costs nothing: one CPU eval at the ruler setting is
+    ~10 minutes.
     """
-    p = subprocess.run([sys.executable, os.path.join(HERE, "eval.py"), path]
-                       + EVAL_ARGS,
-                       capture_output=True, text=True, cwd=HERE)
-    if p.returncode != 0:
-        print(f"  [eval.py rc={p.returncode} on {os.path.basename(path)}]")
-        print((p.stdout[-1500:] or "") + (p.stderr[-1500:] or ""))
-        return None
-    out = p.stdout
+    cache = path + ".evaltxt"
+    if os.path.exists(cache) and os.environ.get("TMT_FS_NO_CACHE") != "1":
+        out = open(cache).read()
+    else:
+        p = subprocess.run([sys.executable, os.path.join(HERE, "eval.py"),
+                            path] + EVAL_ARGS,
+                           capture_output=True, text=True, cwd=HERE)
+        if p.returncode != 0:
+            print(f"  [eval.py rc={p.returncode} on {os.path.basename(path)}]")
+            print((p.stdout[-1500:] or "") + (p.stderr[-1500:] or ""))
+            return None
+        out = p.stdout
+        with open(cache, "w") as f:
+            f.write(out)
     m = re.search(r"mean\s+([0-9.]+) \+/- ([0-9.]+)", out)
     ind = (float(m.group(1)), float(m.group(2))) if m else (None, None)
     m = re.search(r"cross-domain CE.*?mean\s+([0-9.]+) \+/- ([0-9.]+)",
@@ -155,14 +162,23 @@ def score(path):
     hot = int(m.group(1)) if m else None
     m = re.search(r"half-life\s+mean=([0-9.]+) B", out)
     hl = float(m.group(1)) if m else None
-    m = re.search(r"steps \(t\)\s*:\s*(\d+)\s+bytes seen\s*(\d+)", out)
-    t = int(m.group(1)) if m else None
-    seen = int(m.group(2)) if m else None
+    m = re.search(r"steps \(t\)\s*:\s*([\d,]+)\s+bytes seen\s*([\d,]+)", out)
+    # The ruler prints thousands separators ("60,000"), which a plain \d+
+    # silently fails to match and leaves the table as None.
+    t = int(m.group(1).replace(",", "")) if m else None
+    seen = int(m.group(2).replace(",", "")) if m else None
     return dict(ind=ind, xd=xd, shift=sh, hot=hot, hl=hl, t=t, seen=seen)
 
 
 def fmt_pair(p):
-    return f"{p[0]:.4f} +/- {p[1]:.4f}" if p[0] is not None else "n/a"
+    if p is None or p[0] is None:
+        return "n/a"
+    return f"{p[0]:.4f} +/- {p[1]:.4f}"
+
+
+def num(v, spec="{:>9,}", scale=1.0):
+    """Format a possibly-missing number; a None must never crash the table."""
+    return spec.format("n/a") if v is None else spec.format(int(v * scale))
 
 
 def main():
@@ -276,16 +292,17 @@ def main():
         if a not in rows:
             continue
         p, s = rows[a]
-        print(f"FS-{a:3s} {s['t']:>9,} {s['seen']:>13,} "
-              f"{fmt_pair(s['ind']):>20s} "
-              f"{(f'{s['xd'][0]:.3f}' if s['xd'][0] is not None else 'n/a'):>8s} "
-              f"{s['hot']:>5d} "
-              f"{(f'{s['hl']:.2f}' if s['hl'] is not None else 'n/a'):>10s}")
+        xd = f"{s['xd'][0]:.3f}" if s['xd'] and s['xd'][0] is not None else "n/a"
+        hl = f"{s['hl']:.2f}" if s['hl'] is not None else "n/a"
+        hot = s['hot'] if s['hot'] is not None else "n/a"
+        print(f"FS-{a:3s} {num(s['t']):>9s} {num(s['seen']):>13s} "
+              f"{fmt_pair(s['ind']):>20s} {xd:>8s} {str(hot):>5s} {hl:>10s}")
     print("=" * 74)
 
     # ---- verdict ---------------------------------------------------------
     print(f"\nbar = {BAR} CE nats/byte (the real-difference line from RESULTS.md)")
-    best = min((a for a in rows if rows[a][1]["ind"][0] is not None),
+    best = min((a for a in rows if rows[a][1]["ind"]
+                and rows[a][1]["ind"][0] is not None),
                key=lambda a: rows[a][1]["ind"][0], default=None)
     if best is None:
         sys.exit("no in-domain mean to compare")
@@ -294,22 +311,33 @@ def main():
     for a in rows:
         if a == best:
             continue
-        d = rows[best][1]["ind"][0] - rows[a][1]["ind"][0]
-        sep = (d > BAR)
-        # cross-domain guard: the winner must not wreck novel-domain transfer
-        xd_gap = None
-        if rows[best][1]["xd"][0] is not None and rows[a][1]["xd"][0] is not None:
-            xd_gap = rows[best][1]["xd"][0] - rows[a][1]["xd"][0]
+        # lower CE is better, and `best` is the MINIMUM, so the margin is
+        # other - best (positive => best wins by that much). The first version
+        # computed best - other, which is always negative and therefore
+        # reported a 0.52 CE gap as "within noise".
+        d = rows[a][1]["ind"][0] - rows[best][1]["ind"][0]
+        sep = d > BAR
+        # Cross-domain guard: a winner that wrecks novel-domain transfer has
+        # not really won. d_xd positive => the in-domain winner is WORSE on
+        # novels by that margin.
+        d_xd = None
+        if rows[best][1]["xd"] and rows[a][1]["xd"] \
+                and rows[best][1]["xd"][0] is not None \
+                and rows[a][1]["xd"][0] is not None:
+            d_xd = rows[best][1]["xd"][0] - rows[a][1]["xd"][0]
         verdict = "SEPARATED" if sep else "within noise"
-        if xd_gap is not None and xd_gap < -BAR:
-            verdict += " (but worse on novels)"
-        print(f"  FS-{best} vs FS-{a}: d(indomain) = {d:+.4f} -> {verdict}"
-              + (f" | d(novels) = {xd_gap:+.4f}" if xd_gap is not None else ""))
+        if d_xd is not None and d_xd > BAR:
+            verdict += f" (but worse on novels by {d_xd:+.3f})"
+        line = (f"  FS-{best} vs FS-{a}: FS-{best} wins in-domain by "
+                f"{d:+.4f} -> {verdict}")
+        if d_xd is not None:
+            line += f" | FS-{best} minus FS-{a} on novels = {d_xd:+.4f}"
+        print(line)
 
     hot = {a: rows[a][1]["hot"] for a in rows}
     if len(set(hot.values())) > 1:
         print("\nhot dims (long-memory growth) differ: "
-              + ", ".join(f"FS-{a}={hot[a]}" for a in ARMS if a in hot))
+              + ", ".join(f"FS-{a}={hot[a]}" for a in ARMS if a in rows))
     print("\nNOTE: this is arm-vs-arm. It is NOT a claim that a from-scratch "
           "run beats\nthe incumbent at t=94,747, which has 64,747 more steps "
           "of history.")
