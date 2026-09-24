@@ -21,6 +21,7 @@ Verdict rules (PLAN §6 / RESULTS.md ruler):
     cross-domain novels by more than the bar
 """
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -136,7 +137,11 @@ def score(path):
     (or fixing a regex) costs nothing: one CPU eval at the ruler setting is
     ~10 minutes.
     """
-    cache = path + ".evaltxt"
+    # The eval args are part of the cache key: without them a transcript
+    # produced at --slices 1 --bytes 2000 gets served for a ruler-grade
+    # request, silently reporting the wrong numbers under the right heading.
+    key = hashlib.sha1(" ".join(EVAL_ARGS).encode()).hexdigest()[:8]
+    cache = f"{path}.evaltxt.{key}"
     if os.path.exists(cache) and os.environ.get("TMT_FS_NO_CACHE") != "1":
         out = open(cache).read()
     else:
