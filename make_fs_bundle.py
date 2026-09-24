@@ -74,6 +74,10 @@ SAVE_EVERY = 2000
 # The locally staged TinyStories files cover the head of the train file; start
 # past them so this arm's text is novel w.r.t. the eval ruler.
 TS_OFFSET_MB = int(os.environ.get("TMT_FS_TS_OFFSET_MB", "220"))
+# Every module the arm needs must travel INSIDE the generated script: `colab
+# run` executes it as a notebook cell and the repo does not exist on the VM.
+MODULES = ["gpu_port.py", "train_gpu.py", "numpy_port.py", "tail_credit.py",
+           "checkpoint_hub.py", "fetch_corpus.py"]
 # Toy size for the local CPU smoke test; never used in a real arm.
 SMOKE_DIM = int(os.environ.get("TMT_FS_SMOKE_DIM", "64"))
 SMOKE_LAYERS = int(os.environ.get("TMT_FS_SMOKE_LAYERS", "2"))
@@ -85,6 +89,8 @@ TEMPLATE = r'''#!/usr/bin/env python3
 1h GPU budget. Trains FROM t=0 on a seeded init, one corpus, then pushes the
 final tag (colab run releases the VM, so anything unpushed is lost).
 """
+import base64
+import gzip
 import os
 import subprocess
 import sys
@@ -92,16 +98,22 @@ import time
 import urllib.request
 
 # `colab run` executes the script inside a notebook cell, where __file__ does
-# not exist and the repo lands in /content. Prefer whichever directory
-# actually holds train_gpu.py.
+# not exist AND the repo is not present on the VM. Unpack the embedded modules
+# first, then point HERE at the directory that actually holds them.
 HERE = (os.path.dirname(os.path.abspath(__file__))
         if "__file__" in globals() else os.getcwd())
+PAYLOAD = __PAYLOAD__
+for _name, _b64 in PAYLOAD.items():
+    with open(os.path.join(HERE, _name), "wb") as _f:
+        _f.write(gzip.decompress(base64.b64decode(_b64)))
 if not os.path.isfile(os.path.join(HERE, "train_gpu.py")):
     for _cand in ("/content", os.getcwd()):
         if os.path.isfile(os.path.join(_cand, "train_gpu.py")):
             HERE = _cand
             break
 sys.path.insert(0, HERE)
+print(f"[payload] wrote {{len(PAYLOAD)}} modules to {{HERE}}: "
+      f"{{', '.join(sorted(PAYLOAD))}}", flush=True)
 
 ARM          = "{name}"
 QUESTION     = "{question}"
@@ -380,6 +392,14 @@ print("=" * 68)
 
 
 def build(arm, cfg):
+    import base64 as _b64mod
+    import gzip as _gz
+    payload = {}
+    for name in MODULES:
+        with open(os.path.join(HERE, name), "rb") as f:
+            payload[name] = _b64mod.b64encode(_gz.compress(f.read(), 9)).decode()
+    # Format FIRST, then inject the payload: the base64 blob is full of braces
+    # and would be chewed up by str.format if it were substituted before.
     body = TEMPLATE.format(
         name=cfg["name"], question=cfg["question"], kind=cfg["kind"],
         layers=cfg.get("layers", ""), total_budget_s=TOTAL_BUDGET_S,
@@ -387,6 +407,9 @@ def build(arm, cfg):
         fetch_mb=FETCH_MB, data_seed=DATA_SEED, init_seed=INIT_SEED,
         save_every=SAVE_EVERY, ts_offset_mb=TS_OFFSET_MB, ts_url=TINYSTORIES,
         smoke_dim=SMOKE_DIM, smoke_layers=SMOKE_LAYERS)
+    body = body.replace(
+        "__PAYLOAD__",
+        "{" + ", ".join(f'"{k}": "{v}"' for k, v in payload.items()) + "}")
     path = os.path.join(HERE, f"colab_fs_{arm}.py")
     with open(path, "w") as f:
         f.write(body)
