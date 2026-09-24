@@ -92,8 +92,30 @@ membership on the documented REBASE_EVERY cadence with on-device seeding
 Post-review hardening (same session): parity gate now compares the
 accumulators, not just loss/grads — live 150 steps: ring_b 0% mismatch (ids
 exact), ring_w 8.9e-07 rel, tail_cols 0%, tail_E 8.7e-07 rel, loss 2.9e-07;
-thresholds tightened to loss 1e-5 / grads+accumulators 5e-3. Hub-pull load,
-relative `--steps`, `--batch` default 1024, `--push`, untagged mode, atomic
-rolling replace, CUDA bench sync, `TMT_TAIL` switch, 4 GB hot-dim cap, and
+thresholds tightened to loss 1e-5 / grads+accumulators 5e-3, and post-resume
+m, v, theta and accumulators are asserted too. Hub-pull load, relative
+`--steps`, `--batch` default 1024, `--push`, untagged mode, atomic rolling
+replace, CUDA bench sync, `TMT_TAIL` switch, 4 GB hot-dim cap, and
 corpus staging swap all landed and are covered by the gates above
 (see PLAN-2026-09-23-GPU.md §8 for the full review triage).
+
+Second review response (same session): A/B tag isolation per arm; tail cap
+now pre-allocates; `new_states` invalidates tail/rebase; hub content
+validation with SHA-256 sidecars and loud equal-step conflicts; explicit
+remote pruning; crash-safe versioned corpus publication; HF pagination with
+revision + yield checks; Kaggle entrypoint (`kaggle/tmt_gpu_train.py`,
+exercised locally on CPU). New gate: `tests/check_trainer.py` (6/6 PASS).
+Also measured and now documented rather than hand-waved:
+
+- **Resume is recoverable, not bit-identical.** `ring_b`/`ring_w` are not
+  persisted (numpy-compatible), so a resumed model's cold-dim embed credit
+  warms from step 1 and the trajectory separates: embed rel err 6.6e-02 at
+  step 1 (abs/RMS 5.5e-05, loss ratio 1.00), while tail E restores exactly.
+  A/B arms must not compare checkpoints taken within `ring_k` (≤18) steps of
+  a resume.
+- **Tail membership lags by design on GPU** (rebase every 500 steps vs numpy's
+  every step): pinned by a deterministic test (numpy 4 hot, GPU 3 until
+  rebase, 4 after).
+- The recorded CUDA numbers above remain **loss-only**; the CUDA gate now also
+  compares theta, every gradient, m, v, ring_b/ring_w and tail E, and the next
+  T4 run will record them.

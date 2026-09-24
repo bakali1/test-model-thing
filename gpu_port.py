@@ -64,11 +64,12 @@ class TorchTail:
     and rare); the per-step hot path (decay/credit/add) is torch.
     """
 
-    def __init__(self, B, ring_k, hot_frac=HOT_FRAC, device="cpu"):
+    def __init__(self, B, ring_k, hot_frac=HOT_FRAC, device="cpu", cap_gb=None):
         self.B = B
         self.ring_k = ring_k
         self.hot_frac = hot_frac
         self.device = device
+        self.cap_bytes = None if cap_gb is None else float(cap_gb) * 1e9
         self.cols = {}   # layer -> int64 tensor (H,) on device
         self.mask = {}   # layer -> bool (dim,) on device
         self.E = {}      # layer -> (B,256,H) fp32 on device
@@ -116,6 +117,20 @@ class TorchTail:
             keep = np.intersect1d(old, new)
             adopt = np.setdiff1d(new, old)
             H = len(new)
+            # Cap check BEFORE allocation: a 34 GB request must fail with this
+            # actionable message, not an opaque CUDA OOM from torch.zeros.
+            if self.cap_bytes is not None:
+                other = sum(int(e.numel()) * 4 for k, e in self.E.items()
+                            if k != l)
+                projected = other + self.B * 256 * H * 4
+                if projected > self.cap_bytes:
+                    raise RuntimeError(
+                        f"tail-credit memory would be "
+                        f"{projected/1e9:.3f} GB ({len(new)} hot dims in "
+                        f"layer {l}, B={self.B}), over the "
+                        f"{self.cap_bytes/1e9:.3f} GB cap. Lower --batch, or "
+                        f"TMT_TAIL=0 (ring-only credit), or raise "
+                        f"TMT_TAIL_CAP_GB deliberately.")
             E = torch.zeros((self.B, 256, H), dtype=F, device=self.device)
             if len(keep):
                 pos = np.array([int(np.searchsorted(old, k)) for k in keep])
@@ -264,6 +279,14 @@ class GpuModel:
 
     def new_states(self, B):
         self.B = B
+        # Replacing ring/states invalidates any tail built against the old
+        # buffers: drop it so _ensure_tail rebuilds and _tail_sync re-seeds.
+        # (Without this, a B change or a checkpoint ring_k change could keep a
+        # fresh rebase marker and leave the new tail unseeded with 0 hot dims.)
+        if hasattr(self, "tail"):
+            self.tail = None
+            self.tail_state = {}
+            self._tail_rebase_at = -1
         self.ring_b = torch.zeros((B, self.ring_k), dtype=torch.long,
                                   device=self.device)
         self.ring_vals = torch.zeros((B, self.ring_k, self.dim), dtype=F,
@@ -279,7 +302,8 @@ class GpuModel:
         if not self.tail_enabled:
             return
         if self.tail is None or self.tail.B != self.B:
-            self.tail = TorchTail(self.B, self.ring_k, device=self.device)
+            self.tail = TorchTail(self.B, self.ring_k, hot_frac=HOT_FRAC,
+                                  device=self.device, cap_gb=self.tail_cap_gb)
             if self.tail_state:
                 self._tail_restore_from(self.tail_state)
                 self.tail_state = {}
@@ -483,9 +507,10 @@ class GpuModel:
         if not os.path.exists(path):
             return False
         d = np.load(path)
-        if "ring_k" in d and int(d["ring_k"]) != self.ring_k:
-            self.ring_k = int(d["ring_k"])
-            self.tail = None
+        if "ring_k" in d and int(np.ravel(d["ring_k"])[0]) != self.ring_k:
+            self.ring_k = int(np.ravel(d["ring_k"])[0])
+            # new_states() drops the tail built against the old ring, so the
+            # newly sized ring/tail gets re-seeded by _ensure_tail below.
             self.new_states(self.B)
         if "t" in d:
             self.t = int(d["t"])

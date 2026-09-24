@@ -138,7 +138,53 @@ print(f"[RESULT] CUDA-vs-CPU maxrel loss over {STEPS} steps: {maxrel:.3e}", flus
 for t in range(STEPS):
     print(f"  step {cpu_m.t - STEPS + t + 1:6d}: cpu {lc[t]:.6f} cuda {lg[t]:.6f}",
           flush=True)
-result("cuda-parity", maxrel < 1e-3, f"maxrel {maxrel:.2e}")
+result("cuda-parity-loss", maxrel < 1e-5, f"maxrel {maxrel:.2e}")
+
+
+# ---- comprehensive state parity (review #4): loss alone does not prove the
+# embedding credit, tail EMA, or parameter update agree across devices.
+def _rel(a, b, floor):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return float(np.max(np.abs(a - b) / (np.abs(b) + floor)))
+
+
+def state_report(cpu_m, gpu_m):
+    out = {}
+    out["theta"] = _rel(cpu_m.theta.detach().cpu().numpy(),
+                        gpu_m.theta.detach().cpu().numpy(), 1e-6)
+    for name in cpu_m.gviews:
+        out["g:" + name] = _rel(cpu_m.gviews[name].detach().cpu().numpy(),
+                                gpu_m.gviews[name].detach().cpu().numpy(), 1e-4)
+    out["m"] = _rel(cpu_m.m.detach().cpu().numpy(),
+                    gpu_m.m.detach().cpu().numpy(), 1e-6)
+    out["v"] = _rel(cpu_m.v.detach().cpu().numpy(),
+                    gpu_m.v.detach().cpu().numpy(), 1e-6)
+    out["ring_b_mismatch"] = float((cpu_m.ring_b.detach().cpu().numpy()
+                                    != gpu_m.ring_b.detach().cpu().numpy()).mean())
+    rw, te = 0.0, 0.0
+    for i, l in enumerate(cpu_m.layers):
+        rw = max(rw, _rel(l.ring_w.detach().cpu().numpy(),
+                          gpu_m.layers[i].ring_w.detach().cpu().numpy(), 1e-6))
+        if cpu_m.tail is not None and gpu_m.tail is not None:
+            te = max(te, _rel(cpu_m.tail.E[i].detach().cpu().numpy(),
+                              gpu_m.tail.E[i].detach().cpu().numpy(), 1e-3))
+    out["ring_w"] = rw
+    out["tail_E"] = te
+    return out
+
+
+rep = state_report(cpu_m, gpu_m)
+for k, v in rep.items():
+    print(f"  [RESULT] cuda-vs-cpu {k:14s} {v:.3e}", flush=True)
+worst_state = max(v for k, v in rep.items() if k != "ring_b_mismatch")
+ok_ids = rep["ring_b_mismatch"] == 0.0
+ok_acc = rep["ring_w"] < 5e-3 and rep["tail_E"] < 5e-3
+ok_core = rep["theta"] < 5e-3 and rep["m"] < 5e-3 and rep["v"] < 1e-4
+ok_grad = max(v for k, v in rep.items() if k.startswith("g:")) < 5e-3
+result("cuda-parity-state", ok_ids and ok_acc and ok_core and ok_grad,
+       f"ids_exact={ok_ids} acc={ok_acc} core={ok_core} grads={ok_grad} "
+       f"worst={worst_state:.2e}")
 
 # ---------------- D: tagged save / reload / continue on CUDA --------------
 banner("D: save/reload/continue on CUDA")

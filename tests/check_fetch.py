@@ -68,16 +68,72 @@ def t_writer():
         w.add("doc2", "b" * 100)
         w.add("doc3", "c" * 100)
         w.close({"x": 1})
-        parts = sorted(x for x in os.listdir(d) if x.startswith("corpus_"))
+        # published through a versioned dir + atomic `current` symlink
+        cur = os.path.join(d, "current")
+        assert os.path.islink(cur), os.listdir(d)
+        target = os.path.realpath(cur)
+        assert os.path.basename(target) == "v0000", target
+        parts = sorted(x for x in os.listdir(target) if x.startswith("corpus_"))
         assert len(parts) >= 1, parts
         # docs never split: each part is a concatenation of WHOLE docs
-        total = sum(os.path.getsize(os.path.join(d, p)) for p in parts)
+        total = sum(os.path.getsize(os.path.join(target, p)) for p in parts)
         assert total == 300, total
-        assert os.path.exists(os.path.join(d, "manifest.json"))
-        assert os.path.exists(os.path.join(d, "ORDER.txt"))
+        assert os.path.exists(os.path.join(target, "manifest.json"))
+        assert os.path.exists(os.path.join(target, "ORDER.txt"))
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    print("  writer (no split, manifest, order): PASS")
+    print("  writer (versioned publish, no split, manifest, order): PASS")
+    return True
+
+
+def t_publish_crash_safety():
+    """Review #13: a crash before the pointer flip must leave the PREVIOUS
+    corpus intact and complete; a second publish advances the version."""
+    d = tempfile.mkdtemp()
+    try:
+        w1 = fc.CorpusWriter(d, mb=1)
+        w1.add("a", "first corpus")
+        w1.close({"v": 1})
+        first = os.path.realpath(os.path.join(d, "current"))
+
+        # crash injection: build a staging dir then "crash" before close()
+        w2 = fc.CorpusWriter(d, mb=1)
+        w2.add("b", "half written")
+        # no close(): simulate the process dying here
+        staging = [n for n in os.listdir(d) if n.startswith(".staging-")]
+        assert staging, os.listdir(d)
+        assert os.path.realpath(os.path.join(d, "current")) == first, \
+            "pointer moved before publish completed"
+        data = open(os.path.join(first, "corpus_00000.txt")).read()
+        assert "first corpus" in data and "half written" not in data
+
+        # recovery: the next publish ignores the abandoned staging dir
+        w3 = fc.CorpusWriter(d, mb=1)
+        w3.add("c", "second corpus")
+        w3.close({"v": 2})
+        now = os.path.realpath(os.path.join(d, "current"))
+        assert now != first, now
+        txt = open(os.path.join(now, "corpus_00000.txt")).read()
+        assert "second corpus" in txt, txt
+        # manifest records which version was published
+        import json
+        m = json.load(open(os.path.join(now, "manifest.json")))
+        assert m["published_as"] == os.path.basename(now), m
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("  publish is crash-safe (pointer flips last): PASS")
+    return True
+
+
+def t_pagination():
+    """Review #14: Link-header rel=next parsing (the tree API paginates)."""
+    h = '<https://huggingface.co/api/datasets/x/tree/main?cursor=abc>; rel="next"'
+    assert fc._next_link(h) == \
+        "https://huggingface.co/api/datasets/x/tree/main?cursor=abc"
+    assert fc._next_link('<u>; rel="prev"') is None
+    assert fc._next_link("") is None
+    assert fc._next_link(None) is None
+    print("  HF tree pagination (Link rel=next): PASS")
     return True
 
 
@@ -95,7 +151,8 @@ def t_budget():
 
 
 def main():
-    ok = all(f() for f in [t_gutenberg, t_raw, t_dialogue, t_writer, t_budget])
+    ok = all(f() for f in [t_gutenberg, t_raw, t_dialogue, t_writer,
+                           t_publish_crash_safety, t_pagination, t_budget])
     print("\nCHECK_FETCH:", "PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1
 

@@ -95,7 +95,97 @@ def run_steps(np_model, gpu_model, cs, ns, ends, n_steps, warm="", verbose=True)
             e_gp = gpu_model.tail.E[i].detach().cpu().numpy()
             acc["tail_E"] = max(acc["tail_E"],
                                 rel(e_np, e_gp, floor=1e-3))
-    return bad_loss, bad_ce, worst_grad, rm, rv, acc, time.time() - t0
+    # params after the run (theta must track too, not just grads/moments)
+    pth = rel(np_model.theta, gpu_model.theta.detach().cpu().numpy(),
+              floor=1e-6)
+    return (bad_loss, bad_ce, worst_grad, rm, rv, acc, pth,
+            time.time() - t0)
+
+
+def ring_warmup_test(np_writer, ckpt_path, cs, ns, ends, n_steps):
+    """Review #7: ring_b/ring_w are NOT persisted, so a resumed model starts
+    with an empty ring: cold-dim embed credit is missing from step 1. Unlike
+    the tail (E is saved, so hot dims are exact immediately), this difference
+    does NOT wash out — a perturbed embed changes later states, so the two
+    trajectories separate and stay separated. That is the accepted cost of the
+    numpy-compatible checkpoint size, and the reason A/B arms must not compare
+    the first ring_k steps after a resume as if they were a learning effect.
+
+    Asserts the bounded, documented facts rather than convergence:
+      * saved tail E is restored EXACTLY at resume;
+      * the first-step embed perturbation is finite and small in absolute
+        terms relative to the embed scale;
+      * the loss stays in the same band as the writer's (no blow-up).
+    Returns (first_embed_rel, last_embed_rel, abs_rms, loss_ratio, ring_k).
+    """
+    import copy
+    # writer must be the SAME engine that wrote the file: torch->torch is
+    # bit-exact for saved state; numpy->torch is only parity-level (~1e-6).
+    writer = copy.deepcopy(np_writer)            # torch, still has its live ring
+    resumed = gpu_port.GpuModel(dim=writer.dim, layers=writer.layercount,
+                                lr=writer.lr)
+    resumed.new_states(cs.shape[1])
+    resumed.load(ckpt_path)                      # ring starts empty, tail E saved
+    dev = resumed.device
+    # (a) the persisted tail must come back exactly
+    e_tail_exact = True
+    for i in range(writer.layercount):
+        w = writer.tail.E[i].detach().cpu().numpy()
+        g = resumed.tail.E[i].detach().cpu().numpy()
+        if w.shape != g.shape or not np.array_equal(w, g):
+            e_tail_exact = False
+    first_rel, last_rel, losses = 0.0, 0.0, []
+    w_scale = float(torch.sqrt(torch.mean(writer.embed ** 2))) + 1e-12
+    for t in range(1, min(n_steps, cs.shape[0] - 1) + 1):
+        c, n_, e_ = cs[t], ns[t], ends[t]
+        lw = writer.step_batch(torch.from_numpy(c).to(dev),
+                               torch.from_numpy(n_).to(dev),
+                               torch.from_numpy(e_).to(dev))
+        lr_ = resumed.step_batch(torch.from_numpy(c).to(dev),
+                                 torch.from_numpy(n_).to(dev),
+                                 torch.from_numpy(e_).to(dev))
+        losses.append((float(lw), float(lr_)))
+        e = rel(writer.embed.detach().cpu().numpy().ravel(),
+                resumed.embed.detach().cpu().numpy().ravel(), floor=1e-6)
+        if t == 1:
+            first_rel = e
+        last_rel = e
+    abs_rms = float(np.sqrt(np.mean(
+        (writer.embed.detach().cpu().numpy().ravel()
+         - resumed.embed.detach().cpu().numpy().ravel()) ** 2)))
+    loss_ratio = max((abs(r) / max(1e-6, abs(w)) for w, r in losses[-5:]),
+                     default=1.0)
+    return e_tail_exact, first_rel, last_rel, abs_rms / w_scale, loss_ratio, \
+        resumed.ring_k
+
+
+def membership_cadence_test(dim, layers, B, seed, n_hot):
+    """Review #8: numpy re-evaluates hot membership every step; gpu every
+    REBASE_EVERY (500). A dim that crosses the threshold mid-interval is
+    adopted by numpy immediately and by gpu at the next rebase. Pins that
+    documented behavior: lag exists inside the interval, and an explicit
+    rebase reconciles the two engines exactly."""
+    np_m, gp_m = build_pair(dim, layers, B, seed, n_hot)
+    t0, T = 0, 40
+    cs, ns, ends = byte_streams(T + 2, B, seed=seed + 1)
+    dev = gp_m.device
+    for t in range(1, t0 + 1):
+        np_m.step_batch(cs[t].tolist(), ns[t].tolist(), ends[t].tolist())
+        gp_m.step_batch(torch.from_numpy(cs[t]).to(dev),
+                        torch.from_numpy(ns[t]).to(dev),
+                        torch.from_numpy(ends[t]).to(dev))
+    np_m.layers[0].decay[5] = 4.0               # cross into hot (both engines)
+    gp_m.layers[0].decay[5] = 4.0               # same truth; not re-evaluated
+    for t in range(t0 + 1, t0 + 6):
+        np_m.step_batch(cs[t].tolist(), ns[t].tolist(), ends[t].tolist())
+        gp_m.step_batch(torch.from_numpy(cs[t]).to(dev),
+                        torch.from_numpy(ns[t]).to(dev),
+                        torch.from_numpy(ends[t]).to(dev))
+    np_hot = np_m.tail.nhot(0)
+    gp_hot = gp_m.tail.nhot(0)                  # stale: rebase not due
+    gp_m._tail_sync()                           # force the documented rebase
+    gp_hot_after = gp_m.tail.nhot(0)
+    return np_hot, gp_hot, gp_hot_after
 
 
 def main():
@@ -115,13 +205,14 @@ def main():
           f"B {args.B} | dim {args.dim} layers {args.layers} | "
           f"tail hot: {[(i, np_model.tail.nhot(i)) for i in range(args.layers) if np_model.tail and np_model.tail.nhot(i)]}")
 
-    bl, bce, wg, rm, rv, acc, dt = run_steps(np_model, gpu_model, cs, ns, ends,
-                                             args.steps, "live")
+    bl, bce, wg, rm, rv, acc, pth, dt = run_steps(np_model, gpu_model, cs,
+                                                   ns, ends, args.steps, "live")
     hot_total = (sum(np_model.tail.nhot(i) for i in range(args.layers))
                  if np_model.tail else 0)
     print(f"\n  live {args.steps} steps in {dt:.1f}s: maxrel loss {bl:.2e} "
           f"ce {bce:.2e} | tail engaged on {hot_total} dims")
-    print(f"  worst grad rel {wg[0]} = {wg[1]:.2e} | m {rm:.2e} v {rv:.2e}")
+    print(f"  worst grad rel {wg[0]} = {wg[1]:.2e} | m {rm:.2e} v {rv:.2e} "
+          f"| theta {pth:.2e}")
     print(f"  accumulators: ring_b mismatch {acc['ring_b']:.0%} | ring_w rel "
           f"{acc['ring_w']:.2e} | tail_cols mismatch {acc['tail_cols']:.0%} | "
           f"tail_E rel {acc['tail_E']:.2e}")
@@ -137,12 +228,13 @@ def main():
     gp2.load("/tmp/_parity_a.npz")
     assert np2.t == gp2.t == np_model.t, (np2.t, gp2.t, np_model.t)
     assert np2.ring_k == gp2.ring_k == np_model.ring_k
-    bl2, bce2, wg2, rm2, rv2, acc2, dt2 = run_steps(
+    bl2, bce2, wg2, rm2, rv2, acc2, pth2, dt2 = run_steps(
         np2, gp2, cs, ns, ends, 40, "continue", verbose=False)
     print(f"  continue 40 steps through npz bridge: maxrel loss {bl2:.2e} "
-          f"ce {bce2:.2e} worst grad {wg2[1]:.2e} m {rm2:.2e} v {rv2:.2e} | "
-          f"acc ring_b {acc2['ring_b']:.0%} ring_w {acc2['ring_w']:.2e} "
-          f"tail_E {acc2['tail_E']:.2e}")
+          f"ce {bce2:.2e} worst grad {wg2[1]:.2e} m {rm2:.2e} v {rv2:.2e} "
+          f"theta {pth2:.2e}")
+    print(f"  acc ring_b {acc2['ring_b']:.0%} ring_w {acc2['ring_w']:.2e} "
+          f"tail_cols {acc2['tail_cols']:.0%} tail_E {acc2['tail_E']:.2e}")
 
     # ---- round-trip bit-exactness: torch save -> numpy save -> compare ----
     gpu_model.save("/tmp/_parity_b.npz")
@@ -156,19 +248,42 @@ def main():
             assert int(d1[k]) == int(d2[k]), k
         else:
             assert np.array_equal(d1[k], d2[k]), f"round-trip mismatch: {k}"
-    print("  npz round-trip bit-exact: PASS")
+    print("  saved-state npz round-trip bit-exact: PASS "
+          "(saved state only; ring_b/ring_w are NOT persisted — see #7)")
+
+    # ---- review #7: ring warmup after a resume ----
+    e_exact, first_rel, last_rel, abs_rel, loss_ratio, ring_k = ring_warmup_test(
+        gpu_model, "/tmp/_parity_a.npz", cs, ns, ends, 2 * args.layers + 20)
+    print(f"  ring warmup: tail E restored exactly={e_exact}; embed rel err "
+          f"first step {first_rel:.2e} -> last {last_rel:.2e} "
+          f"(abs/RMS {abs_rel:.2e}); loss ratio {loss_ratio:.2f}; K={ring_k}")
+    # ---- review #8: membership rebase cadence ----
+    np_hot, gp_hot, gp_after = membership_cadence_test(
+        args.dim, args.layers, args.B, 11, args.n_hot)
+    print(f"  membership cadence: numpy hot {np_hot}, gpu before rebase "
+          f"{gp_hot} (lagging by design), after forced rebase {gp_after}")
 
     # Tolerances: loss/ce are ~1e-7 (fp32 matmul reassociation only). Grads
     # and the tail EMA use a relative floor because the embed gradient and the
     # eligibility EMA span several orders of magnitude; the threshold is set
     # ~1.5x above the measured worst (3.6e-3 / 1e-3) so a real divergence
     # (orders of magnitude) fails loudly. ring_b must match EXACTLY (ids).
+    # Post-resume moments/params/accumulators are gated too (review #5: rm2
+    # and rv2 used to be printed but not asserted).
     ok = (bl < 1e-5 and bce < 1e-5 and wg[1] < 5e-3 and rm < 5e-3
-          and rv < 1e-4
+          and rv < 1e-4 and pth < 5e-3
           and acc["ring_b"] == 0.0 and acc["tail_cols"] == 0.0
           and acc["ring_w"] < 5e-3 and acc["tail_E"] < 5e-3
           and bl2 < 1e-5 and bce2 < 1e-5 and wg2[1] < 5e-3
-          and acc2["ring_b"] == 0.0 and acc2["ring_w"] < 5e-3)
+          and rm2 < 5e-3 and rv2 < 1e-4 and pth2 < 5e-3
+          and acc2["ring_b"] == 0.0 and acc2["tail_cols"] == 0.0
+          and acc2["ring_w"] < 5e-3 and acc2["tail_E"] < 5e-3)
+    # #7: the ring omission is real and does not wash out — assert the
+    # documented shape of it (tail exact, bounded perturbation, no blow-up)
+    # rather than pretending two trajectories re-converge.
+    ok &= e_exact and first_rel > 0 and abs_rel < 0.5 and loss_ratio < 2.0
+    # #8: gpu lags inside the cadence window, then matches on rebase
+    ok &= (gp_hot == np_hot - 1) and (gp_after == np_hot)
     print("\nPARITY:", "PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1
 

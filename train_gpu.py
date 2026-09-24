@@ -18,6 +18,7 @@ import argparse
 import glob
 import os
 import random
+import re
 import sys
 import time
 
@@ -50,22 +51,30 @@ def _with_hub(repo):
 
 
 def save_checkpoint(model, rolling, keep_k, tagged, tag_dir=None):
-    """Phase 0.3 pattern, crash-safe.
+    """Phase 0.3 pattern, crash-safe, A/B-safe.
 
-    tagged:  write tmt_t{step:06d}.npz, prune to last K, then point the rolling
-             path at it via link-to-tmp + os.replace (atomic).
+    The tag name is DERIVED FROM THE ROLLING BASENAME, so two arms in one
+    directory never collide: armW.npz -> armW_t000001.npz, armN.npz ->
+    armN_t000001.npz, each pruned only against its own prefix. (Rolling names
+    like ``tmt.npz`` keep the historical ``tmt_t*.npz`` convention.)
+
+    tagged:  write <base>_t{step:06d}.npz, prune to last K, then point the
+             rolling path at it via link-to-tmp + os.replace (atomic).
     untagged: write the rolling path directly through model.save's own
              .tmp + os.replace (atomic); no tags are created.
     """
-    tag_dir = tag_dir or "."
+    rolling = os.path.abspath(rolling)
+    base = os.path.splitext(os.path.basename(rolling))[0]
+    base = re.sub(r"_t\d+$", "", base)          # rolling may itself be a tag
+    tag_dir = tag_dir or os.path.dirname(rolling)
     if not tagged:
         model.save(rolling)                      # atomic inside model.save
         return rolling
-    tag = f"tmt_t{model.t:06d}.npz"
+    tag = f"{base}_t{model.t:06d}.npz"
     tag_path = os.path.join(tag_dir, tag)
     model.save(tag_path)
     if keep_k > 0:
-        olds = sorted(glob.glob(os.path.join(tag_dir, "tmt_t*.npz")))
+        olds = sorted(glob.glob(os.path.join(tag_dir, f"{base}_t*.npz")))
         for old in olds[:-keep_k]:
             try:
                 os.remove(old)
@@ -236,6 +245,12 @@ def main():
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.no_tagged and (args.push or args.hub_repo
+                          or os.environ.get("TMT_HUB_REPO")
+                          or os.environ.get("TMT_HUB_URL")):
+        sys.exit("--no-tagged writes only the rolling checkpoint, which the "
+                 "hub protocol never uploads (it pushes tagged files). Drop "
+                 "--no-tagged, or drop the hub flags.")
     if args.hub_repo is None and args.push:
         args.hub_repo = (os.environ.get("TMT_HUB_REPO")
                          or os.environ.get("TMT_HUB_URL"))

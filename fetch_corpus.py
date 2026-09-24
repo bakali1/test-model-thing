@@ -167,12 +167,54 @@ TRANSFORMS = {"gutenberg": transform_gutenberg, "raw": transform_raw,
 # ----------------------------------------------------------------------------
 # Repo file listing + sizes (plain HF JSON API, no extra deps)
 # ----------------------------------------------------------------------------
-def repo_files(repo):
-    url = f"https://huggingface.co/api/datasets/{repo}/tree/main?recursive=true&expand=false"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req) as r:
-        tree = json.load(r)
-    return [f for f in tree if f.get("type") == "file"]
+def _next_link(header):
+    """Parse an RFC 5988 Link header for rel="next"."""
+    if not header:
+        return None
+    for part in header.split(","):
+        seg = part.split(";")
+        if len(seg) < 2:
+            continue
+        url = seg[0].strip().strip("<>")
+        if any('rel="next"' in s for s in seg[1:]):
+            return url
+    return None
+
+
+def repo_files(repo, max_pages=500):
+    """Every file in a dataset repo, FOLLOWING PAGINATION.
+
+    The tree endpoint returns one page and a Link: rel="next" header; a 2 TB
+    repo like FineWeb-Edu has thousands of files, so stopping after page one
+    would silently shrink the candidate pool (and change the corpus hash).
+    """
+    url = (f"https://huggingface.co/api/datasets/{repo}/tree/main"
+           f"?recursive=true&expand=false")
+    out, pages = [], 0
+    while url and pages < max_pages:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req) as r:
+            tree = json.load(r)
+            link = r.headers.get("Link", "")
+        out.extend(f for f in tree if f.get("type") == "file")
+        url = _next_link(link)
+        pages += 1
+    if url:
+        raise RuntimeError(f"HF tree pagination did not terminate after "
+                           f"{max_pages} pages for {repo}")
+    return out
+
+
+def repo_revision(repo):
+    """Current commit sha of the dataset repo, recorded in the manifest so a
+    rerun can prove it saw the same tree."""
+    try:
+        url = f"https://huggingface.co/api/datasets/{repo}"
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req) as r:
+            return json.load(r).get("sha")
+    except Exception:
+        return None
 
 
 def match_files(repo, pattern):
@@ -212,12 +254,19 @@ def _read_parquet(path, cols, batch_size=20000):
 # Staging writer: book-ordered ~40 MB files, docs never split
 # ----------------------------------------------------------------------------
 class CorpusWriter:
+    """Crash-safe publisher: stage in a hidden versioned dir, rename it into
+    place, then flip a symlink atomically.
+
+    The trainer reads `<out>/current/corpus_*.txt`. A crash before the flip
+    leaves `current` pointing at the previous complete corpus; a crash after
+    it leaves the new one. There is no window where the directory is partial.
+    """
+
     def __init__(self, outdir, mb):
-        # Stage into a hidden dir, then swap into place on close: an
-        # interrupted or smaller rerun must never leave stale corpus_*.txt
-        # that the trainer's glob would still read.
         self.outdir = outdir
-        self.dir = os.path.join(outdir, ".staging")
+        os.makedirs(outdir, exist_ok=True)
+        self.version = self._next_version()
+        self.dir = os.path.join(outdir, f".staging-{self.version:04d}")
         if os.path.isdir(self.dir):
             shutil.rmtree(self.dir)
         os.makedirs(self.dir, exist_ok=True)
@@ -228,6 +277,14 @@ class CorpusWriter:
         self.docs = 0
         self.parts_docs = []          # (name, part) audit trail
         self.order = io.StringIO()
+
+    def _next_version(self):
+        v = 0
+        for name in os.listdir(self.outdir):
+            m = re.match(r"^v(\d{4})$", name)
+            if m:
+                v = max(v, int(m.group(1)) + 1)
+        return v
 
     def add(self, name, text):
         b = text.encode("utf-8", "ignore")
@@ -252,19 +309,30 @@ class CorpusWriter:
         self.flush()
         with open(os.path.join(self.dir, "ORDER.txt"), "w") as f:
             f.write(self.order.getvalue())
+        manifest["published_as"] = f"v{self.version:04d}"
         with open(os.path.join(self.dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
-        # swap: drop old parts, move staged files in
-        for old in os.listdir(self.outdir):
-            if old.startswith("corpus_") and old.endswith(".txt"):
-                os.remove(os.path.join(self.outdir, old))
-        for name in sorted(os.listdir(self.dir)):
-            os.replace(os.path.join(self.dir, name),
-                       os.path.join(self.outdir, name))
-        try:
-            os.rmdir(self.dir)
-        except OSError:
-            pass
+        # 1) rename staging -> final version dir (target does not exist yet)
+        final = os.path.join(self.outdir, f"v{self.version:04d}")
+        os.replace(self.dir, final)
+        # 2) flip the pointer atomically: symlink via temp + os.replace
+        link = os.path.join(self.outdir, "current")
+        tmp = link + ".swap"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        os.symlink(os.path.basename(final), tmp)
+        if os.path.lexists(link) and not os.path.islink(link):
+            # legacy flat layout from before versioning: replace the dir
+            shutil.rmtree(link) if os.path.isdir(link) else os.remove(link)
+        os.replace(tmp, link)
+        # 3) keep the last 2 versions, drop older ones
+        vers = sorted(int(m.group(1)) for m in
+                      (re.match(r"^v(\d{4})$", n)
+                       for n in os.listdir(self.outdir)) if m)
+        for v in vers[:-2]:
+            shutil.rmtree(os.path.join(self.outdir, f"v{v:04d}"),
+                          ignore_errors=True)
+        return os.path.join(link, "corpus_00000.txt")
 
 
 def _auto_install(pkgs):
@@ -351,6 +419,14 @@ def main():
               f"{speed:,} B/s)")
         print("yields are per-file estimates; the real fetch stops exactly at "
               "each layer budget.")
+        # yield check: a silently-short candidate pool (pagination change,
+        # renamed slice) must fail the dry run, not the 8-hour fetch
+        want = gb if gb > 0 else 0
+        if want and staged_est < want * 0.9:
+            sys.exit(f"dry run: estimated staged yield {staged_est:.2f} GB is "
+                     f"below 90% of the requested {want:.2f} GB — the selected "
+                     f"file pool changed or the slice is too small; re-check "
+                     f"the repo listing before spending quota")
         return
 
     # ---- real fetch ----
@@ -365,6 +441,7 @@ def main():
 
     writer = CorpusWriter(args.out, args.mb)
     per_layer = {}
+    used = {l: [] for l in layers}          # exact files consumed, for the manifest
     t0 = time.time()
     total_staged = 0
     stop_reasons = []
@@ -393,6 +470,7 @@ def main():
                 stop = f"limit {args.limit} docs"
                 break
             local = download(spec["repo"], fname, install_ok)
+            used[l].append(fname)
             print(f"  {fname} ({_fsize/1e9:.2f} GB) -> {local}", flush=True)
             for row in _read_parquet(local, spec["cols"]):
                 if lbudget is not None and staged >= lbudget:
@@ -411,7 +489,10 @@ def main():
             if stop:
                 break
         per_layer[l] = {"label": spec["label"], "staged_bytes": staged,
-                        "docs": docs, "budget_bytes": lbudget, "stop": stop}
+                        "docs": docs, "budget_bytes": lbudget, "stop": stop,
+                        "repo": spec["repo"],
+                        "revision": repo_revision(spec["repo"]),
+                        "selected_files": used[l]}
         total_staged += staged
         if stop:
             stop_reasons.append(f"{l}:{stop}")
@@ -442,6 +523,8 @@ def main():
     print(f"\n[fetch] done in {time.time()-t0:.0f}s -> {writer.parts} part files, "
           f"{total_staged/1e9:.2f} GB staged, {writer.docs} docs "
           f"({stopped_by or 'all layers'})")
+    print(f"[fetch] published at {args.out}/current/ (versioned v*/; the "
+          f"trainer glob is {args.out}/current/**/corpus_*)")
     print(f"[fetch] ETA to read it at {speed:,} B/s: {eta_str(total_staged or 1, speed)}")
 
 

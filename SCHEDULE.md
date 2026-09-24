@@ -17,7 +17,18 @@ Platform split rule: Colab = dev loop (<20 min answers), Kaggle = long haul.
 
 ## Running this week
 
-Week of: _(fill on first session)_  ·  GPU hours used: **0.0 / 30 Kaggle + Colab**
+Week of: _(fill on first Kaggle session)_  ·  GPU hours used: **0.0 / 30 Kaggle** ·
+Colab validation runs: **2 short runs** (see below)
+
+| date | platform | purpose | run_id | hours | outcome |
+|---|---|---|---|---|---|
+| night session | Colab T4 | GPU gate #1 (parity + bench) | gate-1 | ~0.1 | speed bug found (per-step ring→CPU sync, 2.6 kB/s); correctness PASS |
+| night session | Colab T4 | GPU gate #2 after fix | gate-2 | ~0.1 | **PASS**: 32.4–34.3 kB/s, CUDA loss parity 1.1e-07, roundtrip exact |
+| — | Kaggle | *first long leg: NOT RUN yet* | — | 0.0 | morning decision after the live-checkpoint Colab leg |
+
+Notes: no Kaggle quota spent. The CUDA state-parity extension (theta, grads,
+m, v, ring, tail E) and the live-checkpoint leg are the next Colab runs; the
+ledger gains a row for each.
 
 ## Log
 

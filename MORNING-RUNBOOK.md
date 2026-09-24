@@ -42,7 +42,7 @@ import gpu_port, train_gpu as tg, os
 # 1. pull tmt.npz to /content (upload it once, or fetch from the hub)
 tr = tg.Trainer(path="tmt.npz", batch=1024, save_every=500, keep_k=4,
                 max_steps=10_000, device="cuda", dim=512, layers=16)
-tr.train(True, "corpus/corpus_*.txt")     # corpus via fetch_corpus.py
+tr.train(True, "corpus/current/**/corpus_*")   # corpus via fetch_corpus.py
 ```
 
 Run: `colab run --gpu T4 --timeout 3600 colab_leg.py`, then
@@ -61,9 +61,13 @@ python fetch_corpus.py --layers A,B,C --gb 4.5 --out ./corpus   # prints ETA
 It prints the ETA from this session's measured B/s. Sizing rule of thumb at the
 **measured 34 kB/s**: 1 h ≈ 123 MB · a 4.5 GB one-epoch pass ≈ 37 h → too big
 for one 12 h Kaggle session, so either raise throughput first (scatter
-optimization) or run 1.2 GB per session and resume. The fetch is idempotent
-per layer; Kaggle can save `./corpus` as a dataset version once so later
-sessions mount instead of re-downloading.
+optimization) or run 1.2 GB per session and resume. The fetch is
+**cache-backed and restartable from scratch** (the HF download cache is
+reused; staged bytes are redone, not resumed mid-layer). Publication is
+crash-safe: each run writes `./corpus/vNNNN/` and flips a `./corpus/current`
+symlink atomically, so the trainer's glob `corpus/current/**/corpus_*` always
+sees one complete corpus. Kaggle can save `./corpus` as a dataset version once
+so later sessions mount instead of re-downloading.
 
 ## 3. Checkpoint transport
 
@@ -75,14 +79,30 @@ export TMT_TOKEN=...                           # or `hf auth login` once
 python train_gpu.py tmt.npz train --hub-repo bakali1/tmt-checkpoints ...
 ```
 
-Pull refuses the past (remote t ≤ local t is skipped), pushes are tagged +
-atomic. Verify with `python checkpoint_hub.py list`.
+Pull refuses the past (a remote `t` that is not strictly newer than local is
+skipped) and refuses to guess: content is validated (readable, internal `t` ==
+filename, param count) with SHA-256 sidecars, and an equal-step remote with
+different bytes fails loudly instead of overwriting. Pushes are tagged with
+the rolling basename (`tmt_t*.npz`, or `armW_t*.npz` per A/B arm) and atomic.
+Verify with `python checkpoint_hub.py list`; prune deliberately with
+`prune-remote --keep 8 [--yes]` (dry run by default).
 
 ## 4. Kaggle — long haul only (after a Colab leg is proven)
 
-Mirror the Colab flow: same `train_gpu.py`, same hub repo, `--save-every 500`
-(checkpoint every few minutes; a 12 h kill costs ≤ the last interval), and log
-the session in `SCHEDULE.md` (hours used / 30).
+There is a checked-in entrypoint with the same env contract (dry-run it first):
+
+```bash
+python kaggle/tmt_gpu_train.py --dry-run          # prints the exact command
+TMT_HUB_URL=bakali1/tmt-checkpoints TMT_RUN_ID=expD-W \
+TMT_STEPS=120000 TMT_SAVE_EVERY=1000 TMT_KEEP_K=8 \
+  python kaggle/tmt_gpu_train.py
+```
+
+It runs the same `train_gpu.py` (relative `--steps`, so a killed session
+resumes cleanly), optionally fetches the corpus first (`TMT_FETCH=1`), refuses
+to start without a checkpoint unless `TMT_FRESH=1`, and reminds you to log
+hours in `SCHEDULE.md` (cap 30 h/wk). `--save-every 500` means a 12 h kill
+costs at most the last interval.
 
 ## 5. What to do with the speed, in order
 
