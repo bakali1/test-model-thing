@@ -5,7 +5,7 @@ targets below.** One candidate is worth adopting (`a2-compiled`, +20%); the
 headline traffic-arithmetic predictions in this plan were refuted by
 measurement. The phase text is kept as the record of what was believed when
 written, with corrections marked. This plan supersedes the "next lever" note
-in `PLAN-2026-09-23-GPU.md` §0.3/§0.4.
+in `docs/plans/PLAN-2026-09-23-GPU.md` §0.3/§0.4.
 
 **Baseline to beat:** **21,477 B/s** last-window (47.6 ms/step at B=1024),
 measured on the live checkpoint (t=94,747, `ring_k=18`, 115 hot dims, dim=512,
@@ -13,6 +13,12 @@ measured on the live checkpoint (t=94,747, `ring_k=18`, 115 hot dims, dim=512,
 Reference points: the old tail-sync bug was 2,655 B/s; the synthetic-checkpoint
 micro-bench says 32,353 B/s but does **not** reproduce on the live checkpoint
 (23,796 B/s there), so plan against 21.5 kB/s.
+
+**Scope:** this document governs performance only. mini-AGI science transfers
+(role-specific learning rates, GradSNR/liveness telemetry, and continual-learning
+probes) are governed by `docs/plans/PLAN-2026-09-22.md` and `../THINGS-TO-LEARN-FROM-MINI-AGI.md`.
+Do not treat a "factored decay" optimization here as a change to the scientific
+memory-decay learning rate.
 
 **Arithmetic correction:** at the live H=115, the hot fraction is
 `115 / (16 × 512) = 1.40%`, not 22%. A1's speedup must therefore be measured,
@@ -257,7 +263,8 @@ state. Renormalize periodically:
 
 ```python
 c.mul_(sig)                       # B x H scalars
-# every N=100 steps: E /= c; c = 1
+# every N steps: effective value is E*c, so fold c into E before resetting
+E *= c; c = 1                     # NOT E /= c
 # credit folds c into the gather: einsum(E, g * c)
 ```
 
@@ -341,29 +348,33 @@ Options, in increasing ambition:
 
 ---
 
-## 8.1 Implementation status in this worktree
+## 8.1 Implementation and measured status (current)
 
-The candidate paths are implemented behind explicit flags, with the legacy path
-unchanged as the default:
+The candidate paths were implemented behind explicit flags and measured on T4.
+The current contract and gaps are maintained in `docs/optimization/OPTIMIZATION_TEST_STATUS.md`;
+`RESULTS.md` contains the full tables and parity evidence.
 
-- `bench_variants.py` provides the fresh-model, synchronized Phase-0 board,
-  profiler, and isolated `index_add_`/segmented microbenchmark.
-- A1 (`--ring-credit cold`), A2 controls (`kloop` / `compiled`), and C
-  (`segmented` / CUDA-only `triton`) are available for T4 measurement.
-- A3 is exposed as `--compile-step` plus `--async-metrics`; it deliberately
-  refuses to run with the per-step host metric sync.
-- B1/B2 are versioned candidates with explicit migration and saved factors.
-  B1's factor is `(B,K,D)`, correcting the invalid scalar `(B,K)` proposal;
-  therefore it is not credited with a traffic win.
-- `tests/check_optimizations.py` is the local CPU gate for all candidate state,
-  loss, and checkpoint-version behavior.
+Current outcome:
 
-No GPU result is claimed in this worktree: the laptop environment has
-`torch 2.14.0+cpu` and no CUDA device. The T4 board and the documented 0.03 CE
-ruler still need to be run before accepting any candidate as an improvement.
+- `a2-compiled` is the adopted default on CUDA and measured approximately +20–27%.
+- A1, A3 whole-step compile, B1/B2, cold gather, K-loop, segmented scatter, and the first Triton
+  variants are rejected or neutral as recorded in §0 and `RESULTS.md`.
+- Local CPU gates and long real-data/rebase checks are active; the remaining gaps are explicitly
+  listed in `docs/optimization/OPTIMIZATION_TEST_STATUS.md` (for example B=4096 compile specialization, multiple
+  rebases, multi-file transitions, and deterministic repeat runs).
+- Scientific acceptance remains separate: a performance candidate must also pass the documented
+  numerical/state gates and, when its algorithm changes, the 0.03 CE ruler.
+
+**Next performance candidates:** contiguous cold-only ring layout, hand-rolled CUDAGraph with static
+control flow, and compiling only the layer function. Each requires the same 200-step real-data
+measurement and rebase/parity gates.
 
 
-## 9. Work order and expected payoff
+## 9. Original work order and expected payoff (historical)
+
+The expected values and order below are preserved as the pre-measurement record. They are not the
+current work queue. The adopted/rejected result is in §0, and the next ranked performance candidates
+are at the end of §8.1.
 
 | # | item | effort | risk | expected B/s | cumulative |
 |---|---|---|---|---|---|

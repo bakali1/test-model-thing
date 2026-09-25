@@ -97,7 +97,7 @@ m, v, theta and accumulators are asserted too. Hub-pull load, relative
 `--steps`, `--batch` default 1024, `--push`, untagged mode, atomic rolling
 replace, CUDA bench sync, `TMT_TAIL` switch, 4 GB hot-dim cap, and
 corpus staging swap all landed and are covered by the gates above
-(see PLAN-2026-09-23-GPU.md §8 for the full review triage).
+(see docs/plans/PLAN-2026-09-23-GPU.md §8 for the full review triage).
 
 Second review response (same session): A/B tag isolation per arm; tail cap
 now pre-allocates; `new_states` invalidates tail/rebase; hub content
@@ -409,7 +409,7 @@ Lesson recorded in the code: a floor-relative metric explodes on entries near
 zero (Adam moments and some gradient rows sit far below their tensor's scale),
 so cross-device state is now gated on **max abs error / tensor RMS < 1e-3**,
 which the worst tensor misses by two orders of magnitude. The three runs this
-required (all short, all Colab) are in SCHEDULE.md. Also measured and now
+required (all short, all Colab) are in docs/runbooks/SCHEDULE.md. Also measured and now
 documented rather than hand-waved:
 
 - **Resume is recoverable, not bit-identical.** `ring_b`/`ring_w` are not
@@ -549,7 +549,7 @@ rebase with no recompile stall. Six measured losers were removed outright
 sort+segment 0.81x, whole-step compile 0.003x), and `load()` now refuses
 factored checkpoints rather than silently misreading them. Full detail,
 including what was deliberately NOT tested, is in
-`OPTIMIZATION_TEST_STATUS.md`.
+`docs/optimization/OPTIMIZATION_TEST_STATUS.md`.
 
 ## Three-way result (2026-09-24, later the same day) — the layered mix LOSES
 

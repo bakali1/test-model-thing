@@ -1,4 +1,11 @@
-# Review of `GPU_OPTIMIZATION_PLAN.md` and `PLAN-2026-09-23-GPU.md`
+# Review of `docs/optimization/GPU_OPTIMIZATION_PLAN.md` and `docs/plans/PLAN-2026-09-23-GPU.md`
+
+> **Historical review — do not execute as current status.** The optimization board has since run.
+> `docs/optimization/GPU_OPTIMIZATION_PLAN.md` §0 and `docs/optimization/OPTIMIZATION_TEST_STATUS.md` record the measured outcome:
+> `a2-compiled` was adopted, the other listed candidates were rejected/neutral, and the remaining
+> gaps are listed there. The implementation and cloud-run state is current in
+> `docs/plans/PLAN-2026-09-23-GPU.md` §8.2 and `RESULTS.md`. The findings below are preserved as the review that
+> caught the earlier arithmetic/state-format problems.
 
 **Review basis:** current implementation at commit `53db379`, the live 30k-step T4 leg recorded in `RESULTS.md`, current `gpu_port.py`/`train_gpu.py`, and the current CPU gates.  
 **Reviewed plans:**
@@ -221,13 +228,13 @@ Do not build the fused Triton kernel until:
 - numerical parity is checked on CPU and CUDA;
 - the checkpoint/ring state format is versioned.
 
-## Problems in `PLAN-2026-09-23-GPU.md`
+## Problems in `docs/plans/PLAN-2026-09-23-GPU.md`
 
 The older plan is directionally correct but is now partly stale and should be made a short parent/route document rather than a second optimization specification.
 
 ### Changes needed in the parent plan
 
-1. **Make `GPU_OPTIMIZATION_PLAN.md` authoritative for optimization.** Add a clear link and remove the duplicated §0.4 optimization table, especially the stale 22% A1 claim.
+1. **Make `docs/optimization/GPU_OPTIMIZATION_PLAN.md` authoritative for optimization.** Add a clear link and remove the duplicated §0.4 optimization table, especially the stale 22% A1 claim.
 2. **Correct the plan’s optimization summary.** The parent plan still says the remaining work is mainly ring scatter; the live profile says the ring and its temporary/scatter path dominate, while A1’s 22% claim is wrong.
 3. **Use the real live baseline everywhere.** 21.5–22.1 kB/s is the planning number; 32.4 kB/s is synthetic-only. The parent plan already warns about this, but its §1.2 still contains the old aspirational 5–10 ms/100–200 kB/s language. Remove or label that as obsolete.
 4. **Update the corpus path contract.** The current fetcher publishes `out/current/`, while the Kaggle script defaults to `data/corpus/current/`. The parent plan should define one canonical path and require the Kaggle wrapper to use it.
@@ -236,7 +243,7 @@ The older plan is directionally correct but is now partly stale and should be ma
 7. **Require an algorithm version for factored state.** B1/B2 cannot be added to the existing NPZ contract without a version/migration decision.
 8. **Separate infrastructure gates from science gates.** CUDA parity proves implementation agreement, not model quality. The ruler/CE and held-out evaluation remain mandatory for B/C changes.
 9. **Fix the secret-management instruction before cloud use.** The generated live-leg artifact currently embeds a credential; the parent plan should explicitly prohibit credential embedding and require rotation.
-10. **Update completion status.** The live 30k leg is now recorded, so the parent plan’s “not yet run” items and old “first leg not run” wording need reconciliation with the current `RESULTS.md` and `SCHEDULE.md`.
+10. **Update completion status.** The live 30k leg is now recorded, so the parent plan’s “not yet run” items and old “first leg not run” wording need reconciliation with the current `RESULTS.md` and `docs/runbooks/SCHEDULE.md`.
 
 ## Recommended corrected optimization order
 

@@ -116,7 +116,7 @@ TMT_STEPS=120000 TMT_SAVE_EVERY=1000 TMT_KEEP_K=8 \
 It runs the same `train_gpu.py` (relative `--steps`, so a killed session
 resumes cleanly), optionally fetches the corpus first (`TMT_FETCH=1`), refuses
 to start without a checkpoint unless `TMT_FRESH=1`, and reminds you to log
-hours in `SCHEDULE.md` (cap 30 h/wk). `--save-every 500` means a 12 h kill
+hours in `docs/runbooks/SCHEDULE.md` (cap 30 h/wk). `--save-every 500` means a 12 h kill
 costs at most the last interval.
 
 ## 5. What to do with the speed, in order

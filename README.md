@@ -61,3 +61,28 @@ I think this probably will contribute significantly to solving continual learnin
 Below is an approximate flow chart of the model architecture, made in Apple's Freeform app (excluding the wrapper for dataset cleaning and input/output handling) for reference. Note that the arrow connecting the target latent to the CE loss should instead be the target byte to the CE loss.
 
 <img width="1653" height="1161" alt="JEPA thing" src="https://github.com/user-attachments/assets/2d3a34ff-ba6a-44b8-b361-6c73da9216c0" />
+
+---
+
+## GPU port and experimental work (added 2026-09-24)
+
+The description above is the original MLX proof of concept. Everything since
+has been a batched **torch port** (`gpu_port.py`, fp32, CPU/CUDA parity gated)
+plus a documented experiment record. Start here:
+
+| I want to… | go to |
+|---|---|
+| know what is actually true, with numbers | **[`RESULTS.md`](RESULTS.md)** — the ruler and every measured result |
+| see the documentation map | **[`docs/INDEX.md`](docs/INDEX.md)** |
+| know what has *not* been tested | [`docs/optimization/OPTIMIZATION_TEST_STATUS.md`](docs/optimization/OPTIMIZATION_TEST_STATUS.md) |
+| run a GPU leg | [`docs/runbooks/MORNING-RUNBOOK.md`](docs/runbooks/MORNING-RUNBOOK.md) |
+| read the current plan | [`docs/plans/PLAN-2026-09-23-GPU.md`](docs/plans/PLAN-2026-09-23-GPU.md) |
+
+Quick facts: the shipped default is a torch port that is **bit-identical** to
+the original engine and runs **~27.5 kB/s on a T4** (vs ~1 kB/s on CPU); the
+`+27%` Inductor-fused ring-credit path is the default on CUDA, with every
+measured-and-losing candidate removed rather than left in the tree.
+
+The model still produces largely incoherent text — it is 4.5 M parameters
+trained for ~10^5 steps. See the generated samples in `RESULTS.md`
+("Qualitative inspection") for an honest look at what it currently does.

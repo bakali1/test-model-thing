@@ -1,8 +1,14 @@
 # GPU plan implementation review — third full review
 
+> **Superseded historical review — do not execute the old critical list as current status.** The
+> findings below were captured before the follow-up fixes. `docs/plans/PLAN-2026-09-23-GPU.md` §8.2 records the
+> later resolutions, `RESULTS.md` records the live 30k GPU leg, and `docs/optimization/OPTIMIZATION_TEST_STATUS.md`
+> records the completed optimization board. The first real Kaggle leg remains an operations item;
+> use the current parent plan rather than the stale status text in this review.
+
 **Reviewed:** current worktree at commit `53db379` (`leg bundle: embed the hub repo id, not just the token`). The previous P0/P1 findings were rechecked against the current code rather than copied from the earlier report.
 
-**Plan reviewed:** `PLAN-2026-09-23-GPU.md`  
+**Plan reviewed:** `docs/plans/PLAN-2026-09-23-GPU.md`  
 **Overall verdict:** **The implementation fixes are now present and the local gates pass, but the system is not yet clean for production use.** There is one critical secret-management issue in the generated live-leg artifact, several integration/reproducibility gaps, and the real live-checkpoint training leg plus Kaggle run are still not recorded.
 
 ## Current gate results
@@ -16,7 +22,7 @@
 | `test_tail.py` | **PASS**. |
 | Python compile / `git diff --check` | **PASS**. |
 | `kaggle/tmt_gpu_train.py --dry-run` | **PASS operationally**, but it exposed a corpus path mismatch described below. |
-| Real live-checkpoint GPU training | **Not yet recorded**. `SCHEDULE.md` still says this is the next action. |
+| Real live-checkpoint GPU training | **Not yet recorded**. `docs/runbooks/SCHEDULE.md` still says this is the next action. |
 | Real Kaggle leg | **Not yet run**. |
 
 The previous findings about A/B tag collisions, late tail-cap enforcement, stale rebase state, CUDA loss-only gating, ungated post-resume state, corpus publication, HF pagination, hub filename trust, equal-step conflicts, and missing Kaggle code are fixed or covered by current tests.
@@ -141,7 +147,7 @@ These are documented, but should remain visible:
 2. The Kaggle default dataset path and fetch default output path must be unified.
 3. The plan says every pull is digest-verified, while missing sidecars are currently accepted with a warning.
 4. The plan says the live checkpoint is “crash-proof”; the implementation correctly calls it recoverable because ring state is omitted. Keep that wording consistent everywhere.
-5. `SCHEDULE.md` logs the short Colab gates but still says the live leg and Kaggle leg are not run.
+5. `docs/runbooks/SCHEDULE.md` logs the short Colab gates but still says the live leg and Kaggle leg are not run.
 6. `colab_leg.py` is ignored, but the presence of an embedded secret makes ignoring it insufficient protection.
 
 ## Recommended order
@@ -153,7 +159,7 @@ These are documented, but should remain visible:
 5. Make checkpoint sidecar publication/verification a defined protocol; clean up sidecars during remote pruning.
 6. Bound the Colab range download and align 10k/30k defaults.
 7. Include replacement-tail peak memory and checkpoint-restored tail memory in the cap guard.
-8. Run the disposable live checkpoint leg, then the first Kaggle leg, and record both in `RESULTS.md` and `SCHEDULE.md`.
+8. Run the disposable live checkpoint leg, then the first Kaggle leg, and record both in `RESULTS.md` and `docs/runbooks/SCHEDULE.md`.
 
 ## Final assessment
 
