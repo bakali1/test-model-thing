@@ -17,6 +17,10 @@ import os
 import sys
 import time
 
+# The engine lives at the repo root; this file lives in tools/, so make the
+# root importable no matter which directory it is invoked from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 
@@ -47,7 +51,9 @@ def bytes_for(B, steps, device, seed=0xBEEF):
 
 TINY_URL = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
             "main/TinyStories-train.txt")
-TEXT_CACHE = os.environ.get("TMT_BENCH_TEXT", "tinystories_bench.txt")
+TEXT_CACHE = os.environ.get("TMT_BENCH_TEXT",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "legacy", "tinystories_bench.txt"))
 
 
 def real_bytes_for(B, steps, device, mb=64):

@@ -16,6 +16,10 @@ usage: python memory_report.py CKPT.npz [CKPT2.npz ...]
 import os
 import sys
 
+# The engine lives at the repo root; this file lives in tools/, so make the
+# root importable no matter which directory it is invoked from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 
 # fixed half-life edges (bytes) so runs are comparable over time

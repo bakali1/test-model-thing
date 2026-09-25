@@ -23,6 +23,10 @@ import glob
 import os
 import sys
 
+# The engine lives at the repo root; this file lives in tools/, so make the
+# root importable no matter which directory it is invoked from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 
 import numpy_port as N

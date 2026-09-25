@@ -19,7 +19,7 @@ import time
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 sys.path.insert(0, HERE)
 import numpy_port  # noqa: E402
 

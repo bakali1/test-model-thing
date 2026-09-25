@@ -66,7 +66,7 @@ def encode(model, sentence, dummies):
 
 def run():
     model = Model(dim = 512, layers = 16, temp = 0.75, lr = 5e-4)
-    model.load('smaller-4.5m.safetensors')
+    model.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'smaller-4.5m.safetensors'))
     model.freeze()
 
     head = Classification(model.dim)

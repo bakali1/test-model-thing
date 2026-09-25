@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 sys.path.insert(0, HERE)
 
 BAR = float(os.environ.get("TMT_FS_BAR", "0.03"))
@@ -141,7 +141,12 @@ def score(path):
     # produced at --slices 1 --bytes 2000 gets served for a ruler-grade
     # request, silently reporting the wrong numbers under the right heading.
     key = hashlib.sha1(" ".join(EVAL_ARGS).encode()).hexdigest()[:8]
-    cache = f"{path}.evaltxt.{key}"
+    # Cached transcripts live in cache/ so the repo root stays readable; they
+    # are ~40 KB each and cost ~10 min of CPU to regenerate.
+    cache_dir = os.path.join(HERE, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(cache_dir,
+                         f"{os.path.basename(path)}.evaltxt.{key}")
     if os.path.exists(cache) and os.environ.get("TMT_FS_NO_CACHE") != "1":
         out = open(cache).read()
     else:

@@ -24,7 +24,8 @@ import base64
 import gzip
 import os
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+OUT = os.path.dirname(os.path.abspath(__file__))                   # bundles/
 MODULES = ["gpu_port.py", "train_gpu.py", "numpy_port.py", "tail_credit.py",
            "checkpoint_hub.py"]
 
@@ -386,7 +387,7 @@ def main():
     out = DRIVER.replace("__PAYLOAD__", "{" + ", ".join(
         f"{k!r}: {v!r}" for k, v in payload.items()) + "}")
     out = out.replace("__REPO__", repr(_repo()))
-    path = os.path.join(HERE, "colab_leg.py")
+    path = os.path.join(OUT, "colab_leg.py")
     with open(path, "w") as f:
         f.write(out)
     print(f"wrote {path} ({os.path.getsize(path)/1024:.0f} KB) "

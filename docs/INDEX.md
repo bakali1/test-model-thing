@@ -42,25 +42,53 @@ from-scratch experiment).
   successes is how a plan ends up shipping predictions that measurement
   already refuted.
 
-## Local layout
+## Repo layout
+
+The **engine stays flat at the root** on purpose: 24 files import it and the
+Colab bundles embed it by flat module name, so a package layout would buy
+tidiness at the cost of a fragile refactor across the whole transport layer.
 
 ```
-gpu_port.py  train_gpu.py  numpy_port.py      engine (fp32, CUDA/CPU parity)
-fetch_corpus.py  checkpoint_hub.py            in-session data + checkpoint transport
-eval.py  bench_variants.py  chat_models.py    ruler, benchmark board, sampling
-fs_verdict.py  make_*_bundle.py               from-scratch experiment + Colab bundles
-tests/                                        free CPU gates; run these first
-models/                                       banked + historical checkpoints (gitignored)
+# engine (root) — imported by everything, embedded into the Colab bundles
+gpu_port.py  numpy_port.py  tail_credit.py       model + tail credit
+train_gpu.py                                       the GPU trainer (CPU or CUDA)
+checkpoint_hub.py  fetch_corpus.py  fetch_eval_data.py   transport + in-session data
+test_tail.py  tmt.npz                              the rolling working checkpoint
+
+tools/     eval.py  eval_npz.py  bench_variants.py        the ruler + benchmark board
+           chat_models.py  fs_verdict.py  memory_report.py  sampling + experiment analysis
+bundles/   make_*.py                                       Colab bundle generators
+           colab_*.py                                      GENERATED (gitignored)
+legacy/    main.py  main_torch.py  benchmark*.py          the original per-byte line
+           smaller-4.5m.safetensors  tinystories_bench.txt
+tests/     check_*.py                                      free CPU gates; run these first
+docs/      INDEX.md  plans/  optimization/  reviews/  runbooks/  ideas/
+cache/     cached eval transcripts (gitignored)            lets tables re-render free
+models/    banked + historical checkpoints (gitignored)
+kaggle/    tmt_gpu_train.py                               the Kaggle mirror
+data/  corpus/                                              corpora, staged in-session
 ```
+
+**Every tool runs from any directory.** Each one inserts the repo root on
+`sys.path`, so `python tools/eval.py` works from `/tmp`.
+
+### Rebuilding the Colab bundles
+
+```bash
+.venv/bin/python bundles/make_fs_bundle.py       # -> bundles/colab_fs_*.py
+colab run --gpu T4 --timeout 4200 bundles/colab_fs_w.py
+```
+
+The generators read the engine from the repo root and write into `bundles/`.
+Each generated script embeds the engine as gzip+base64 and unpacks it on the
+VM, because `colab run` uploads only the one script. They are gitignored: they
+embed the HF token.
 
 ### Where checkpoints live
 
 | path | what it is | why there |
 |---|---|---|
-| `tmt.npz` (repo root) | the **rolling working checkpoint** | `checkpoint_hub.py --dest` and `make_leg_bundle.py` both default to this exact path, and the save/keep-k pruning writes its tags beside it. Moving it breaks the tooling. |
-| `models/tmt_t094747.npz` | the banked incumbent (t=94,747) | versioned, so it belongs with the other named models |
-| `models/nlt0.1.npz`, `models/nlt-fix-0.1.npz` | earlier prototypes (2026-09-20/21) | historical; no current code references them |
-| `fs_*.npz` | from-scratch arm checkpoints | **not kept locally.** All verified present on the private hub; re-pull with `fs_verdict.py --pull --at-step N`. Their cached eval transcripts (`*.evaltxt.*`, also gitignored) let the verdict tables be re-rendered without re-pulling. |
-
-Generated Colab bundles (`colab_*.py`) are gitignored: they embed the HF
-token, and they are rebuilt with `make_*_bundle.py`.
+| `tmt.npz` (root) | the **rolling working checkpoint** | `checkpoint_hub.py --dest` and `make_leg_bundle.py` default to this exact path, and save/keep-k pruning writes its tags beside it |
+| `models/tmt_t094747.npz` (+ `.sha256`) | the banked incumbent (t=94,747) | versioned, so it belongs with the other named models |
+| `models/nlt0.1.npz`, `models/nlt-fix-0.1.npz` | earlier prototypes | historical; no current code references them |
+| `fs_*.npz` | from-scratch arm checkpoints | **not kept locally.** All verified on the private hub; re-pull with `fs_verdict.py --pull --at-step N`. Cached transcripts in `cache/` let the tables re-render without re-pulling. |

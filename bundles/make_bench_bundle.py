@@ -16,7 +16,8 @@ import base64
 import gzip
 import os
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+OUT = os.path.dirname(os.path.abspath(__file__))                   # bundles/
 MODULES = ["gpu_port.py", "train_gpu.py", "numpy_port.py", "tail_credit.py",
            "checkpoint_hub.py"]
 
@@ -126,14 +127,18 @@ def _repo():
 
 def main():
     payload = {}
-    for name in MODULES + ["bench_variants.py"]:
+    # bench_variants.py lives in tools/, but it must be written FLAT into the
+    # payload so its `import gpu_port` resolves after unpacking on Colab.
+    # "srcpath" is read from the repo, the basename is what lands in the VM.
+    for name in MODULES + ["tools/bench_variants.py"]:
         with open(os.path.join(HERE, name), "rb") as f:
-            payload[name] = base64.b64encode(gzip.compress(f.read(), 9)).decode()
+            payload[os.path.basename(name)] = base64.b64encode(
+                gzip.compress(f.read(), 9)).decode()
     out = DRIVER.replace("__PAYLOAD__", "{" + ", ".join(
         f"{k!r}: {v!r}" for k, v in payload.items()) + "}")
     out = out.replace("__TOKEN__", repr(_token()))
     out = out.replace("__REPO__", repr(_repo()))
-    path = os.path.join(HERE, "colab_bench.py")
+    path = os.path.join(OUT, "colab_bench.py")
     with open(path, "w") as f:
         f.write(out)
     print(f"wrote {path} ({os.path.getsize(path)/1024:.0f} KB)"

@@ -33,7 +33,8 @@ import os
 import stat
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+OUT = os.path.dirname(os.path.abspath(__file__))                   # bundles/
 sys.path.insert(0, HERE)
 
 TINYSTORIES = ("https://huggingface.co/datasets/roneneldan/TinyStories/"
@@ -198,14 +199,15 @@ if not torch.cuda.is_available() and not SMOKE:
 
 # ---------------- corpus, downloaded in-session ---------------------------
 banner("corpus (in-session, never shipped from the laptop)")
-os.makedirs("./fs_corpus", exist_ok=True)
+CORPUS_DIR = os.path.join(HERE, "fs_corpus")
+os.makedirs(CORPUS_DIR, exist_ok=True)
 data_path = None
 t_fetch = time.time()
 
 if KIND == "tinystories":
     # Range-fetch a slice STARTING PAST the locally staged region so this arm's
     # text cannot overlap the ruler's eval set.
-    data_path = "./fs_corpus/arm_w.txt"
+    data_path = os.path.join(CORPUS_DIR, "arm_w.txt")
     off = TS_OFFSET_MB * 1_000_000
     want = FETCH_MB * 1_000_000
     if SMOKE and os.environ.get("TMT_FS_SMOKE_LOCAL", "0") == "1":
@@ -261,12 +263,14 @@ else:
     # stager. It publishes versioned files and a `current` symlink.
     cmd = [sys.executable, os.path.join(HERE, "fetch_corpus.py"),
            "--layers", LAYERS, "--mb", str(max(FETCH_MB // 3, 40)),
-           "--out", "./fs_corpus", "--seed", str(DATA_SEED)]
+           "--out", CORPUS_DIR, "--seed", str(DATA_SEED)]
     print("  $ " + " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
     import glob as _glob
-    hits = _glob.glob("./fs_corpus/current/**/corpus_*", recursive=True)
-    data_path = hits[0] if len(hits) == 1 else "./fs_corpus/current/**/corpus_*"
+    hits = _glob.glob(os.path.join(CORPUS_DIR, "current", "**", "corpus_*"),
+                      recursive=True)
+    data_path = (hits[0] if len(hits) == 1
+                 else os.path.join(CORPUS_DIR, "current", "**", "corpus_*"))
 
 nbytes = 0
 if os.path.isfile(data_path):
@@ -289,7 +293,7 @@ banner("calibrate (measure B/s, then derive steps for the budget)")
 # the same reason. ~200 warmup covers Inductor compile AND clock ramp.
 CAL = int(os.environ.get("TMT_FS_CAL_STEPS", "200"))
 WARMUP = int(os.environ.get("TMT_FS_WARMUP", "200"))
-cal_path = "./fs_cal.npz"
+cal_path = os.path.join(HERE, "fs_cal.npz")
 if os.path.exists(cal_path):
     os.remove(cal_path)
 cal = subprocess.run(
@@ -473,7 +477,7 @@ def build(arm, cfg):
     body = body.replace(
         "__PAYLOAD__",
         "{" + ", ".join(f'"{k}": "{v}"' for k, v in payload.items()) + "}")
-    path = os.path.join(HERE, f"colab_fs_{arm}.py")
+    path = os.path.join(OUT, f"colab_fs_{arm}.py")
     with open(path, "w") as f:
         f.write(body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
