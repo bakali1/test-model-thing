@@ -650,3 +650,53 @@ Seed variance (one seed, so the 0.55-0.64 CE gaps have no run-to-run error
 bar), B=4096, longer horizons, per-domain data scaling, and a ruler with a
 balanced multi-domain eval set. FS-L also completed a longer 97,426-step run
 that is **not** step-matched to the others and is reported separately.
+
+## Qualitative inspection — generated text (2026-09-24)
+
+CE averages hide mode collapse. `chat_models.py` samples all four checkpoints
+from the same prompt with the same seed, on CPU, in under a second each.
+
+Same prompt, seed 3, in-domain TinyStories opening:
+
+| model | output character |
+|---|---|
+| **incumbent** (t=94,747) | simple children's-story English with real dialogue structure: `he was so happy and said, "I want to make sorry...` |
+| **FS-W** (t=60,000) | same register and comparable quality: `to her mom and dad said "I got... minking in the grass. The bird was so happy` |
+| **FS-N** (t=86,000) | **emitted 16 consecutive newlines, then** verbose Latinate pseudo-Victorian: `...on the familiately as the man of the reason of the strong of the home of such familiaty...` |
+| **FS-L** (t=86,000) | same Latinate/formal register as FS-N, slightly less structured: `...the motion for store the differing the sights conductions of the permitation...` |
+
+**The arms faithfully learned their corpora's register**, which is the clearest
+positive signal in the whole experiment: FS-N and FS-L produce formal
+nineteenth-century-sounding prose without dialogue or character reference,
+while the TinyStories-trained models produce short dialogue-driven stories.
+The training worked; the corpora differ in *kind*, not just difficulty.
+
+### Degeneracy across 6 seeds (250 bytes each)
+
+| model | max newline run | fully degenerate | unique bytes | mean entropy |
+|---|---|---|---|---|
+| incumbent | 1 | 0/6 | **32.5** | 0.20 |
+| FS-W | 0 | 0/6 | 28.2 | 0.22 |
+| FS-N | **16** | 0/6 | 26.3 | 0.28 |
+| FS-L | 1 | 0/6 | 25.2 | 0.29 |
+
+- **FS-N has a newline-collapse mode** (16 consecutive newlines) that the
+  other three never approach. Plausibly a paragraph-boundary attractor in
+  Gutenberg. It is *invisible to CE*, which is exactly the class of defect
+  this check exists to catch. Not yet explained; not yet fixed.
+- **Unique-byte count tracks the CE ranking exactly** (32.5 > 28.2 > 26.3 >
+  25.2), an independent confirmation that the ruler is not misleading here.
+- FS-L is the least lexically diverse of the four.
+- The from-scratch arms run higher entropy (0.28-0.29) than the incumbent
+  (0.20), i.e. they are less certain, consistent with less total training.
+
+### A caveat about reading these samples
+
+`sample()`'s entropy-adaptive temperature **collapses toward near-greedy when
+entropy is high**: at self.temp=0.75 and entropy 1.0 the effective temperature
+is 0.19. Measured effective temperatures here are 0.61-0.71, so these are
+mildly greedy samples, not diverse ones. The tool now prints the entropy and
+the effective temperature so no reader mistakes the sampler for the model.
+Separately, with a fixed seed, different prompts can yield near-identical
+continuations because the next-byte distributions differ by at most ~0.13 in
+probability even for very different prompts.
