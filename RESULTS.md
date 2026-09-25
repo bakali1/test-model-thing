@@ -571,15 +571,62 @@ Bar = 0.03 CE.
 - **FS-L does not beat FS-N on novels**: 2.146 vs 2.141 is a 0.005 difference,
   far inside the bar. The mix buys nothing over novels alone.
 
-### What this refutes
+### CORRECTION (added after the dilution control) — the mix is not simply worse
 
-**The corpus-v2 layered-mix strategy is not supported.** The mix is
-*dominated*: worst in-domain of the three, statistically tied with plain
-Gutenberg on novels, and carrying the **fewest hot dims of all three (40 vs
-128 for W)**. The ordering on hot dims (128 / 54 / 40) tracks in-domain
-performance exactly, i.e. richer data *diluted* long-memory growth rather than
-fostering it. This is the opposite of the hypothesis that a multi-domain mix
-would grow more long-memory dims than a single corpus.
+The verdict above was written from the t=60,000 point alone and it **over-read
+the evidence**. A later control at matched compute overturns its headline. Do
+not act on the original "dominated" wording.
+
+FS-N's own tag history makes the control free: at t=28,000 it has seen
+28,672,000 bytes, within 2.4% of FS-L's 29.35 MB *per domain* at t=86,000.
+
+Matched trajectory, identical bytes and init at every row:
+
+| t | FS-N in-dom | FS-L in-dom | FS-N novels | FS-L novels | N hot | L hot |
+|---|---|---|---|---|---|---|
+| 28,000 | 1.6600 ± 0.0184 | 1.6438 ± 0.0184 | 2.030 | 2.056 | 5 | 10 |
+| 60,000 | 1.7566 ± 0.0361 | 1.8491 ± 0.0160 | 2.141 | 2.146 | 54 | 40 |
+| 86,000 | 1.6059 ± 0.0217 | 1.8600 ± 0.0206 | 1.966 | 2.098 | 91 | 99 |
+
+Three things follow, and the first one reverses the earlier claim:
+
+1. **At matched compute the mix is NOT worse.** At t=28,000 the arms are
+   statistically indistinguishable: 0.0162 in-domain (FS-L nominally *ahead*)
+   and 0.026 on novels, both inside the 0.03 bar. The "layered mix is
+   dominated" reading does not survive its own control.
+2. **Both arms regress between 28k and 60k** (FS-N 1.660 -> 1.757, FS-L 1.644
+   -> 1.849). This is a *shared* phenomenon, not a mix property, and it
+   coincides with the hot-set explosion (5/10 dims at 28k -> 54/40 at 60k).
+   Expanding tail credit appears to cost transient loss while the new hot set
+   is learned. Neither arm escapes it quickly, and this was not predicted.
+3. **FS-N recovers by 86k (-0.151); FS-L had not (-0.011).** Since FS-N's
+   recovery took ~26k steps from the trough, FS-L's absence of recovery by
+   86k is *not* yet evidence that it never recovers -- the runs are too close
+   together to tell a delayed curve from a flat one. **This is exactly the
+   "the mix needs more time" hypothesis, and it remains open.**
+
+### Status of the corpus-v2 decision
+
+**Open, not decided.** The honest summary is:
+
+- The mix is not harmful at matched compute (t=28,000 tie).
+- It buys no in-domain or novel-domain advantage at 60k or 86k.
+- It **does** grow long-memory dims faster and overtakes FS-N on hot dims by
+  86k (99 vs 91) — the one axis where it leads, and the axis least tied to
+  the ruler.
+- There is a shared, unexplained mid-run regression around hot-set growth that
+  deserves its own investigation; it may matter more for long runs than the
+  corpus choice does.
+
+FS-L's last pushed tag is **t=92,000** (its Colab session has ended), which is
+past FS-N's last tag of 86,000, so **86,000 is the largest step the two arms
+share** and the comparison above cannot be extended without a further FS-N run.
+
+### What would actually settle it
+
+A longer FS-L and FS-N pair (say 200k steps each) to see whether FS-L's curve
+is delayed-but-parallel or genuinely flat, plus an investigation of the
+hot-set-growth regression. Neither is a one-hour run.
 
 ### The most important caveat — the ruler is in-domain TinyStories
 

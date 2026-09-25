@@ -269,6 +269,29 @@ def main():
     if not paths:
         sys.exit("no checkpoints given and none found; pass paths or --pull")
 
+    # LOUD mismatch guard. pick_at_step returns the newest tag at or before the
+    # target, so an arm that stopped short silently lands on a SMALLER step
+    # (FS-W maxes at 60,058, so at --at-step 86000 it lands there while N and L
+    # sit at 86,000). A table mixing 60,058 with 86,000 invites a comparison
+    # that is not byte-matched, so say so before anyone reads the numbers.
+    def step_of(p):
+        try:
+            return int(os.path.basename(p).split("_t")[-1].split(".")[0])
+        except (ValueError, IndexError):
+            return None
+    chosen_steps = {p: step_of(p) for p in paths}
+    uniq = set(chosen_steps.values())
+    MISMATCH = len(uniq) > 1
+    if MISMATCH:
+        print("\n" + "!" * 74)
+        print("WARNING: the selected checkpoints are NOT at the same step.")
+        for p, s in chosen_steps.items():
+            print(f"    t={s if s else '?':>8}  {os.path.basename(p)}")
+        print("Rows at different step counts are NOT byte-matched. Compare only")
+        print("rows that share a step, or the differences conflate corpus with")
+        print("amount of training.")
+        print("!" * 74 + "\n")
+
     jobs = []
     for p in paths:
         arm = None
@@ -325,6 +348,10 @@ def main():
     print("=" * 74)
 
     # ---- verdict ---------------------------------------------------------
+    # Pairwise verdicts only between arms that share a step count.
+    pairable = {a for a, p in zip([j[0] for j in jobs], paths)
+                if paths.count(p) == 1}
+    step_of_arm = {a: chosen_steps.get(p) for a, p in jobs if a in rows}
     print(f"\nbar = {BAR} CE nats/byte (the real-difference line from RESULTS.md)")
     best = min((a for a in rows if rows[a][1]["ind"]
                 and rows[a][1]["ind"][0] is not None),
@@ -335,6 +362,11 @@ def main():
 
     for a in rows:
         if a == best:
+            continue
+        if MISMATCH and step_of_arm.get(a) != step_of_arm.get(best):
+            print(f"  FS-{best} vs FS-{a}: SKIPPED -- not at a common step "
+                  f"(t={step_of_arm.get(best)} vs t={step_of_arm.get(a)}); "
+                  f"the difference would confound corpus with training.")
             continue
         # lower CE is better, and `best` is the MINIMUM, so the margin is
         # other - best (positive => best wins by that much). The first version
