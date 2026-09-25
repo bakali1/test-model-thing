@@ -1,4 +1,3 @@
-
 archive/
 colab_bench.py
 colab_fs_l.py
@@ -17,3 +16,7 @@ models/
 *.pyc
 __pycache__/
 # the ruler (~10 min CPU each), so never commit them
+
+# sha256 sidecars that checkpoint_hub.push writes next to a checkpoint;
+# they outlive the .npz and were left orphaned by the repo cleanup
+*.sha256
