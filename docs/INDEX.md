@@ -50,7 +50,17 @@ fetch_corpus.py  checkpoint_hub.py            in-session data + checkpoint trans
 eval.py  bench_variants.py  chat_models.py    ruler, benchmark board, sampling
 fs_verdict.py  make_*_bundle.py               from-scratch experiment + Colab bundles
 tests/                                        free CPU gates; run these first
+models/                                       banked + historical checkpoints (gitignored)
 ```
+
+### Where checkpoints live
+
+| path | what it is | why there |
+|---|---|---|
+| `tmt.npz` (repo root) | the **rolling working checkpoint** | `checkpoint_hub.py --dest` and `make_leg_bundle.py` both default to this exact path, and the save/keep-k pruning writes its tags beside it. Moving it breaks the tooling. |
+| `models/tmt_t094747.npz` | the banked incumbent (t=94,747) | versioned, so it belongs with the other named models |
+| `models/nlt0.1.npz`, `models/nlt-fix-0.1.npz` | earlier prototypes (2026-09-20/21) | historical; no current code references them |
+| `fs_*.npz` | from-scratch arm checkpoints | **not kept locally.** All verified present on the private hub; re-pull with `fs_verdict.py --pull --at-step N`. Their cached eval transcripts (`*.evaltxt.*`, also gitignored) let the verdict tables be re-rendered without re-pulling. |
 
 Generated Colab bundles (`colab_*.py`) are gitignored: they embed the HF
 token, and they are rebuilt with `make_*_bundle.py`.

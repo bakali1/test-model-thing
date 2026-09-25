@@ -23,9 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import numpy_port  # noqa: E402
 
-# (label, checkpoint path). Checkpoints with different t are reported as such.
+# (label, checkpoint path). Versioned/banked models live in models/; the
+# rolling working checkpoint stays at the repo root because checkpoint_hub.py
+# and make_leg_bundle.py both default to that exact path.
 DEFAULT_SET = [
-    ("incumbent tmt", "tmt_t094747.npz"),
+    ("incumbent tmt", "models/tmt_t094747.npz"),
     ("FS-W TinyStories", "fs_fs-w_t060000.npz"),
     ("FS-N Gutenberg", "fs_fs-n_t086000.npz"),
     ("FS-L mix", "fs_l_t086000.npz"),
