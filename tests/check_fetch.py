@@ -60,13 +60,40 @@ def t_dialogue():
     return True
 
 
+def t_oversized_document_split():
+    text = ("line-%04d\n" % 0) * 1000
+    text += "z" * 12_000
+    pieces = list(fc.split_text_bytes(text, 4_000))
+    assert len(pieces) > 1
+    assert all(len(p.encode("utf-8")) <= 4_000 for p in pieces)
+    assert "".join(pieces).encode("utf-8") == text.encode("utf-8")
+    assert pieces[0].endswith("\n")
+    print("  oversized source document splits deterministically: PASS")
+    return True
+
+
+def t_round_robin():
+    values = {
+        "A": iter(["a1", "a2"]),
+        "B": iter(["b1"]),
+        "C": iter(["c1", "c2", "c3"]),
+    }
+
+    getters = {k: (lambda k=k: next(values[k])) for k in values}
+    got = list(fc.round_robin_documents(getters, max_items=5))
+    assert got == [("A", "a1"), ("B", "b1"), ("C", "c1"),
+                   ("A", "a2"), ("C", "c2")], got
+    print("  round-robin mixed document order: PASS")
+    return True
+
+
 def t_writer():
     d = tempfile.mkdtemp()
     try:
         w = fc.CorpusWriter(d, mb=0.0002)      # 0.2 KB target: forces >1 part
-        w.add("doc1", "a" * 100)
-        w.add("doc2", "b" * 100)
-        w.add("doc3", "c" * 100)
+        w.add("doc1", "a" * 100, layer="A")
+        w.add("doc2", "b" * 100, layer="B")
+        w.add("doc3", "c" * 100, layer="C")
         w.close({"x": 1})
         # published through a versioned dir + atomic `current` symlink
         cur = os.path.join(d, "current")
@@ -79,11 +106,65 @@ def t_writer():
         total = sum(os.path.getsize(os.path.join(target, p)) for p in parts)
         assert total == 300, total
         assert os.path.exists(os.path.join(target, "manifest.json"))
-        assert os.path.exists(os.path.join(target, "ORDER.txt"))
+        order = open(os.path.join(target, "ORDER.txt")).read()
+        assert order.splitlines()[0].split("\t", 1)[1].startswith("A\t")
+        assert [line.split("\t", 1)[1].split("\t", 1)[0]
+                for line in order.splitlines()] == ["A", "B", "C"]
     finally:
         shutil.rmtree(d, ignore_errors=True)
     print("  writer (versioned publish, no split, manifest, order): PASS")
     return True
+
+
+def t_mixed_writer_parts():
+    d = tempfile.mkdtemp()
+    try:
+        w = fc.CorpusWriter(d, mb=0.0002, expected_layers=("A", "B", "C"))
+        for i in range(6):
+            for layer in ("A", "B", "C"):
+                w.add(f"{layer}{i}", "x" * 100, layer=layer)
+        w.close({"mixed": True, "mix": {"A": 1, "B": 1, "C": 1},
+                 "layer_budgets_bytes": {"A": 1, "B": 1, "C": 1},
+                 "fetch_seed": 42, "spec_hash": "test-spec"})
+        target = os.path.realpath(os.path.join(d, "current"))
+        parts = sorted(p for p in os.listdir(target)
+                       if p.startswith("corpus_"))
+        assert len(parts) >= 2, parts
+        order = open(os.path.join(target, "ORDER.txt")).read().splitlines()
+        first_layers = {line.split("\t", 2)[1]
+                        for line in order if line.startswith("00000\t")}
+        assert first_layers == {"A", "B", "C"}, first_layers
+        assert all(os.path.getsize(os.path.join(target, p)) < 1000
+                   for p in parts), [(p, os.path.getsize(os.path.join(target, p)))
+                                     for p in parts]
+        import json
+        manifest = json.load(open(os.path.join(target, "manifest.json")))
+        assert set(manifest["first_part_layers"]) == {"A", "B", "C"}
+        assert manifest["part_sizes"] == [
+            os.path.getsize(os.path.join(target, p)) for p in parts]
+        assert "mix" in manifest and "layer_budgets_bytes" in manifest
+        assert "fetch_seed" in manifest and "spec_hash" in manifest
+        print("  first mixed part + bounded later parts + manifest: PASS")
+        return True
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_oversized_document_rejected():
+    d = tempfile.mkdtemp()
+    try:
+        w = fc.CorpusWriter(d, mb=0.001, expected_layers=("A",))
+        try:
+            w.add("huge-doc", "x" * 8_000_001, layer="A")
+            raise AssertionError("oversized source document was accepted")
+        except ValueError as e:
+            msg = str(e)
+            assert "over the 8 MB part limit" in msg
+            assert "layer=A" in msg and "huge-doc" in msg
+        print("  oversized source document fails loudly: PASS")
+        return True
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def t_publish_crash_safety():
@@ -151,7 +232,10 @@ def t_budget():
 
 
 def main():
-    ok = all(f() for f in [t_gutenberg, t_raw, t_dialogue, t_writer,
+    ok = all(f() for f in [t_gutenberg, t_raw, t_dialogue, t_round_robin,
+                           t_writer, t_mixed_writer_parts,
+                           t_oversized_document_split,
+                           t_oversized_document_rejected,
                            t_publish_crash_safety, t_pagination, t_budget])
     print("\nCHECK_FETCH:", "PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1

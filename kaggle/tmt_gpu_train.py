@@ -9,25 +9,32 @@ One command, same engine and same env contract as Colab:
 Everything is configured by environment variables so a Kaggle notebook cell is
 just `!python kaggle/tmt_gpu_train.py` with secrets attached:
 
-  TMT_STEPS       steps to train FROM THE RESUMED CHECKPOINT (relative)  [120000]
-  TMT_BATCH       streams per step (A/B arms must state it)              [1024]
-  TMT_LR          learning rate                                            [5e-4]
-  TMT_SAVE_EVERY  steps between tagged saves                              [1000]
-  TMT_KEEP_K      local tagged checkpoints to keep                        [8]
-  TMT_DATA_SEED   file-order seed (pin per arm)                           [0]
-  TMT_CHECKPOINT  rolling checkpoint path                                 [tmt.npz]
-  TMT_DATASET     training glob                                           [corpus/current/**/corpus_*]
-  TMT_FETCH       1 = run fetch_corpus.py first (in-session download)     [0]
-  TMT_FETCH_ARGS  extra args for fetch_corpus.py            [--layers A,B,C --gb 4.5]
-  TMT_HUB_URL     HF repo for pull+push      (TMT_HUB_REPO also accepted)
-  TMT_TOKEN       HF write token (or use Kaggle secrets as env)
-  TMT_RUN_ID      arm/run label recorded in checkpoint sidecars
-  TMT_FRESH       1 = allow training from scratch (no checkpoint/hub needed) [0]
-  TMT_DEVICE      cuda | cpu                                               [cuda]
-  TMT_RING_ALGORITHM  legacy | factored (experimental)                   [legacy]
-  TMT_TAIL_ALGORITHM  legacy | factored (experimental)                   [legacy]
-  TMT_RING_CREDIT     full | cold | kloop | compiled | triton | segmented [full]
-  TMT_EXTRA       extra args appended to train_gpu.py
+  TMT_STEPS          steps to train FROM scratch/resume (relative)       [120000]
+  TMT_BATCH          streams per step (A/B arms must state it)            [1024]
+  TMT_DIM / TMT_LAYERS                                                   [512 / 16]
+  TMT_RING_K         explicit retained-lag count; checkpoint mismatch fails [18]
+  TMT_LR             learning rate                                         [5e-4]
+  TMT_SEED           from-scratch model seed                               [0]
+  TMT_SAVE_EVERY     local tagged-save interval                           [20000]
+  TMT_HUB_SAVE_EVERY selected Hub-upload interval; 0 = final only       [40000]
+  TMT_KEEP_K         local tags to keep; 0 = all                          [0]
+  TMT_TELEMETRY_EVERY observation-only JSONL interval; 0 = disabled     [2000]
+  TMT_MEASURE_AFTER  relative steps before steady-state timing starts     [1000]
+  TMT_VERIFY_FINAL   1 = clean reload + digest verification at final     [1]
+  TMT_DATA_SEED      file-order seed (pin per arm)                        [0]
+  TMT_CHECKPOINT     rolling checkpoint path                              [tmt.npz]
+  TMT_DATASET        training glob                    [corpus/current/**/corpus_*]
+  TMT_FETCH          1 = run fetch_corpus.py first (in-session download)  [0]
+  TMT_FETCH_ARGS     extra args for fetch_corpus.py
+                     [--layers A,B,C --gb 0.9 --mb 6]
+  TMT_HUB_URL        HF repo for pull+push      (TMT_HUB_REPO also accepted)
+  TMT_TOKEN          HF write token (or use Kaggle secrets as env)
+  TMT_RUN_ID         arm/run label recorded in checkpoint sidecars
+  TMT_FRESH          1 = force seeded training from scratch               [0]
+  TMT_DEVICE         cuda | cpu                                            [cuda]
+  TMT_TAIL           1 = exact dense tail credit                           [1]
+  TMT_RING_CREDIT    auto | full | compiled | triton                       [auto]
+  TMT_EXTRA          extra args appended to train_gpu.py
 
 Quota discipline: this script NEVER discovers datasets or spends time on
 anything but the leg you asked for. It prints its exact command before
@@ -63,6 +70,10 @@ def main():
     print(f"[kaggle] root={ROOT}")
     print(f"[kaggle] run_id={run_id or '-'} hub={repo or '-'} device={device}")
     print(f"[kaggle] steps={steps} (relative) batch={batch} ckpt={ckpt}")
+    print(f"[kaggle] fresh={env('TMT_FRESH', '0') == '1'} "
+          f"seed={env('TMT_SEED', '0')} data_seed={env('TMT_DATA_SEED', '0')}")
+    print(f"[kaggle] ring_k={env('TMT_RING_K', '18')} "
+          f"tail={env('TMT_TAIL', '1')} precision=fp32 tf32=disabled")
     print(f"[kaggle] dataset={dataset}")
     try:
         import torch
@@ -74,22 +85,37 @@ def main():
         sys.exit(f"torch missing ({e}); on Kaggle use the GPU image")
 
     if fetch:
-        fargs = shlex.split(env("TMT_FETCH_ARGS", "--layers A,B,C --gb 4.5"))
+        fargs = shlex.split(env(
+            "TMT_FETCH_ARGS", "--layers A,B,C --gb 0.9 --mb 6 --seed 42"))
         fcmd = [sys.executable, os.path.join(ROOT, "fetch_corpus.py")] + fargs
         print(f"[kaggle] fetch: {' '.join(shlex.quote(c) for c in fcmd)}")
         if not dry:
             subprocess.run(fcmd, check=True, cwd=ROOT)
 
+    # GpuModel reads this before construction. Set it here so the printed
+    # command and the actual process cannot disagree about tail semantics.
+    os.environ["TMT_TAIL"] = env("TMT_TAIL", "1")
     cmd = [sys.executable, os.path.join(ROOT, "train_gpu.py"), ckpt, "train",
            "--dataset", dataset, "--batch", str(batch),
+           "--dim", env("TMT_DIM", "512"),
+           "--layers", env("TMT_LAYERS", "16"),
            "--lr", env("TMT_LR", "5e-4"),
-           "--save-every", env("TMT_SAVE_EVERY", "1000"),
-           "--keep-k", env("TMT_KEEP_K", "8"),
+           "--seed", env("TMT_SEED", "0"),
+           "--save-every", env("TMT_SAVE_EVERY", "20000"),
+           "--hub-save-every", env("TMT_HUB_SAVE_EVERY", "40000"),
+           "--keep-k", env("TMT_KEEP_K", "0"),
+           "--telemetry-every", env("TMT_TELEMETRY_EVERY", "2000"),
+           "--measure-after", env("TMT_MEASURE_AFTER", "1000"),
            "--data-seed", env("TMT_DATA_SEED", "0"),
            "--steps", str(steps), "--device", device,
-           "--ring-algorithm", env("TMT_RING_ALGORITHM", "legacy"),
-           "--tail-algorithm", env("TMT_TAIL_ALGORITHM", "legacy"),
-           "--ring-credit", env("TMT_RING_CREDIT", "full")]
+           "--ring-credit", env("TMT_RING_CREDIT", "auto"),
+           "--ring-k", env("TMT_RING_K", "18")]
+    if env("TMT_TELEMETRY_PATH"):
+        cmd += ["--telemetry-path", env("TMT_TELEMETRY_PATH")]
+    if env("TMT_VERIFY_FINAL", "1") == "1":
+        cmd += ["--verify-final"]
+    if env("TMT_FRESH", "0") == "1":
+        cmd += ["--from-scratch"]
     if repo:
         cmd += ["--hub-repo", repo]
     if run_id:
@@ -100,6 +126,8 @@ def main():
     if dry:
         print("[kaggle] dry run; not executing")
         return 0
+    checkpoint_parent = os.path.dirname(os.path.abspath(os.path.join(ROOT, ckpt)))
+    os.makedirs(checkpoint_parent, exist_ok=True)
     if not os.path.exists(os.path.join(ROOT, ckpt)) and not repo \
             and env("TMT_FRESH", "0") != "1":
         sys.exit(f"no checkpoint at {ckpt} and no TMT_HUB_URL to pull one "

@@ -272,7 +272,7 @@ class GpuModel:
 
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
                  device=None, ring_credit="auto", sync_metrics=True,
-                 grad_assembly="cat", seed=0):
+                 grad_assembly="cat", seed=0, ring_k=None):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
@@ -282,6 +282,10 @@ class GpuModel:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self._init_seed = int(seed)
+        self._ring_k_explicit = ring_k is not None
+        if self._ring_k_explicit:
+            if not isinstance(ring_k, (int, np.integer)) or int(ring_k) < 1 or int(ring_k) > 256:
+                raise ValueError(f"ring_k must be an integer in [1, 256], got {ring_k!r}")
         if ring_credit not in ("auto", "full", "compiled", "triton"):
             raise ValueError(f"unknown ring_credit={ring_credit!r}")
         if grad_assembly not in ("cat", "loop"):
@@ -317,8 +321,9 @@ class GpuModel:
             dmax = float(_sig(torch.tensor(
                 decay_init if decay_init is not None else lim,
                 dtype=torch.float32)).item())
-            self.ring_k = int(min(256, np.ceil(
+            inferred_ring_k = int(min(256, np.ceil(
                 np.log(RING_TOL) / np.log(max(dmax, 1e-3)))))
+            self.ring_k = int(ring_k) if self._ring_k_explicit else inferred_ring_k
         self._build(dim, layers, decay_init)
 
     def _build(self, dim, layers, decay_init):
@@ -708,11 +713,18 @@ class GpuModel:
                 f"checkpoint {path} carries removed factored-candidate keys "
                 f"({stale[:3]}...); it cannot be read by the current engine -- "
                 f"retrain or convert from a legacy checkpoint")
-        if "ring_k" in d and int(np.ravel(d["ring_k"])[0]) != self.ring_k:
-            self.ring_k = int(np.ravel(d["ring_k"])[0])
-            # new_states() drops the tail built against the old ring, so the
-            # newly sized ring/tail gets re-seeded by _ensure_tail below.
-            self.new_states(self.B)
+        if "ring_k" in d:
+            stored_ring_k = int(np.ravel(d["ring_k"])[0])
+            if self._ring_k_explicit and stored_ring_k != self.ring_k:
+                raise ValueError(
+                    f"checkpoint {path} stores ring_k={stored_ring_k}, but "
+                    f"the requested explicit ring_k={self.ring_k}; refusing "
+                    "to silently migrate or overwrite the run contract")
+            if stored_ring_k != self.ring_k:
+                self.ring_k = stored_ring_k
+                # Inferred (non-explicit) loads may restore the checkpoint's
+                # historical K. Explicit loads never reach this branch.
+                self.new_states(self.B)
         if "t" in d:
             self.t = int(d["t"])
         self.bytes_seen = int(d["bytes"]) if "bytes" in d else self.t * self.B

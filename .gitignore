@@ -21,3 +21,6 @@ __pycache__/
 # sha256 sidecars that checkpoint_hub.push writes next to a checkpoint;
 # they outlive the .npz and were left orphaned by the repo cleanup
 *.sha256
+
+# experiment output (756 MB); keep history readable for rig commits
+runs/

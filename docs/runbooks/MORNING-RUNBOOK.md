@@ -104,20 +104,30 @@ Verify with `python checkpoint_hub.py list`; prune deliberately with
 
 ## 4. Kaggle — long haul only (after a Colab leg is proven)
 
-There is a checked-in entrypoint with the same env contract (dry-run it first):
+The entrypoint is dry-run first. The wrapper now prints the exact current
+`train_gpu.py` command; it no longer passes the removed ring/tail algorithm
+flags and defaults to `ring_credit=auto` plus `TMT_TAIL=1`.
+
+For the 25 September mixed-data calibration, use the frozen manifest in
+`runs/2026-09-25/README.md` rather than the historical example below. The
+important contract is:
 
 ```bash
-python kaggle/tmt_gpu_train.py --dry-run          # prints the exact command
-TMT_HUB_URL=bakali1/tmt-checkpoints TMT_RUN_ID=expD-W \
-TMT_STEPS=120000 TMT_SAVE_EVERY=1000 TMT_KEEP_K=8 \
-  python kaggle/tmt_gpu_train.py
+TMT_FRESH=1 TMT_FETCH=1 \
+TMT_RUN_ID=tmt-mixed-2026-09-25-cal10k \
+TMT_STEPS=10000 TMT_RING_K=18 TMT_SAVE_EVERY=5000 TMT_HUB_SAVE_EVERY=0 \
+TMT_KEEP_K=3 TMT_TELEMETRY_EVERY=2000 TMT_MEASURE_AFTER=1000 \
+TMT_VERIFY_FINAL=1 TMT_HUB_URL=bakali1/tmt-checkpoints \
+TMT_CHECKPOINT=runs/2026-09-25/cal10k/tmt_mixed_cal10k.npz \
+  python kaggle/tmt_gpu_train.py --dry-run
 ```
 
-It runs the same `train_gpu.py` (relative `--steps`, so a killed session
-resumes cleanly), optionally fetches the corpus first (`TMT_FETCH=1`), refuses
-to start without a checkpoint unless `TMT_FRESH=1`, and reminds you to log
-hours in `docs/runbooks/SCHEDULE.md` (cap 30 h/wk). `--save-every 500` means a 12 h kill
-costs at most the last interval.
+After inspecting the dry-run, remove `--dry-run` only when the GPU/cloud run is
+approved. The long leg uses `TMT_SAVE_EVERY=20000`,
+`TMT_HUB_SAVE_EVERY=40000`, and `TMT_KEEP_K=0` (retain all local tags; selected
+HF uploads only). Both legs use the same corpus version, fetch seed `42`, data
+seed `0`, seed `0`, and `TMT_TAIL=1`. Record the session in
+`docs/runbooks/SCHEDULE.md` immediately after it ends.
 
 ## 5. What to do with the speed, in order
 

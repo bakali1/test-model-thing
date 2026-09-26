@@ -700,3 +700,93 @@ the effective temperature so no reader mistakes the sampler for the model.
 Separately, with a fixed seed, different prompts can yield near-identical
 continuations because the next-byte distributions differ by at most ~0.13 in
 probability even for very different prompts.
+
+## Long mixed-data run — `tmt-mixed-2026-09-25-long889897` (2026-09-25/26)
+
+The first long mixed-data leg: from scratch, seed 0, B=1024, dim 512, L16,
+**K=18**, tail on, compiled ring credit, fp32/TF32-off, 0.9 GB round-robin
+A/B/C corpus (Gutenberg / FineWeb-Edu / UltraChat, 60/33.3/6.7%). Budgeted
+from the 10k calibration for ~8h; the run reached its planned 889,897 steps.
+
+Ruler command (identical for all three rows):
+
+    .venv/bin/python tools/eval.py CHECKPOINT \
+      --slices 3 --bytes 20000 --xd-bytes 8000 --xd-files 4
+
+| date | ckpt | t | bytes seen | held-out CE | shift CE | cross-domain CE | stop AUC | hot dims | mean HL | note |
+|---|---|---:|---:|---|---|---|---:|---:|---:|---|
+| 2026-09-25 | `tmt_mixed_long889897_t400000.npz` | 400,000 | 409,600,000 | **1.6999 ± 0.0205** | **1.7094 ± 0.0107** | 1.8435 ± 0.0211 | **0.9359** | 85 | 1.12 B | best on both in-distribution rulers |
+| 2026-09-25 | `tmt_mixed_long889897_t600000.npz` | 600,000 | 614,400,000 | 1.7133 ± 0.0222 | 1.7326 ± 0.0130 | **1.7787** ± 0.0178 | 0.8732 | 101 | 1.13 B | stop-head trough |
+| 2026-09-26 | `tmt_mixed_long889897_t889897.npz` | 889,897 | 911,254,528 | 1.7438 ± 0.0207 | 1.7551 ± 0.0118 | 1.7950 ± 0.0201 | 0.8938 | **104** | **1.14 B** | final; digest `5291ef86ba4d…` verified |
+
+All three digests verified against their `.sha256` sidecars. Telemetry:
+444 interval rows, t=2k→888k, **zero non-finite events**, ring_k=18 throughout.
+
+### The result is a trade, not a win
+
+| axis | 400k | 890k | winner |
+|---|---:|---:|---|
+| held-out CE | 1.6999 | 1.7438 | 400k (+0.044, 1.5× the 0.03 bar) |
+| shift CE | 1.7094 | 1.7551 | 400k |
+| cross-domain gap | +0.1436 | **+0.0512** | 890k (−64%) |
+| dims >8 B half-life | 4 | **7** | 890k |
+| hot dims | 85 | **104** | 890k |
+
+Cross-domain transfer improved the most and saturated by 600k; the last 290k
+steps bought almost nothing on any axis. In-domain CE drifted up monotonically
+(each step within ~1 SE individually, but three consistent points).
+
+### Memory formation is real but small
+
+Long-lived dims grew steadily: `>4 B` 13→17, `>8 B` 4→7, `>32 B` 2→2, hot
+dims 85→104 (saturating), mean half-life 1.12→1.14 B. **The bulk of 8,192 dims
+remain ~1-byte memory** and the long tail is ~24 dims total. State RMS climbed
+0.40→0.46, so recurrent state magnitude grows faster than useful long memory.
+
+Gradient SNR was **~0.05 for the entire run** (0.10 at 2k, never recovered),
+for both shared and decay groups. This is the standing blocker from
+`ADVICE-2026-09-24.md` and 890k steps did not change it. It is the evidence
+that argues for the role-specific LR factorial rather than more steps or more data.
+
+Throughput decayed gracefully 35,879 → 29,488 B/s (−18%) as the tail grew
+0 → ~415 RMS (memory 0 → 109 MB). No cliff; cost scaling is well behaved.
+
+### CAVEAT — the 600k generation collapse is a single unrepeated observation
+
+Chat inspection (`numpy_port.py --frozen … chat`) on the three checkpoints:
+
+| | 400k | 600k | 890k |
+|---|---|---|---|
+| terminates? | yes (short) | **no — hit 2000-token cap** | yes (0.3–2.5 s) |
+| `User:`/`Assistant:` leakage | yes | yes | **none** |
+| repetition | mild | **severe** | moderate |
+| chat ingest | 170–199 B/s | 170–199 B/s | **244–306 B/s** |
+
+600k is the one checkpoint that failed to terminate, yet its stop-head AUC
+(0.8732) partially recovered by 890k (0.8938) and **890k generates cleanly**.
+So 600k is a dip, not a monotone degradation, and the in-domain CE trend does
+not describe generation quality.
+
+**This is one manual observation, not a measurement.** It has no fixed seed,
+no recorded sampling params, and no numeric degeneracy metric behind it. Do
+not cite it as a result until it is reproduced under the fixed-prompt protocol
+(6 seeds, 250 bytes, degeneracy metrics) already used in the 24-Sep section
+above. The apparent ruler/model disagreement — CE says "worse monotonically",
+generation says "600k broke" — is the exact defect the multi-domain ruler and
+the fixed-prompt generation probe are designed to catch; until those exist,
+neither reading is settled.
+
+### CAVEAT — the ruler is TinyStories-centric
+
+This run trained on Gutenberg/FineWeb-Edu/UltraChat and is scored almost
+entirely on TinyStories. Two consequences, both visible above:
+
+1. The stop-head AUC drop (0.9359→0.8938) may be **domain shift, not damage**:
+   the model learns to terminate in *its own* text while being scored on
+   TinyStories line-ending statistics. 890k terminates cleanly in chat.
+2. 890k shows **register bleed** — a children's-story prompt pulls in
+   federal-institutional web vocabulary. Same class of problem as the dialogue
+   markers, subtler.
+
+Neither is measured. A multi-domain ruler is the prerequisite for deciding
+whether 400k or 890k is the better checkpoint.

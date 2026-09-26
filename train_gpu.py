@@ -16,6 +16,7 @@ Optional hub sync (guarded by env, never on by default):
 """
 import argparse
 import glob
+import math
 import os
 import random
 import re
@@ -30,6 +31,7 @@ from gpu_port import GpuModel
 import numpy_port as np_
 
 import checkpoint_hub as hub
+from telemetry import RunTelemetry
 
 Device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -95,7 +97,9 @@ def save_checkpoint(model, rolling, keep_k, tagged, tag_dir=None):
 class Trainer:
     def __init__(self, path, batch=1024, save_every=1000, keep_k=8,
                  tagged=True, max_steps=0, data_seed=0, device=Device,
-                 from_scratch=False, seed=0, log_every=0, warmup=0, **model_kw):
+                 from_scratch=False, seed=0, log_every=0, warmup=0,
+                 hub_save_every=0, telemetry_every=0, telemetry_path=None,
+                 measure_after=0, verify_final=False, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -117,6 +121,15 @@ class Trainer:
         self.max_steps = max_steps          # "train N MORE steps" (relative)
         self.data_seed = data_seed
         self.device = device
+        # Local saves and Hub uploads intentionally have independent cadences.
+        # hub_save_every=0 means "periodic local saves only"; the final tagged
+        # checkpoint is always pushed when a Hub repo was supplied.
+        self.hub_save_every = int(hub_save_every)
+        self.telemetry_every = int(telemetry_every)
+        self.telemetry_path = telemetry_path or (self.path + ".telemetry.jsonl")
+        self.measure_after = int(measure_after)
+        self.verify_final = bool(verify_final)
+        self.telemetry = None
 
     def train(self, save, dataset, hub_repo=None):
         m = self.model
@@ -196,6 +209,62 @@ class Trainer:
             if self.max_steps:
                 self.start_t = m.t
                 self.stop_t = m.t + self.max_steps
+        if self.telemetry_every:
+            self.telemetry = RunTelemetry(
+                self.telemetry_path, self.batch,
+                measure_after=self.start_t + self.measure_after)
+            if self.measure_after == 0:
+                self.telemetry.mark_measurement(m)
+
+        def digest_of(path):
+            return hub.sha256_file(path) if self.telemetry is not None else None
+
+        def push_selected(path, final=False):
+            # A zero cadence disables periodic uploads, never the final safety
+            # push. This prevents a 200+ MB upload from stalling every local
+            # 20k checkpoint.
+            periodic = (self.hub_save_every > 0 and
+                        m.t % self.hub_save_every == 0)
+            if hub_repo and self.tagged and (final or periodic):
+                with_hub(hub.push, path)
+                return True
+            return False
+
+        def verify_saved(path):
+            """Reload through a clean engine and verify transport identity."""
+            probe = GpuModel(device="cpu", dim=m.dim, layers=m.layercount,
+                             ring_k=m.ring_k, ring_credit="full")
+            probe.new_states(self.batch)
+            probe.load(path)
+            with np.load(path) as d:
+                ck_t = int(d["t"])
+                ck_B = int(d["B"])
+                ck_K = int(d["ring_k"])
+            if (probe.t, probe.B, probe.ring_k) != (ck_t, ck_B, ck_K):
+                raise RuntimeError(
+                    f"checkpoint reload identity mismatch: engine="
+                    f"{(probe.t, probe.B, probe.ring_k)} file={(ck_t, ck_B, ck_K)}")
+            if (ck_t, ck_B, ck_K) != (m.t, self.batch, m.ring_k):
+                raise RuntimeError(
+                    f"checkpoint content mismatch: engine={(m.t, self.batch, m.ring_k)} "
+                    f"file={(ck_t, ck_B, ck_K)}")
+            sha = hub.sha256_file(path)
+            side = path + ".sha256"
+            if os.path.exists(side):
+                side_sha = hub._read_sidecar(side)
+                if side_sha != sha:
+                    raise RuntimeError(f"local digest sidecar mismatch for {path}")
+                print(f"  [verify] clean reload PASS t={ck_t} B={ck_B} K={ck_K} "
+                      f"sha256={sha}", flush=True)
+            else:
+                print(f"  [verify] clean reload PASS t={ck_t} B={ck_B} K={ck_K} "
+                      f"sha256={sha} (no sidecar yet)", flush=True)
+            return sha
+
+        def emit_telemetry(digest=None):
+            if self.telemetry is not None:
+                self.telemetry.maybe_emit(m, self.telemetry_every, digest)
+
         t0 = time.time()
         while True:
             for file in files:
@@ -214,28 +283,51 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 for t in range(L):
-                    loss_win += m.step_batch(mats[t], mats[t + 1], ets[t])
+                    loss = m.step_batch(mats[t], mats[t + 1], ets[t])
+                    if self.telemetry is not None:
+                        self.telemetry.observe(loss, m.last_ce)
+                        if m.t == self.start_t + self.measure_after:
+                            self.telemetry.mark_measurement(m)
+                    if not math.isfinite(float(loss)):
+                        if self.telemetry is not None:
+                            self.telemetry.nonfinite_loss(m, loss, m.last_ce)
+                        print(f"[fatal] non-finite loss at t={m.t}: {loss}",
+                              flush=True)
+                        raise FloatingPointError(f"non-finite loss at t={m.t}")
+                    loss_win += loss
                     ce_win += m.last_ce
                     n_win += 1
                     total += self.batch
                     if self.stop_t and m.t >= self.stop_t:
                         print(f"  [reached {self.max_steps} more steps "
                               f"(t={m.t}), stopping]", flush=True)
+                        digest = None
                         if save:
                             out = save_checkpoint(m, self.path, self.keep_k,
                                                   self.tagged)
-                            if hub_repo and self.tagged:
-                                with_hub(hub.push, out)
+                            push_selected(out, final=True)
+                            digest = digest_of(out)
+                            if self.verify_final:
+                                digest = verify_saved(out)
                             print(f"  [final] saved {os.path.basename(out)}",
                                   flush=True)
+                        emit_telemetry(digest if save else None)
                         return
                     if save and self.save_every and m.t % self.save_every == 0:
                         out = save_checkpoint(m, self.path, self.keep_k,
                                               self.tagged)
-                        if hub_repo and self.tagged:
-                            with_hub(hub.push, out)
+                        push_selected(out, final=False)
+                        digest = digest_of(out)
+                        if self.verify_final:
+                            # Full clean reload is required only for the final
+                            # artifact; a periodic tag is covered by that final
+                            # gate without doubling 200+ MB reload costs.
+                            pass
                         print(f"  [save] {os.path.basename(out)} t={m.t}",
                               flush=True)
+                        emit_telemetry(digest)
+                        continue
+                    emit_telemetry()
                     if self.log_every and total % self.log_every == 0:
                         dt = time.time() - t0
                         # Async metric mode keeps CUDA work queued; synchronize
@@ -286,6 +378,9 @@ def main():
                          "every A/B arm)")
     ap.add_argument("--dim", type=int, default=512)
     ap.add_argument("--layers", type=int, default=16)
+    ap.add_argument("--ring-k", type=int, default=None,
+                    help="explicit retained-lag count; when set, loading a "
+                         "checkpoint with a different stored ring_k fails")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--decay-init", type=float, default=None)
     ap.add_argument("--from-scratch", action="store_true",
@@ -317,7 +412,22 @@ def main():
                     help="wrap the steady-state step in torch.compile/reduce-overhead "
                          "(the measured A3 candidate; requires --async-metrics)")
     ap.add_argument("--save-every", type=int, default=500)
-    ap.add_argument("--keep-k", type=int, default=8)
+    ap.add_argument("--keep-k", type=int, default=8,
+                    help="local tagged checkpoints to keep; 0 keeps all")
+    ap.add_argument("--hub-save-every", type=int, default=0,
+                    help="push a local tag only when t is divisible by this; "
+                         "0 pushes the final tag only")
+    ap.add_argument("--telemetry-every", type=int, default=0,
+                    help="emit observation-only JSONL every N absolute steps "
+                         "(0 disables telemetry)")
+    ap.add_argument("--telemetry-path", default=None,
+                    help="JSONL path (default: CHECKPOINT.telemetry.jsonl)")
+    ap.add_argument("--measure-after", type=int, default=0,
+                    help="start steady-state throughput clock after N relative "
+                         "training steps; training is not rewound or repeated")
+    ap.add_argument("--verify-final", action="store_true",
+                    help="reload the final tag through a clean CPU engine and "
+                         "verify t/B/K plus its local SHA-256 sidecar")
     ap.add_argument("--no-tagged", action="store_true",
                     help="overwrite the rolling checkpoint; no tags")
     ap.add_argument("--steps", type=int, default=0,
@@ -339,6 +449,9 @@ def main():
     if args.compile_step and not args.async_metrics:
         sys.exit("--compile-step requires --async-metrics (a host float(loss) "
                  "prevents CUDA graph/compile capture)")
+    if args.telemetry_every and args.async_metrics:
+        sys.exit("--telemetry-every cannot be combined with --async-metrics; "
+                 "telemetry needs finite host loss/CE values at its interval")
     if args.no_tagged and (args.push or args.hub_repo
                           or os.environ.get("TMT_HUB_REPO")
                           or os.environ.get("TMT_HUB_URL")):
@@ -358,12 +471,17 @@ def main():
                 keep_k=args.keep_k, tagged=not args.no_tagged,
                 max_steps=args.steps, data_seed=args.data_seed,
                 device=args.device, dim=args.dim, layers=args.layers,
-                lr=args.lr, decay_init=args.decay_init,
+                ring_k=args.ring_k, lr=args.lr, decay_init=args.decay_init,
                 ring_credit=args.ring_credit,
                 grad_assembly=args.grad_assembly,
                 sync_metrics=not args.async_metrics,
                 from_scratch=args.from_scratch, seed=args.seed,
-                log_every=args.log_every, warmup=args.warmup)
+                log_every=args.log_every, warmup=args.warmup,
+                hub_save_every=args.hub_save_every,
+                telemetry_every=args.telemetry_every,
+                telemetry_path=args.telemetry_path,
+                measure_after=args.measure_after,
+                verify_final=args.verify_final)
     print(f"parameters: {t.model.theta.shape[0]:,} | device {args.device}",
           flush=True)
     if args.mode == "train":

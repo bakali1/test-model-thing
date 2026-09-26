@@ -2,8 +2,12 @@
 """fetch_corpus.py — in-session corpus staging for TMT GPU runs.
 
 Runs INSIDE the Colab/Kaggle session (or locally). Downloads the pinned corpus
-layers straight from HuggingFace Hub, strips/normalizes, concatenates documents
-in pinned order into ~40 MB plain-text files under ./corpus/, and prints an ETA
+layers straight from HuggingFace Hub, strips/normalizes, and interleaves documents
+round-robin across requested layers into small plain-text files under ./corpus/.
+Documents larger than the 6 MB source-chunk limit are split deterministically
+(preferring a newline) and the split is recorded in the manifest. Every output
+part therefore contains a mixture rather than one sequential domain block. It
+prints an ETA
 table (with --speed, or TMT_SPEED env) so the amount of data for a run can be
 chosen from that session's measured bytes/s — bigger sessions get bigger slices.
 
@@ -41,6 +45,32 @@ import urllib.request
 from datetime import datetime, timezone
 
 USER_AGENT = "tmt-fetch-corpus/1.0"
+MAX_PART_BYTES = 8_000_000
+
+
+def split_text_bytes(text, limit):
+    """Split one source document deterministically at <= ``limit`` bytes.
+
+    Prefer the last newline in the second half of the window; otherwise cut
+    at a UTF-8 code-point boundary.  The original document is never lost: the
+    returned pieces concatenate back to exactly the input bytes.
+    """
+    raw = text.encode("utf-8", "ignore")
+    if limit <= 0:
+        raise ValueError(f"split limit must be positive, got {limit}")
+    while len(raw) > limit:
+        cut = limit
+        newline = raw.rfind(b"\n", limit // 2, limit)
+        if newline >= 0:
+            cut = newline + 1
+        while cut > 0 and cut < len(raw) and (raw[cut] & 0xC0) == 0x80:
+            cut -= 1
+        if cut <= 0:
+            raise ValueError("could not find a valid UTF-8 split boundary")
+        yield raw[:cut].decode("utf-8", "ignore")
+        raw = raw[cut:]
+    if raw:
+        yield raw.decode("utf-8", "ignore")
 
 # ----------------------------------------------------------------------------
 # Pinned corpus spec
@@ -253,8 +283,112 @@ def _read_parquet(path, cols, batch_size=20000):
                 yield row
 
 
+def round_robin_documents(next_document, max_items=None, is_active=None):
+    """Yield ``(key, document)`` from keyed iterators/next-callables.
+
+    ``next_document(key)`` returns the next value for a key or raises
+    ``StopIteration`` when that key is exhausted.  Each key is advanced once
+    per round, so the earliest output shard is genuinely mixed whenever all
+    requested layers have data. ``max_items`` bounds smoke fetches without
+    reading the rest of a multi-gigabyte source. ``is_active`` may disable a
+    source as soon as its per-layer byte budget is reached.
+    """
+    getter = next_document.__getitem__
+    active = set(next_document.keys())
+    emitted = 0
+    while active:
+        for key in sorted(active):
+            if is_active is not None and not is_active(key):
+                active.remove(key)
+                continue
+            try:
+                value = getter(key)()
+            except StopIteration:
+                active.remove(key)
+                continue
+            yield key, value
+            emitted += 1
+            if max_items and emitted >= max_items:
+                return
+
+
+class LayerSource:
+    """Lazily read transformed docs from one pinned layer's shuffled files."""
+
+    def __init__(self, layer, spec, files, install_ok, revision, log=print,
+                 max_document_bytes=MAX_PART_BYTES):
+        self.layer = layer
+        self.spec = spec
+        self.revision = revision
+        self.transform = TRANSFORMS[spec["transform"]]
+        self.files = list(files)
+        self.install_ok = install_ok
+        self.log = log
+        self.file_index = -1
+        self.local = None
+        self.rows = None
+        self.selected_files = []
+        self.exhausted = False
+        self.max_document_bytes = int(max_document_bytes)
+        self._pending = []
+        self.split_documents = 0
+        self.split_pieces = 0
+        self.split_bytes = 0
+        self.split_examples = []
+
+    def _open_next_file(self):
+        self.file_index += 1
+        if self.file_index >= len(self.files):
+            self.exhausted = True
+            self.rows = None
+            return False
+        fname, remote_size = self.files[self.file_index]
+        self.local = download(self.spec["repo"], fname, self.install_ok,
+                              revision=self.revision)
+        self.selected_files.append(fname)
+        self.rows = _read_parquet(self.local, self.spec["cols"])
+        self.log(f"  {self.layer}: {fname} ({remote_size/1e9:.2f} GB) -> "
+                 f"{self.local}", flush=True)
+        return True
+
+    def start(self):
+        return self._open_next_file()
+
+    def next_document(self):
+        """Next (text-piece, provenance-name), or None after all files."""
+        if self._pending:
+            return self._pending.pop(0)
+        while self.file_index < len(self.files):
+            if self.rows is None and not self._open_next_file():
+                return None
+            try:
+                row = next(self.rows)
+            except StopIteration:
+                if not self._open_next_file():
+                    return None
+                continue
+            out = self.transform(row)
+            if out is None:
+                continue
+            text, name = out
+            pieces = list(split_text_bytes(text, self.max_document_bytes))
+            if len(pieces) > 1:
+                self.split_documents += 1
+                self.split_pieces += len(pieces)
+                self.split_bytes += len(text.encode("utf-8", "ignore"))
+                if len(self.split_examples) < 8:
+                    self.split_examples.append({
+                        "document": name, "bytes": len(text.encode("utf-8", "ignore")),
+                        "pieces": len(pieces),
+                    })
+            self._pending = [(piece, f"{name}_part{i:03d}")
+                             for i, piece in enumerate(pieces)]
+            return self._pending.pop(0)
+        return None
+
+
 # ----------------------------------------------------------------------------
-# Staging writer: book-ordered ~40 MB files, docs never split
+# Staging writer: round-robin document order, small files, bounded source pieces
 # ----------------------------------------------------------------------------
 class CorpusWriter:
     """Crash-safe publisher: stage in a hidden versioned dir, rename it into
@@ -265,7 +399,7 @@ class CorpusWriter:
     it leaves the new one. There is no window where the directory is partial.
     """
 
-    def __init__(self, outdir, mb):
+    def __init__(self, outdir, mb, expected_layers=None):
         self.outdir = outdir
         os.makedirs(outdir, exist_ok=True)
         self.version = self._next_version()
@@ -273,12 +407,21 @@ class CorpusWriter:
         if os.path.isdir(self.dir):
             shutil.rmtree(self.dir)
         os.makedirs(self.dir, exist_ok=True)
-        self.target = int(mb * 1e6)
+        # The run contract forbids domain-sized tails. Keep the hard ceiling
+        # independent of the requested target so a historical --mb 40 cannot
+        # silently reintroduce the oversized-part failure.
+        self.max_part_bytes = MAX_PART_BYTES
+        self.target = min(int(mb * 1e6), self.max_part_bytes)
         self.parts = 0
         self.buf = []
         self.bufbytes = 0
         self.docs = 0
         self.parts_docs = []          # (name, part) audit trail
+        self.expected_layers = (set(expected_layers) if expected_layers
+                                else set())
+        self.part_layers = set()
+        self.first_part_layers = set()
+        self.part_sizes = []
         self.order = io.StringIO()
 
     def _next_version(self):
@@ -289,27 +432,55 @@ class CorpusWriter:
                 v = max(v, int(m.group(1)) + 1)
         return v
 
-    def add(self, name, text):
+    def add(self, name, text, layer=None):
         b = text.encode("utf-8", "ignore")
-        if self.bufbytes and self.bufbytes + len(b) > self.target:
+        if len(b) > self.max_part_bytes:
+            raise ValueError(
+                f"source document is {len(b):,} bytes, over the 8 MB part "
+                f"limit (layer={layer or '-'}, document={name}); refusing "
+                "to publish an oversized part")
+        # Only the first part is held until every requested layer has
+        # contributed. This is the data-order guarantee. If that guarantee
+        # itself cannot fit under 8 MB, fail loudly rather than publish a pure
+        # domain block or a giant tail.
+        part_mixed = self.parts > 0 or not self.expected_layers or \
+            self.expected_layers.issubset(self.part_layers)
+        if not part_mixed and self.bufbytes + len(b) > self.max_part_bytes:
+            missing = sorted(self.expected_layers - self.part_layers)
+            raise ValueError(
+                "cannot make the first mixed part fit under 8 MB before "
+                f"adding layer={layer or '-'} document={name}; missing layers "
+                f"{missing}")
+        if self.bufbytes and part_mixed and self.bufbytes + len(b) > self.target:
+            if self.parts == 0:
+                self.first_part_layers = set(self.part_layers)
             self.flush()
         self.buf.append(b)
         self.bufbytes += len(b)
         self.docs += 1
+        if layer:
+            self.part_layers.add(layer)
         self.parts_docs.append((name, self.parts))
-        self.order.write(f"{self.parts:05d}\t{name}\n")
+        label = f"{layer}\t{name}" if layer else name
+        self.order.write(f"{self.parts:05d}\t{label}\n")
 
     def flush(self):
         if not self.buf:
             return
         with open(os.path.join(self.dir, f"corpus_{self.parts:05d}.txt"), "wb") as f:
             f.write(b"".join(self.buf))
+        self.part_sizes.append(self.bufbytes)
         self.parts += 1
         self.buf = []
         self.bufbytes = 0
+        self.part_layers = set()
 
     def close(self, manifest):
+        if self.parts == 0:
+            self.first_part_layers = set(self.part_layers)
         self.flush()
+        manifest["part_sizes"] = list(self.part_sizes)
+        manifest["first_part_layers"] = sorted(self.first_part_layers)
         with open(os.path.join(self.dir, "ORDER.txt"), "w") as f:
             f.write(self.order.getvalue())
         manifest["published_as"] = f"v{self.version:04d}"
@@ -444,81 +615,108 @@ def main():
         else:
             sys.exit("pyarrow missing; run: python -m pip install -q pyarrow")
 
-    writer = CorpusWriter(args.out, args.mb)
-    per_layer = {}
-    used = {l: [] for l in layers}          # exact files consumed, for the manifest
+    writer = CorpusWriter(args.out, args.mb, expected_layers=layers)
+    sources = {}
+    revisions = {}
+    per_layer = {
+        l: {"label": SPEC[l]["label"], "staged_bytes": 0, "docs": 0,
+            "budget_bytes": budgets[l], "stop": None, "repo": SPEC[l]["repo"]}
+        for l in layers
+    }
     t0 = time.time()
     total_staged = 0
-    stop_reasons = []
 
+    # Build one lazy source per layer before consuming documents. Downloading
+    # the first parquet from every layer is intentional: the first 6 MB output
+    # shard must contain A+B+C, not whichever layer was listed first.
     for l in layers:
         spec = SPEC[l]
-        transform = TRANSFORMS[spec["transform"]]
-        lbudget = budgets[l]
         revision = repo_revision(spec["repo"])
         if not revision:
             raise RuntimeError(f"could not pin dataset revision for {spec['repo']}")
+        revisions[l] = revision
         files = match_files(spec["repo"], spec["file_pat"],
                             revision=revision)
-        # The seed really orders the fetch: file order is permuted with it
-        # (row order WITHIN a file stays source order — determinism by
-        # construction, and the manifest says so).
         import random as _random
         _random.Random(args.seed).shuffle(files)
-        staged, docs = 0, 0
-        stop = None
+        if not files:
+            raise RuntimeError(f"no files for layer {l} at revision {revision}")
+        source = LayerSource(l, spec, files, install_ok, revision=revision,
+                             max_document_bytes=writer.target)
+        source.start()
+        sources[l] = source
         print(f"\n[fetch] layer {l} {spec['label']} - {len(files)} files "
-              f"({spec['note']}); staged budget "
-              f"{'uncapped' if lbudget is None else f'{lbudget/1e9:.2f} GB'}",
+              f"at revision {revision[:12]} ({spec['note']}); staged budget "
+              f"{'uncapped' if budgets[l] is None else f'{budgets[l]/1e9:.2f} GB'}",
               flush=True)
-        for fname, _fsize in files:
-            if lbudget is not None and staged >= lbudget:
-                stop = f"budget {lbudget/1e9:.2f} GB"
-                break
+
+    next_document = {l: sources[l].next_document for l in layers}
+    def source_is_active(l):
+        budget = budgets[l]
+        return (per_layer[l]["stop"] is None and
+                (budget is None or per_layer[l]["staged_bytes"] < budget))
+
+    for l, (text, name) in round_robin_documents(
+            next_document, max_items=args.limit or None,
+            is_active=source_is_active):
+        if args.limit and writer.docs >= args.limit:
+            per_layer[l]["stop"] = f"limit {args.limit} docs"
+            continue
+        lbudget = budgets[l]
+        if lbudget is not None and per_layer[l]["staged_bytes"] >= lbudget:
+            per_layer[l]["stop"] = f"budget {lbudget/1e9:.2f} GB"
+            continue
+        writer.add(f"{name}_{writer.docs:08d}", text + "\n", layer=l)
+        nbytes = len(text.encode("utf-8", "ignore"))
+        per_layer[l]["staged_bytes"] += nbytes
+        per_layer[l]["docs"] += 1
+        total_staged += nbytes
+        if writer.docs % 1000 == 0:
+            print(f"  [fetch] {writer.docs:,} docs / "
+                  f"{total_staged/1e6:.1f} MB staged", flush=True)
+
+    for l in layers:
+        source = sources[l]
+        budget = budgets[l]
+        if per_layer[l]["stop"] is None:
             if args.limit and writer.docs >= args.limit:
-                stop = f"limit {args.limit} docs"
-                break
-            local = download(spec["repo"], fname, install_ok, revision=revision)
-            used[l].append(fname)
-            print(f"  {fname} ({_fsize/1e9:.2f} GB) -> {local}", flush=True)
-            for row in _read_parquet(local, spec["cols"]):
-                if lbudget is not None and staged >= lbudget:
-                    stop = f"budget {lbudget/1e9:.2f} GB"
-                    break
-                if args.limit and writer.docs >= args.limit:
-                    stop = f"limit {args.limit} docs"
-                    break
-                out = transform(row)
-                if out is None:
-                    continue
-                text, name = out
-                writer.add(name, text + "\n")
-                staged += len(text.encode("utf-8", "ignore"))
-                docs += 1
-            if stop:
-                break
-        per_layer[l] = {"label": spec["label"], "staged_bytes": staged,
-                        "docs": docs, "budget_bytes": lbudget, "stop": stop,
-                        "repo": spec["repo"],
-                        "revision": revision,
-                        "selected_files": used[l]}
-        total_staged += staged
-        if stop:
-            stop_reasons.append(f"{l}:{stop}")
-        h = eta_str(total_staged or 1, speed)
-        print(f"  -> layer {l}: {staged/1e6:.1f} MB text, {docs} docs "
-              f"({stop or 'all files'}; cumulative {total_staged/1e6:.0f} MB "
-              f"~ {h} at {speed:,} B/s)", flush=True)
+                per_layer[l]["stop"] = f"global limit {args.limit} docs"
+            elif budget is not None and per_layer[l]["staged_bytes"] >= budget:
+                per_layer[l]["stop"] = f"budget {budget/1e9:.2f} GB"
+            else:
+                per_layer[l]["stop"] = "all files"
+        per_layer[l]["revision"] = revisions[l]
+        per_layer[l]["selected_files"] = source.selected_files
+        per_layer[l]["split_documents"] = source.split_documents
+        per_layer[l]["split_pieces"] = source.split_pieces
+        per_layer[l]["split_bytes"] = source.split_bytes
+        per_layer[l]["split_examples"] = source.split_examples
+        print(f"  -> layer {l}: {per_layer[l]['staged_bytes']/1e9:.3f} GB text, "
+              f"{per_layer[l]['docs']} docs ({per_layer[l]['stop']})",
+              flush=True)
+
+    stop_reasons = [f"{l}:{per_layer[l]['stop']}" for l in layers]
 
     stopped_by = "; ".join(stop_reasons) or None
 
     manifest = {
         "spec_version": 1,
         "ordering": "files shuffled with Random(seed); rows within a file in "
-                    "source order",
+                    "source order; transformed documents emitted round-robin "
+                    "across requested layers",
+        "mixed_parts": "first part guaranteed mixed; later parts follow "
+                       "the round-robin stream and remain small",
+        "mix": {l: budgets[l] for l in layers},
+        "fetch_seed": args.seed,
+        "part_target_mb": args.mb,
+        "part_max_bytes": writer.max_part_bytes,
+        "source_document_split_bytes": writer.target,
+        "split_documents_total": sum(v["split_documents"] for v in per_layer.values()),
+        "split_pieces_total": sum(v["split_pieces"] for v in per_layer.values()),
         "spec_hash": sh,
         "budgets_gb": {l: (None if budgets[l] is None else budgets[l] / 1e9)
                        for l in layers},
+        "layer_budgets_bytes": {l: budgets[l] for l in layers},
         "args": vars(args),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "staged_bytes_total": total_staged,

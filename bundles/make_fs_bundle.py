@@ -82,8 +82,8 @@ SAVE_EVERY = 2000
 TS_OFFSET_MB = int(os.environ.get("TMT_FS_TS_OFFSET_MB", "220"))
 # Every module the arm needs must travel INSIDE the generated script: `colab
 # run` executes it as a notebook cell and the repo does not exist on the VM.
-MODULES = ["gpu_port.py", "train_gpu.py", "numpy_port.py", "tail_credit.py",
-           "checkpoint_hub.py", "fetch_corpus.py"]
+MODULES = ["gpu_port.py", "train_gpu.py", "telemetry.py", "numpy_port.py",
+           "tail_credit.py", "checkpoint_hub.py", "fetch_corpus.py"]
 # Toy size for the local CPU smoke test; never used in a real arm.
 SMOKE_DIM = int(os.environ.get("TMT_FS_SMOKE_DIM", "64"))
 SMOKE_LAYERS = int(os.environ.get("TMT_FS_SMOKE_LAYERS", "2"))
