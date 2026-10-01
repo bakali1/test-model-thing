@@ -948,7 +948,7 @@ PAGE = r'''<!doctype html>
   button{font:inherit;color:var(--fg);background:none;cursor:pointer;
          border:1px solid var(--line);border-radius:6px;padding:5px 11px}
   button:hover{border-color:var(--accent);color:var(--accent)}
-  #log{flex:1 1 auto;overflow-y:auto;padding:24px 16px}
+  #log{flex:1 1 auto;min-height:0;overflow-y:auto;padding:24px 16px}
   .wrap{max-width:720px;margin:0 auto}
   .msg{margin:0 0 20px}
   .who{font-size:12px;color:var(--dim);margin-bottom:5px}
@@ -969,7 +969,21 @@ PAGE = r'''<!doctype html>
   details.prime pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;
                      word-wrap:break-word;overflow-wrap:anywhere;
                      font-size:12px;color:var(--dim);max-height:320px;overflow-y:auto}
-  #mech{border-bottom:1px solid var(--line);padding:9px 16px;flex:0 0 auto}
+  #mech{border-bottom:1px solid var(--line);padding:9px 16px;flex:0 0 auto;
+        /* The panels are tall -- at 1280x800 the instrument block measured
+           483px and left the thread 168px, which pushed the empty-state
+           greeting to y=745..802 on an 800px screen: off the bottom. The
+           conversation is the point, so the panels get a ceiling and the
+           thread always keeps the majority of the height. */
+        max-height:min(46vh, 430px);overflow-y:auto;overscroll-behavior:contain}
+  #mech.collapsed{display:none}
+  /* When collapsed, a one-line strip keeps the headline numbers visible, so
+     folding the panels away does not mean losing the state of the model. */
+  #mechbar{max-width:720px;margin:0 auto;font-size:11px;color:var(--dim);
+           display:flex;gap:16px;flex-wrap:wrap;
+           font-variant-numeric:tabular-nums}
+  #mechbar b{color:var(--fg);font-weight:600}
+  #mechbar[hidden]{display:none}
   .mrow{max-width:720px;margin:0 auto;display:flex;gap:18px;
         align-items:center;flex-wrap:wrap}
   .meter{flex:1 1 158px;min-width:142px}
@@ -1036,15 +1050,26 @@ PAGE = r'''<!doctype html>
   .hint{color:var(--dim);white-space:nowrap}
   button[disabled]{opacity:.4;cursor:default}
   button[disabled]:hover{border-color:var(--line);color:var(--fg)}
+  /* the caret and the flare are the only motion on the page; both are
+     decorative and both are unreadable as animation */
+  @media (prefers-reduced-motion: reduce){
+    .caret::after{animation:none;opacity:.7}
+    .fired{animation:none}
+    .fill{transition:none}
+    details.prime summary::before{transition:none}
+  }
 </style></head>
 <body>
 <header>
   <b>TMT</b><span class="sub" id="hdr"></span>
+  <span class="sub" id="prov"></span>
   <span class="sp"></span>
+  <button id="toggle" aria-expanded="true" aria-controls="mech">Hide panels</button>
   <button id="reset">New chat</button>
   <button id="export" disabled title="download this session as JSON — the checkpoint, its digest, and every turn's numbers">Export</button>
 </header>
 
+<div id="mechbar" hidden></div>
 <div id="mech">
   <div class="mrow">
     <div class="meter" id="m-learn">
@@ -1073,17 +1098,17 @@ PAGE = r'''<!doctype html>
     <div class="irow">
       <div class="ipanel">
         <div class="ihdr"><span>JEPA latent, PCA to 2D</span><em id="lat-var"></em></div>
-        <canvas id="lat" width="560" height="260"></canvas>
+        <canvas id="lat" role="img" aria-label="trajectory of the model's latent vector across the bytes of this reply, projected onto its first two principal components"></canvas>
       </div>
       <div class="ipanel">
         <div class="ihdr"><span>stop head per byte</span><em id="stop-note"></em></div>
-        <canvas id="stop" width="560" height="260"></canvas>
+        <canvas id="stop" role="img" aria-label="the stop head's score for each byte of this reply, against the cut-off"></canvas>
       </div>
     </div>
     <div class="irow">
       <div class="ipanel wide">
         <div class="ihdr"><span>recurrent state RMS per layer, across the reply</span><em id="heat-note"></em></div>
-        <canvas id="heat" width="1400" height="230"></canvas>
+        <canvas id="heat" role="img" aria-label="the recurrent state's root-mean-square magnitude in each of the sixteen layers, for each byte of this reply"></canvas>
       </div>
     </div>
     <div class="irow">
@@ -1102,7 +1127,7 @@ PAGE = r'''<!doctype html>
     <textarea id="q" rows="1" placeholder="Say something"></textarea>
     <button id="send" type="submit">Send</button>
   </form>
-  <div class="stat"><span id="stat"></span><span class="hint">Enter to send, Shift+Enter for a newline</span></div>
+  <div class="stat"><span id="stat" role="status" aria-live="polite"></span><span class="hint">Enter to send &middot; Shift+Enter newline &middot; Esc to stop</span></div>
 </footer>
 
 <script>
@@ -1114,7 +1139,7 @@ const send   = document.getElementById('send');
 let messages = [];
 let busy = false;
 let abortFetch = null;
-let CUR = {body: null, reply: ''};   // the turn in flight, for the Esc handler
+let CUR = {body: null, reply: '', learning: false, stopped: false};
 const $ = id => document.getElementById(id);
 
 // Both counters and the memory report are the SERVER's. The page mirrors
@@ -1122,7 +1147,9 @@ const $ = id => document.getElementById(id);
 // and re-syncs from the server whenever a step or a reply resets something
 // it cannot work out on its own.
 let MECH = {pending:0, chunk:0, steps:0, ids:[], maxTokens:400,
-            threshold:0.35, layers:16};
+            threshold:0.35, layers:16, longBytes:4, long: undefined,
+            snrTrunk: undefined, snrDecay: undefined};
+let LAST = {latent:null, stops:null, heat:null, delta:null};
 
 function note(text, kind){
   const n = $('note');
@@ -1154,10 +1181,18 @@ function drawLearn(){
 // mistake both plans warn about -- so the two are reported separately.
 function drawMem(rep){
   if (!rep) return;
+  MECH.long = rep.n_long;
   $('mem-n').textContent = rep.n_long + ' dims > ' + rep.threshold + 'B'
                          + (rep.n_live < rep.n_long
                             ? '  (' + rep.n_live + ' live)' : '');
+  // the bar is a proportion of a stated ceiling, not a raw count: 8 dims is
+  // "every long-lived dimension this checkpoint has ever grown", so the full
+  // bar means memory has saturated rather than that there are 8 of them
   $('mem-f').style.width = Math.min(100, 100 * rep.n_live / 8) + '%';
+  $('m-mem').title = rep.n_live + ' of ' + rep.n_long + ' dims over '
+                  + rep.threshold + ' bytes are holding state; the bar fills '
+                  + 'at 8, which is every long-lived dim this checkpoint has '
+                  + 'ever grown';
   drawChips(rep);
 }
 
@@ -1192,6 +1227,7 @@ function drawSnr(s){
       + (r > 0 ? '  (' + (r < 0.01 ? '<1%' : Math.round(r * 100) + '%')
                          + ' of trunk)' : '');
   }
+  MECH.snrTrunk = s.trunk; MECH.snrDecay = s.decay;
   // `all` is the whole-vector figure RESULTS.md quotes, so it is a hover
   // rather than a third bar -- three bars for two questions is noise.
   $('m-snr').title = 'whole-vector SNR ' + s.all
@@ -1211,6 +1247,14 @@ function drawChips(rep){
     c.className = 'chip' + (d.live ? ' live' : '')
                 + (fresh && fresh.has(d.id) ? ' new' : '');
     c.textContent = d.hl + 'B';
+    // colour alone cannot be the only signal, so the same fact is in the
+    // text for anyone who cannot see the green and in the label for a
+    // screen reader
+    c.setAttribute('role', 'img');
+    const held = d.live ? 'holding state, RMS ' + d.rms
+                        : 'not holding anything';
+    c.setAttribute('aria-label', d.id + ': half-life ' + d.hl
+                              + ' bytes, ' + held);
     c.title = d.id + ' — half-life ' + d.hl + ' bytes, sigma ' + d.sigma
             + ', state ' + (d.live ? d.rms : '0 (not holding anything)');
     box.appendChild(c);
@@ -1325,7 +1369,15 @@ function drawHeat(heat, nlayers){
 // is about to spend quota on.
 function drawDelta(rows, learn){
   const t = $('delta');
-  if (!rows || !rows.length){ t.innerHTML = ''; return; }
+  const panel = t.closest('.ipanel');
+  if (!rows || !rows.length){
+    // an empty table under a heading reads as a bug; say WHY it is empty
+    t.innerHTML = '';
+    panel.style.display = learn ? '' : 'none';
+    $('delta-note').textContent = learn ? 'no change recorded' : '';
+    return;
+  }
+  panel.style.display = '';
   const head = '<tr><th>role</th><th class="n">params</th>'
              + '<th class="r">RMS &Delta;&theta;</th>'
              + '<th class="r">&Delta;/&theta;</th></tr>';
@@ -1336,13 +1388,14 @@ function drawDelta(rows, learn){
     + '<td class="r">' + r.rms.toExponential(2) + '</td>'
     + '<td class="r">' + (r.rel * 100).toExponential(2) + '%</td></tr>').join('');
   t.innerHTML = head + body;
-  $('delta-note').textContent = learn ? 'update-to-parameter ratio' : 'learning is off';
+  $('delta-note').textContent = learn ? 'update-to-parameter ratio' : '';
 }
 
 let MODE = {learn: true};
 function applyState(d){
   if (d.learn){ MECH.pending = d.learn.pending; MECH.chunk = d.learn.chunk;
-                MECH.steps = d.learn.steps; }
+                MECH.steps = d.learn.steps; MECH.learn = true; }
+  else if (d.learn === null){ MECH.learn = false; }
   // the SERVER is the authority for the byte cap and the stop threshold.
   // The page used to hardcode max_new, which silently ignored --max-tokens:
   // asking for 70 and getting 400 back is the kind of quiet mismatch that
@@ -1350,19 +1403,28 @@ function applyState(d){
   if (d.max_tokens !== undefined) MECH.maxTokens = d.max_tokens;
   if (d.threshold !== undefined) MECH.threshold = d.threshold;
   if (d.meta && d.meta.layers) MECH.layers = d.meta.layers;
+  if (d.meta && d.meta.long_bytes) MECH.longBytes = d.meta.long_bytes;
   if (d.snr !== undefined) drawSnr(d.snr);
   if (d.memory) drawMem(d.memory);
   drawLearn();
+  if ($('mech').classList.contains('collapsed')) drawStrip();
 }
 
 fetch('/api/state').then(r => r.json()).then(d => {
   if (d.path) $('hdr').textContent = d.path;
   if (d.markers) $('hdr').textContent += '  ·  turn markers on';
-  if (d.learn === null) MODE.learn = false;
-  if (d.meta && d.meta.t !== undefined)
-    $('hdr').title = 't=' + d.meta.t + '  bytes=' + d.meta.bytes_seen
-                  + '  dim=' + d.meta.dim + '  ring_k=' + d.meta.ring_k
-                  + '  params=' + (d.meta.params || 0).toLocaleString();
+  if (d.learn === null) MODE.learn = false; else if (d.learn) MODE.learn = true;
+  if (d.meta && d.meta.t !== undefined){
+    // the digest is ON SCREEN, not only in a tooltip: this tool's whole ethos
+    // is that a number belongs to the checkpoint that produced it
+    $('prov').textContent = 'sha256 ' + (d.meta.digest || '?').slice(0, 12)
+                         + ' · t=' + d.meta.t
+                         + ' · ' + (d.meta.params || 0).toLocaleString() + 'p';
+    $('hdr').title = d.meta.path + '  ·  bytes=' + d.meta.bytes_seen
+                  + '  dim=' + d.meta.dim + '  layers=' + d.meta.layers
+                  + '  ring_k=' + d.meta.ring_k
+                  + '  prime=' + d.meta.prime_bytes + 'B';
+  }
   applyState(d);
 }).catch(() => {});
 
@@ -1380,6 +1442,52 @@ fetch('/api/prime').then(r => r.json()).then(p => {
   d.querySelector('pre').textContent = p.text;
   $('primebox').appendChild(d);
 }).catch(() => {});
+
+// The panels are tall and the conversation is the thing. Fold them away, keep
+// the headline numbers in a one-line strip so the model's state is still
+// readable at a glance, and remember the choice. Default: folded on a short
+// viewport, because that is where they were eating the thread.
+const MECH_KEY = 'tmt.mech';
+function drawStrip(){
+  // the strip mirrors the meters, so folding the panels away does not lose
+  // the numbers. Called from applyState as well as from applyMech, because
+  // the first render happens before /api/state has answered and would
+  // otherwise sit there claiming the model was read-only.
+  const parts = [];
+  parts.push('training <b>' + (MECH.learn
+      ? (MECH.pending + '/' + MECH.chunk + ' B to next step')
+      : 'read-only') + '</b>');
+  if (MECH.long !== undefined)
+    parts.push('long memory <b>' + MECH.long + ' dims</b>');
+  if (MECH.snrTrunk !== undefined)
+    parts.push('SNR <b>' + MECH.snrTrunk + '</b> / <b>' + MECH.snrDecay + '</b>');
+  $('mechbar').innerHTML = parts.join(' &middot; ');
+}
+function applyMech(collapsed){
+  $('mech').classList.toggle('collapsed', collapsed);
+  $('mechbar').hidden = !collapsed;
+  $('toggle').textContent = collapsed ? 'Show panels' : 'Hide panels';
+  $('toggle').setAttribute('aria-expanded', String(!collapsed));
+  if (collapsed) drawStrip();
+  try { localStorage.setItem(MECH_KEY, collapsed ? '1' : '0'); } catch (e) {}
+  // the canvases are sized off the panel being visible, so they have to be
+  // redrawn after the fold or they come back at the wrong width
+  if (!collapsed) requestAnimationFrame(redrawAll);
+}
+$('toggle').onclick = () =>
+  applyMech(!$('mech').classList.contains('collapsed'));
+function redrawAll(){
+  if (LAST.latent) drawLatent(LAST.latent);
+  if (LAST.stops) drawStop(LAST.stops, MECH.threshold);
+  if (LAST.heat) drawHeat(LAST.heat, MECH.layers);
+  if (LAST.delta) drawDelta(LAST.delta, MODE.learn);
+}
+// read the saved preference, else fold it on a viewport too short to hold
+// both. The empty state used to render at y=745 on an 800px screen, which is
+// a page that looks blank until you guess there is an input below.
+let saved = null;
+try { saved = localStorage.getItem(MECH_KEY); } catch (e) {}
+applyMech(saved === null ? innerHeight < 900 : saved === '1');
 
 function empty(){
   thread.innerHTML = '<div class="empty">Ask it something.<br>'
@@ -1410,8 +1518,17 @@ q.addEventListener('keydown', e => {
                                          document.getElementById('f').requestSubmit(); }
 });
 $('reset').onclick = () => { if (busy) return; messages = []; empty();
-                             stat.textContent = ''; clearInstruments();
-                             $('export').disabled = false; q.focus(); };
+                             stat.textContent = '';
+                             LAST = {latent:null, stops:null, heat:null, delta:null};
+                             for (const id of ['lat','stop','heat'])
+                               $(id).getContext('2d').clearRect(0,0,$(id).width,$(id).height);
+                             $('lat-var').textContent = '';
+                             $('stop-note').textContent = '';
+                             $('heat-note').textContent = '';
+                             drawDelta(null, MODE.learn);
+                             $('export').disabled = true;
+                             $('export').textContent = 'Export';
+                             q.focus(); };
 
 // Export the session as JSON. Every number this page produces is one the
 // project would otherwise throw away, and RESULTS.md's rule is that a number
@@ -1425,7 +1542,8 @@ $('export').onclick = async () => {
                           {type: 'application/json'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'tmt-session-' + (j.meta.digest || 'nodigest') + '.json';
+    a.download = 'tmt-session-' + (j.meta.digest || 'nodigest').slice(0, 16)
+                + '.json';
     a.click();
     URL.revokeObjectURL(a.href);
     $('export').textContent = 'saved ' + j.turns.length;
@@ -1437,17 +1555,29 @@ $('export').onclick = async () => {
 // alone would leave it generating to its cap while every later request
 // queued behind the lock. The current reply is kept on CUR so this handler,
 // which lives outside the submit closure, can see it.
+//
+// It CANNOT stop the learning pass. Once remember() has begun the weights are
+// already moving and that pass runs to its end regardless -- measured: a
+// cancel sent inside that window still took a step and advanced t. So the
+// status says so instead of implying the turn was halted.
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape' || !busy) return;
   e.preventDefault();
+  if (CUR.learning){
+    stat.textContent = 'the reply is done; the exchange is still being '
+                     + 'trained on and cannot be interrupted now'
+                     + (MECH.chunk ? ' (' + MECH.pending + '/' + MECH.chunk
+                                    + ' B to the next step)' : '');
+    note('too late to stop — already training');
+    return;
+  }
   if (abortFetch) abortFetch.abort();
   fetch('/api/cancel', {method: 'POST'}).catch(() => {});
+  CUR.stopped = true;
   if (CUR.body){
     CUR.body.classList.remove('caret');
     CUR.body.textContent = CUR.reply + '\n\n[stopped]';
   }
-  // the status line must not be left saying "thinking..." after a stop --
-  // that reads as a hang, which is the one thing it must not do here
   stat.textContent = 'stopped after ' + CUR.reply.length + ' bytes';
   note('stopped');
   busy = false; send.disabled = false;
@@ -1464,7 +1594,7 @@ $('f').onsubmit = async (e) => {
   add('user', text);
   messages.push({role:'user', content:text});
   const body = add('bot', '');
-  CUR = {body: body, reply: ''};
+  CUR = {body: body, reply: '', learning: false, stopped: false};
   body.classList.add('caret');
   log.scrollTop = log.scrollHeight;
   stat.textContent = 'thinking...';
@@ -1478,6 +1608,13 @@ $('f').onsubmit = async (e) => {
       body: JSON.stringify({messages, max_new: MECH.maxTokens,
                             threshold: MECH.threshold})
     });
+    // A 500 comes back as an HTML error page, which is not SSE: every frame
+    // check below would silently discard it and the turn would look like it
+    // produced nothing. Check the status before trying to read a stream.
+    if (!r.ok){
+      throw new Error('server returned ' + r.status
+                      + (r.status === 404 ? ' (no checkpoint loaded?)' : ''));
+    }
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -1508,11 +1645,17 @@ $('f').onsubmit = async (e) => {
           follow(was);
           MECH.pending++; drawLearn();
         }
-        else if (d.swap){ if (d.memory) drawMem({dims:d.memory, n_long:d.memory.length,
-                              n_live:d.memory.filter(x=>x.live).length,
-                              threshold:4, state_rms:0}); }
+        else if (d.swap){
+          // the swap frame carries ONLY a dim list. drawChips needs nothing
+          // else, so nothing else is invented here: the earlier version
+          // passed n_long/n_live derived from the list length under a
+          // hardcoded threshold, which is a count the server never sent.
+          if (d.memory) drawChips({dims: d.memory, threshold: MECH.longBytes});
+        }
         else if (d.learning){
-          // the bytes are done; the weights are not
+          // the bytes are done; the weights are not, and this is the window
+          // in which Esc can no longer stop anything
+          CUR.learning = true;
           body.classList.remove('caret');
           stat.textContent = 'reply done — training on the exchange...';
         }
@@ -1524,6 +1667,10 @@ $('f').onsubmit = async (e) => {
           // something the page cannot work out on its own
           const L = d.learned;
           applyState(d);
+          // kept so folding the panels away and back can redraw them: a
+          // canvas sized while its panel was display:none comes back blank
+          LAST.stops = d.stops; LAST.latent = d.latent;
+          LAST.heat = d.heat;   LAST.delta = d.delta;
           drawStop(d.stops, d.threshold);
           drawLatent(d.latent);
           drawHeat(d.heat, MECH.layers);
@@ -1557,6 +1704,15 @@ $('f').onsubmit = async (e) => {
               || String(err).includes('aborted');
     body.classList.add('err');
     if (!gone) body.textContent = reply + '\n\n[' + err + ']';
+    // The Esc path was fixed so it could not leave the status reading
+    // "thinking..."; the transport-drop path had the same failure and was
+    // left with it. A dropped connection is the SERVER going away -- often a
+    // training run holding the card -- so say that rather than leaving a
+    // spinner nobody can stop.
+    if (gone && !CUR.stopped){
+      stat.textContent = 'connection lost — is the server still running?'
+                       + (reply ? ' (' + reply.length + ' bytes kept)' : '');
+    }
   }
   body.classList.remove('caret');
   // Keep the turn for the DISPLAY. The server only reads the last user turn
@@ -1677,19 +1833,26 @@ def main():
                  ema=None, snr=None, loss=None, ce=None,
                  cancel=False, session=[])
     # What this session started from, so an exported transcript says which
-    # checkpoint produced it. The digest is over the first and last megabyte
-    # only: a full sha256 of a 180 MB checkpoint is slow enough to be noticed,
-    # and those two chunks are enough to tell two checkpoints apart.
+    # checkpoint produced it.
+    #
+    # The FULL sha256, not a first+last-page fingerprint. The fingerprint was
+    # an attempt to keep startup fast, and it was wrong on its own terms: a
+    # value labelled "digest" that does not match `sha256sum`, and does not
+    # match the .sha256 sidecars checkpoint_hub writes, is a number that
+    # means something other than what it says -- which is the exact defect
+    # this project's bug log is full of. It is also the number a reader will
+    # actually check the export filename against. It costs ~0.4s once.
+    t_digest = time.time()
     try:
+        h = hashlib.sha256()
         with open(args.path, "rb") as f:
-            h = hashlib.sha256()
-            h.update(f.read(1 << 20))
-            if os.path.getsize(args.path) > (2 << 20):
-                f.seek(-(1 << 20), os.SEEK_END)
-                h.update(f.read(1 << 20))
-        digest = h.hexdigest()[:16]
+            for blk in iter(lambda: f.read(1 << 20), b""):
+                h.update(blk)
+        digest = h.hexdigest()
     except OSError:
         digest = None
+    print(f"[digest] {args.path} sha256 {digest} "
+          f"({time.time() - t_digest:.2f}s)", file=sys.stderr)
     STATE["meta"] = {"path": os.path.abspath(args.path), "digest": digest,
                      "t": int(model.t), "bytes_seen": int(model.bytes_seen),
                      "dim": int(model.dim), "layers": int(model.layercount),

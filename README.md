@@ -94,32 +94,58 @@ trained for ~10^5 steps. See the generated samples in `RESULTS.md`
 .venv/bin/python serve.py                 # then open http://127.0.0.1:8080
 ```
 
-A chat window, plus the three things this model actually does to itself while
-it talks. Ported from `../mini-AGI/serve.py`, which is the same idea against a
-different model — same four routes, same SSE byte stream, same single lock,
-same one-page-no-build-step HTML.
+A chat window, plus the things this model does to itself while it talks.
+Ported from `../mini-AGI/serve.py`, which is the same idea against a different
+model — same four routes, same SSE byte stream, same single lock, same
+one-page-no-build-step HTML.
 
-The middle panel is the part that is specific to TMT:
+**Generation is fast; the training pass is what costs.** A reply streams at
+~270 B/s and a 150-byte reply is written in about 0.5 s. Then the exchange is
+trained on, one `step_batch` per byte at B=1, which is seconds more. The page
+says which of the two is happening rather than looking stuck between them.
+
+The panels answer, in order: how far to the next weight update; which
+dimensions remember, and whether they are actually holding anything; what the
+gradient looks like to each *kind* of parameter; what the latent does; what
+the stop head does; and what the weights did.
 
 * **test-time training** — the conversation is fed back through `step_batch`,
-  the same call the trainer makes on a corpus, one AdamW update per `--learn-chunk`
-  bytes. Talking to the model *is* training it, and it says so on the page.
-  `--no-learn` serves read-only.
-* **long memory** — one chip per dimension whose decay gives it a half-life
-  past `--long-bytes`, each showing its half-life and, in the tooltip, the RMS
-  of the state it is actually holding. That pairing is deliberate: both plans
-  in `docs/plans/` say not to infer liveness from sigma or half-life alone,
-  because a dim can have a 32-byte half-life and carry nothing. A dim with a
-  long half-life and zero state is drawn dim, not lit.
-* **gradient SNR** — `||EMA(g)||² / EMA(||g||²)`, read off the gradient
-  `step_batch` already computed. The measured value over the whole 889,897-step
-  run was ~0.05 and never recovered.
+  one AdamW update per `--learn-chunk` bytes. `--no-learn` serves read-only.
+* **long memory** — one chip per dimension past a half-life threshold, each
+  showing its half-life and, on hover, the RMS of the state it is holding.
+  That pairing is deliberate: both plans in `docs/plans/` say not to infer
+  liveness from sigma or half-life alone, so a dim with a long half-life and
+  zero state is drawn dim, not lit.
+* **gradient SNR, split trunk vs decay** — the standing blocker is one number
+  and one number hides the question. It reads `warming up` until 20
+  optimiser steps, because a single EMA sample returns exactly 0.1 for every
+  group whatever the gradient is, so an early ratio is noise that looks
+  like a reassuring 100%.
+* **JEPA latent, PCA to 2D** — with the fraction of variance the two axes
+  hold, because a scatter of 1% is noise and saying so is the difference
+  between a plot and a lie.
+* **stop head per byte**, against the cut. This is what turns "the 600k
+  checkpoint hit the token cap" from an anecdote into something you can look
+  at.
+* **state RMS per layer**, across the reply. Every layer lights up though
+  only ~11 dims anywhere remember past 4 bytes — that contrast is the
+  finding: the state is busy everywhere, long memory is almost nowhere.
+* **what this exchange changed** — RMS Δθ and Δ/θ per role, decay
+  highlighted. It is a small number, and seeing how small is the useful part.
 
-Generation streams one byte at a time, so what you watch is the model writing.
-A byte that is not a printable character is sent with its value and drawn as a
-placeholder, so the reply on screen is never shorter than the number of bytes
-the model produced. When the stop head never fires and `--max-tokens` ends the
-reply, the page says so rather than letting the cap pass for a decision.
+The panels fold away (`Hide panels`, remembered across visits, folded by
+default on a short viewport) and collapse to a one-line strip, because they
+are tall and the conversation is the point. `Esc` stops a reply; it cannot
+stop the training pass once that has begun, and it says so rather than
+implying otherwise. `Export` downloads the session as JSON — the
+checkpoint's full sha256, `t`, and per turn the prompt, reply, byte counts,
+CE, per-role SNR and whether the stop head fired — which is a `RESULTS.md`
+row per turn.
+
+Generation streams one byte at a time, so what you watch is the model
+writing. A byte that is not a printable character is sent with its value and
+drawn as a placeholder, so the reply on screen is never shorter than the
+number of bytes the model produced.
 
 Two deliberate departures from mini-AGI, both because TMT's memory is the
 recurrent state rather than a context window:
@@ -129,23 +155,24 @@ recurrent state rather than a context window:
   memory between requests. Replaying the history here would apply every earlier
   reply to the state a *second* time.
 * **The prime is fed into the state once, at load.** Prepending it to each
-  prompt, as mini-AGI does, would re-apply ~1 kB of corpus to the memory on
-  every turn and bury the conversation. `/api/prime` still shows you what it
-  was, because the model is answering from state you cannot otherwise see.
+  prompt would re-apply ~1 kB of corpus to the memory on every turn and bury
+  the conversation. `/api/prime` still shows you what it was.
 
 Turn markers are **off** by default, so the page feeds exactly what
 `numpy_port.Runtime.chat` feeds and stays comparable to the chat results
 recorded in `RESULTS.md`. `--markers` opts into `<user>`/`<bot>` turns; the
 current model tends to leak the tags back, which `RESULTS.md` also records.
 
-Learning writes through `Runtime.save_checkpoint` — the tagged, atomic, keep-k
-path — so talking to the model cannot destroy a checkpoint a result was
-measured on. Point `--path` somewhere else to keep a served model off
-`tmt.npz` entirely. `flask` is used if installed and `http.server` if not;
-this project ships with numpy and torch and nothing else. Binds to localhost.
+Learning writes through `Runtime.save_checkpoint` — the tagged, atomic,
+keep-k path — so talking to the model cannot destroy a checkpoint a result
+was measured on. Point `--path` somewhere else to keep a served model off
+`tmt.npz` entirely. `flask` is used if installed and `http.server` if not.
+Binds to localhost.
 
 Gated by `tests/check_web.py` (free, CPU): the memory math against the
 half-lives recorded in `RESULTS.md`, the prime's line-boundary cut, the
-prompt format in both modes, all four routes on **both** servers, the SSE
-frame contract, and that learning writes a tagged checkpoint while
-`--no-learn` writes nothing.
+prompt format in both modes, all routes on **both** servers, the SSE frame
+contract, the per-role parameter split, the cancel path, the session export,
+and a static page/server field agreement check — added because the browser
+caught a meter rendering the literal string "undefined" while every
+server-side assertion passed.

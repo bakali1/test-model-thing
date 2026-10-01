@@ -584,6 +584,76 @@ def check_page_contract():
         ok(("d." + field) in body,
            fn + " is fed from the done frame's '" + field + "'")
 
+    # --- things this file has already got wrong once ---
+    print("\n[10] regressions this gate now pins")
+
+    # the panels measured 483px on an 800px screen and pushed the empty-state
+    # greeting to y=745..802, i.e. off the bottom of the viewport
+    ok("max-height" in page and "#mech" in page,
+       "#mech has a height ceiling, so the thread cannot be squeezed out")
+    ok("innerHeight < 900" in body,
+       "the panels default to folded on a viewport too short to hold both")
+    ok("localStorage" in body, "the folded/expanded choice is remembered")
+    ok("redrawAll" in body and "LAST.stops" in body,
+       "unfolding redraws the canvases, which come back blank otherwise")
+
+    # a dropped connection used to leave the status on "thinking..."
+    ok("connection lost" in body,
+       "a transport failure says so instead of leaving 'thinking...'")
+    ok("!r.ok" in body,
+       "a non-2xx from /api/chat is raised rather than read as an empty stream")
+
+    # an empty table under a heading reads as a bug; in read-only there is
+    # nothing to compare against and the panel should not pretend
+    ok("panel.style.display = learn ? '' : 'none'" in body,
+       "the delta panel is hidden outright when learning is off")
+    ok("no change recorded" in body,
+       "and says why it is empty when learning is on but nothing moved")
+
+    # cancelling during the learning pass does NOT stop the training -- the
+    # weights are already moving. Saying "stopped" there is a lie.
+    ok("CUR.learning" in body and "cannot be interrupted" in body,
+       "Esc says it is too late once the exchange is being trained on")
+
+    # Esc used to wipe the reply it was stopping
+    ok("CUR.reply = reply;" in body,
+       "the reply Esc keeps tracks what actually streamed")
+
+    # the swap frame carries only a dim list; rebuilding the meter from it put
+    # a count and a hardcoded threshold on screen that the server never sent
+    ok("threshold: MECH.longBytes" in body,
+       "the swap path uses --long-bytes, not a hardcoded 4")
+    ok("threshold:4" not in body, "and no hardcoded 4 survives anywhere")
+    ok("n_long: d.memory.length" not in body,
+       "the swap path does not fake n_long from the list length")
+
+    # the mem bar is a proportion of a stated ceiling, so the ceiling is
+    # stated rather than being a magic 8
+    ok("/ 8" in body and "fills " in body and "$('m-mem').title" in body,
+       "the 8-dim ceiling is explained in the meter's own label")
+
+    # provenance belongs on screen for a tool built around it
+    ok("$('prov')" in body, "the checkpoint digest is rendered in the header")
+    ok('id="prov"' in page, "and there is an element to render it into")
+
+    # accessibility: the panels are the content
+    ok(page.count('role="img"') == 3,
+       "all three canvases expose a role", str(page.count('role="img"')))
+    ok(page.count("aria-label=") == 3,
+       "each canvas carries a label", str(page.count("aria-label=")))
+    # the chips are built in JS, so their label is a setAttribute rather than
+    # markup -- counting only the literal attribute would miss it
+    ok("setAttribute('aria-label'" in body,
+       "the chips carry a label too, set where they are created")
+    ok("holding state, RMS" in body and "not holding anything" in body,
+       "and the chip label states liveness in words, not only in colour")
+    ok('role="status"' in page and 'aria-live="polite"' in page,
+       "the status line announces itself to a screen reader")
+    ok("prefers-reduced-motion" in page,
+       "the caret and flare animations respect reduced-motion")
+    ok("'aria-expanded'" in body or '"aria-expanded"' in body,
+       "the panel toggle reports its state")
+
 
 if __name__ == "__main__":
     check_memory_report()
