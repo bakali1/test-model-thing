@@ -254,7 +254,19 @@ class Model:
                 256 * self.dim + 256 + self.dim + 1)
 
     # ---------- inference (single stream, frozen) ----------
-    def frozen_step(self, c):
+    def observe(self, c):
+        """frozen_step, plus the latent and the stop score.
+
+        Split out so an observer (the web page) can plot the JEPA latent and
+        the stop head without keeping a SECOND copy of this forward pass --
+        a duplicate would be a parity risk for no benefit. frozen_step() is a
+        thin wrapper over this and returns exactly what it always did, so
+        Runtime.chat and the parity gate are untouched.
+
+        `latent` is the post-layer-stack x, i.e. the vector the decoder reads
+        and the one the JEPA loss compares against embed(next byte). It is
+        the model's actual prediction and nothing else is.
+        """
         s = 0  # stream 0 carries persistent memory
         enc = self.embed[c]
         x = enc[None, :]
@@ -263,7 +275,11 @@ class Model:
             l.states[s:s + 1] = new_state
         output = (x[0] @ self.Wd.T + self.bd)
         stop = sigmoid(x[0] @ self.Ws + self.bs)[0]
-        return self.sample(output), stop
+        return self.sample(output), stop, x[0]
+
+    def frozen_step(self, c):
+        b, stop, _ = self.observe(c)
+        return b, stop
 
     def sample(self, output):
         probs = np.exp(output - output.max())

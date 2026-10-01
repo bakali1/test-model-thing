@@ -334,8 +334,12 @@ def check_no_learn():
 def check_router():
     print("\n[6] route table")
     ok(set(serve.ROUTES) == {("/", "GET"), ("/api/chat", "POST"),
-                             ("/api/state", "GET"), ("/api/prime", "GET")},
-       "exactly the four routes mini-AGI has", str(sorted(serve.ROUTES)))
+                             ("/api/state", "GET"), ("/api/prime", "GET"),
+                             ("/api/session", "GET"), ("/api/cancel", "POST")},
+       "mini-AGI's four routes, plus session export and cancel",
+       str(sorted(serve.ROUTES)))
+    ok(len([k for k in serve.ROUTES if k[0].startswith("/api")]) == 5,
+       "no route was added by accident")
     status, headers, body = serve.index()
     ok(status == 200 and headers["Content-Type"].startswith("text/html"),
        "the index route declares html")
@@ -346,12 +350,249 @@ def check_router():
        "and disables proxy buffering, or nginx eats the stream")
 
 
+# ------------------------------------------------- 7. the instruments
+def check_instruments():
+    print("\n[7] instrument maths")
+    with tempfile.TemporaryDirectory() as d:
+        m = numpy_port.Model(dim=64, layers=3)
+        m.layers[0].decay[:2] = 4.0
+        m.new_states(1)
+        m.layers[0].states[0, :2] = [1.5, -0.25]
+
+        # --- parameter roles partition the flat buffer exactly ---
+        g = serve.model_groups(m)
+        ok(g["decay"].size == 3 * 64, "decay group is one vector per layer",
+           str(g["decay"].size))
+        ok(g["decay"].size + g["trunk"].size == m.grads.size,
+           "trunk + decay covers every parameter, with no overlap")
+        ok(set(g["named"]) == {"embedding", "decoder", "layer weights",
+                               "layer norm gain", "layer norm bias", "decay"},
+           "named roles cover every tensor", str(sorted(g["named"])))
+        ok(sum(v.size for v in g["named"].values()) == m.grads.size,
+           "the named roles also partition the buffer")
+        # the group cache must follow the buffer, not the other way round
+        m2 = numpy_port.Model(dim=32, layers=2)
+        g2 = serve.model_groups(m2)
+        ok(g2["decay"].size == 2 * 32 and g2["n"] == m2.grads.size,
+           "groups are rebuilt for a different model shape",
+           f"{g2['decay'].size} vs {2*32}")
+
+        # --- a real optimiser step, then per-role SNR ---
+        for _ in range(6):
+            m.step_batch([65], [32], [False])
+        serve.STATE.update(ema=None, snr=None, loss=None, ce=None)
+        serve.update_snr(m)
+        s = serve.snr_state()
+        ok(s is not None and {"trunk", "decay", "all"} <= set(s),
+           "SNR is reported per role", str(s))
+        for role in ("trunk", "decay", "all"):
+            ok(0.0 <= s[role] <= 1.0,
+               f"{role} SNR is in [0,1]", str(s[role]))
+        # one EMA sample gives exactly 0.1 for any input, so this pins the
+        # definition against the 0.10 that RESULTS.md records at t=2k
+        ok(abs(s["all"] - 0.1) < 1e-3,
+           "a single EMA sample gives 0.1, matching the recorded t=2k value",
+           str(s["all"]))
+
+        # --- PCA reports the variance it actually used ---
+        lat = [m.observe(65)[2] for _ in range(12)]
+        p = serve.project_2d(lat)
+        ok(len(p["points"]) == 12, "one projected point per latent",
+           str(len(p["points"])))
+        ok(len(p["var"]) == 2, "two variance readings")
+        ok(all(0.0 <= v <= 1.0 for v in p["var"]),
+           "each axis holds a fraction of the variance", str(p["var"]))
+        ok(p["var"][0] >= p["var"][1] - 1e-9,
+           "the first axis holds at least as much as the second",
+           str(p["var"]))
+        ok(serve.project_2d([[0.0, 0.0]])["points"] == [],
+           "too few points returns an empty projection rather than raising")
+        ok(serve.project_2d([])["points"] == [], "no points is handled")
+
+        # a latent that lies on a 1-D line must project to a line: the first
+        # axis takes essentially all the variance, and that is exactly the
+        # case the readout exists to disclose
+        line = [[float(i), 2.0 * i, 0.0, 0.0] for i in range(20)]
+        pl = serve.project_2d(line)
+        ok(pl["var"][0] > 0.99 and pl["var"][1] < 1e-6,
+           "a rank-1 latent puts ~all variance on one axis and says so",
+           str(pl["var"]))
+
+        # --- state heat: one RMS per layer ---
+        heat = serve.state_heat(m)
+        ok(len(heat) == m.layercount, "one heat value per layer",
+           str(len(heat)))
+        ok(all(v > 0 for v in heat), "every layer is carrying some state",
+           str(heat))
+
+        # --- theta delta ---
+        before = m.theta.copy()
+        for _ in range(4):
+            m.step_batch([66], [32], [False])
+        rows = serve.theta_delta(m, before)
+        ok(len(rows) == len(g["named"]), "one delta row per role",
+           str(len(rows)))
+        ok(all(r["n"] > 0 for r in rows), "every role reports a param count")
+        ok(any(r["rms"] > 0 for r in rows),
+           "four steps moved something", str([r["rms"] for r in rows]))
+        ok(all(0 <= r["rel"] for r in rows), "the ratio is non-negative")
+        decay_row = [r for r in rows if r["role"] == "decay"][0]
+        ok(decay_row["rms"] >= 0, "the decay row is present for the factorial")
+        ok(serve.theta_delta(m, None) == [],
+           "no snapshot means no delta, not a crash")
+
+
+# ---------------------------------------------------- 8. cancel + session
+def check_cancel_and_session():
+    print("\n[8] cancel and session export")
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = tiny(os.path.join(d, "s.npz"))
+        rt = numpy_port.Runtime(path=ckpt, dim=64, layers=2, tagged=True,
+                                keep_k=2, save_every=1)
+        m = rt.model
+        m.new_states(1)
+        m.load(ckpt)
+        serve.STATE.update(runtime=rt, model=m, path=ckpt, learn=True,
+                           chunk=8, pending=0, steps=0, max_tokens=16,
+                           threshold=0.35, long_threshold=4.0, save_every=1,
+                           ema=None, snr=None, loss=None, ce=None,
+                           cancel=False, session=[], hot=[])
+        serve.PRIME = ""
+
+        # --- the cancel flag is observed by the byte loop ---
+        serve.STATE["cancel"] = True
+        out = list(serve.stream(65, 20, 0.35))
+        ok(any("note" in e and "your request" in e["note"] for e in out),
+           "a cancelled stream says so instead of running to its cap",
+           str([e for e in out if "note" in e]))
+        ok(not any("t" in e for e in out),
+           "and emits no bytes", str(len([e for e in out if "t" in e])))
+        ok(serve.STATE["cancel"] is True,
+           "the flag survives the route being callable")
+
+        # --- /api/cancel does not need the lock ---
+        serve.STATE["cancel"] = False
+        status, headers, body = serve.api_cancel()
+        ok(status == 200 and json.loads(body)["cancel"] is True,
+           "/api/cancel answers without taking the lock")
+        ok(serve.STATE["cancel"] is True, "and sets the flag")
+        serve.STATE["cancel"] = False
+
+        # --- the session record carries what RESULTS.md would ask for ---
+        done = {"n": 12, "nonprint": 1, "cps": 5.5, "threshold": 0.35,
+                "stops": [0.1, 0.4, 0.9], "learn": {"model_t": 65},
+                "learned": {"ce": 1.5}, "snr": {"trunk": 0.1, "decay": 0.01},
+                "memory": {"n_long": 4}}
+        serve.record_session("hello", "hi there", done)
+        ok(len(serve.STATE["session"]) == 1, "one row per exchange")
+        row = serve.STATE["session"][0]
+        for field in ("user", "reply", "n", "nonprint", "threshold", "model_t",
+                      "snr", "stop_max", "stop_fired", "long_dims"):
+            ok(field in row, f"the record carries '{field}'")
+        ok(row["stop_max"] == 0.9, "the peak stop score is recorded")
+        ok(row["stop_fired"] is True,
+           "and whether it crossed the cut, which is the diagnosis")
+        serve.record_session("x", "y", {"stops": [0.01], "threshold": 0.35})
+        ok(serve.STATE["session"][-1]["stop_fired"] is False,
+           "a run that never fired records that, too")
+
+        serve.STATE["meta"] = {"path": "/tmp/x.npz", "digest": "abc123",
+                               "t": 64747, "bytes_seen": 57602080,
+                               "dim": 64, "layers": 2, "ring_k": 15,
+                               "params": 45953, "learn": True,
+                               "chunk": 8, "max_tokens": 16, "threshold": 0.35,
+                               "long_bytes": 4.0, "markers": False,
+                               "prime_bytes": 0, "started": "2026-01-01T00:00:00"}
+        status, headers, body = serve.api_session()
+        ok(status == 200, "/api/session answers")
+        payload = json.loads(body)
+        ok(len(payload["turns"]) == 2, "every turn is exported")
+        for field in ("path", "digest", "t", "bytes_seen", "dim", "ring_k",
+                      "params", "chunk", "threshold", "markers"):
+            ok(field in payload["meta"],
+               f"the session names its '{field}' so a result is reproducible")
+        # the export has to survive a checkpoint that is no longer there
+        serve.STATE["meta"] = {}
+        ok(json.loads(serve.api_session()[2])["meta"] == {},
+           "an unset meta exports as empty rather than raising")
+
+
+# ------------------------------- 9. page/server field agreement
+def check_page_contract():
+    """
+    The page and the server must agree on field names, statically.
+
+    Added because the browser caught a bug this file could not: the page was
+    still reading `s.snr` off an object the server had stopped sending `snr`
+    on (it now sends trunk/decay/all), so the meter rendered the literal
+    string "undefined" while every server-side assertion passed. Nothing in a
+    response-shape test can see that -- the response was correct and the
+    consumer was stale.
+
+    So this pins the two ends against each other by name, and specifically
+    pins the retired single-SNR field out of the page.
+    """
+    print("\n[9] page/server contract")
+    import re
+    page = serve.PAGE
+
+    # the field the server sends vs the ones the page reads
+    with tempfile.TemporaryDirectory() as d:
+        m = numpy_port.Model(dim=64, layers=2)
+        m.new_states(1)
+        for _ in range(4):
+            m.step_batch([65], [32], [False])
+        serve.STATE.update(ema=None, snr=None, loss=None, ce=None, steps=25)
+        serve.update_snr(m)
+        sent = set(serve.snr_state())
+    ok({"trunk", "decay", "all"} <= sent,
+       "the server sends trunk/decay/all", str(sorted(sent)))
+    ok("warm" in sent and "steps" in sent,
+       "the server says when the reading is too early to compare")
+    ok("loss" not in sent and "available" not in sent,
+       "nothing is sent that duplicates the learned record",
+       str(sorted(sent)))
+
+    # every field the server sends must be READ by the page somewhere, or the
+    # server grew a field the page silently ignores
+    body = page[page.index("<script>"):]
+    unread = [f for f in sent if ("." + f) not in body]
+    ok(not unread, "every SNR field the server sends is read by the page",
+       str(unread))
+
+    # and the retired field must be gone from the page: this is the exact
+    # token that rendered as "undefined". Only the `s.` form is banned --
+    # reading `d.snr` off the payload is the correct way to call drawSnr, and
+    # an earlier version of this check banned it too and was simply wrong.
+    ok("s.snr" not in body, "the page no longer reads the retired s.snr field")
+    ok(re.search(r"\bs\.snr\b", body) is None,
+       "and not in any form, so a future rename cannot reintroduce it")
+
+    # the SNR branch must not produce the literal string 'undefined' for any
+    # field the server can send
+    draw = body[body.index("function drawSnr"):body.index("function drawChips")]
+    bad = re.findall(r"\$?\(['\"]([\w-]+)['\"]\)\.textContent\s*=\s*s\.(\w+)\s*\+",
+                     draw)
+    ok(all(f in sent for _, f in bad),
+       "every field drawSnr concatenates is one the server sends",
+       str([f for _, f in bad if f not in sent]))
+
+    # the instruments must be wired to the fields the done frame sends
+    for fn, field in (("drawStop", "stops"), ("drawLatent", "latent"),
+                      ("drawHeat", "heat"), ("drawDelta", "delta")):
+        ok(fn in body, fn + " is defined")
+        ok(("d." + field) in body,
+           fn + " is fed from the done frame's '" + field + "'")
+
+
 if __name__ == "__main__":
     check_memory_report()
     check_prime()
     check_prompt()
     check_router()
     check_no_learn()
+    check_instruments()
+    check_cancel_and_session()
     check_http("stdlib", 8731)
     try:
         import flask  # noqa: F401
@@ -359,6 +600,7 @@ if __name__ == "__main__":
     except ImportError:
         print("\n[4] http — flask server SKIPPED (flask not installed; the "
               "stdlib path is the one this project ships)")
+    check_page_contract()
 
     print()
     if FAIL:
