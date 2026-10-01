@@ -53,6 +53,7 @@ tidiness at the cost of a fragile refactor across the whole transport layer.
 gpu_port.py  numpy_port.py  tail_credit.py       model + tail credit
 train_gpu.py                                       the GPU trainer (CPU or CUDA)
 checkpoint_hub.py  fetch_corpus.py  fetch_eval_data.py   transport + in-session data
+serve.py                                           the chat + memory page (flask or stdlib)
 test_tail.py  tmt.npz                              the rolling working checkpoint
 
 tools/     eval.py  eval_npz.py  bench_variants.py        the ruler + benchmark board
@@ -62,6 +63,7 @@ bundles/   make_*.py                                       Colab bundle generato
 legacy/    main.py  main_torch.py  benchmark*.py          the original per-byte line
            smaller-4.5m.safetensors  tinystories_bench.txt
 tests/     check_*.py                                      free CPU gates; run these first
+           check_web.py                                   the page: memory math, both servers, the save path
 docs/      INDEX.md  plans/  optimization/  reviews/  runbooks/  ideas/
 cache/     cached eval transcripts (gitignored)            lets tables re-render free
 models/    banked + historical checkpoints (gitignored)

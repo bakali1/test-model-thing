@@ -74,6 +74,7 @@ plus a documented experiment record. Start here:
 |---|---|
 | know what is actually true, with numbers | **[`RESULTS.md`](RESULTS.md)** — the ruler and every measured result |
 | see the documentation map | **[`docs/INDEX.md`](docs/INDEX.md)** |
+| talk to the model, watch its memory | **`serve.py`** — see [Chat and memory page](#chat-and-memory-page) |
 | know what has *not* been tested | [`docs/optimization/OPTIMIZATION_TEST_STATUS.md`](docs/optimization/OPTIMIZATION_TEST_STATUS.md) |
 | run a GPU leg | [`docs/runbooks/MORNING-RUNBOOK.md`](docs/runbooks/MORNING-RUNBOOK.md) |
 | read the current plan | [`docs/plans/PLAN-2026-09-23-GPU.md`](docs/plans/PLAN-2026-09-23-GPU.md) |
@@ -86,3 +87,65 @@ measured-and-losing candidate removed rather than left in the tree.
 The model still produces largely incoherent text — it is 4.5 M parameters
 trained for ~10^5 steps. See the generated samples in `RESULTS.md`
 ("Qualitative inspection") for an honest look at what it currently does.
+
+## Chat and memory page
+
+```bash
+.venv/bin/python serve.py                 # then open http://127.0.0.1:8080
+```
+
+A chat window, plus the three things this model actually does to itself while
+it talks. Ported from `../mini-AGI/serve.py`, which is the same idea against a
+different model — same four routes, same SSE byte stream, same single lock,
+same one-page-no-build-step HTML.
+
+The middle panel is the part that is specific to TMT:
+
+* **test-time training** — the conversation is fed back through `step_batch`,
+  the same call the trainer makes on a corpus, one AdamW update per `--learn-chunk`
+  bytes. Talking to the model *is* training it, and it says so on the page.
+  `--no-learn` serves read-only.
+* **long memory** — one chip per dimension whose decay gives it a half-life
+  past `--long-bytes`, each showing its half-life and, in the tooltip, the RMS
+  of the state it is actually holding. That pairing is deliberate: both plans
+  in `docs/plans/` say not to infer liveness from sigma or half-life alone,
+  because a dim can have a 32-byte half-life and carry nothing. A dim with a
+  long half-life and zero state is drawn dim, not lit.
+* **gradient SNR** — `||EMA(g)||² / EMA(||g||²)`, read off the gradient
+  `step_batch` already computed. The measured value over the whole 889,897-step
+  run was ~0.05 and never recovered.
+
+Generation streams one byte at a time, so what you watch is the model writing.
+A byte that is not a printable character is sent with its value and drawn as a
+placeholder, so the reply on screen is never shorter than the number of bytes
+the model produced. When the stop head never fires and `--max-tokens` ends the
+reply, the page says so rather than letting the cap pass for a decision.
+
+Two deliberate departures from mini-AGI, both because TMT's memory is the
+recurrent state rather than a context window:
+
+* **A turn is fed alone, not the conversation.** mini-AGI rebuilds its prompt
+  from the whole message list every request, because a fresh KV cache has no
+  memory between requests. Replaying the history here would apply every earlier
+  reply to the state a *second* time.
+* **The prime is fed into the state once, at load.** Prepending it to each
+  prompt, as mini-AGI does, would re-apply ~1 kB of corpus to the memory on
+  every turn and bury the conversation. `/api/prime` still shows you what it
+  was, because the model is answering from state you cannot otherwise see.
+
+Turn markers are **off** by default, so the page feeds exactly what
+`numpy_port.Runtime.chat` feeds and stays comparable to the chat results
+recorded in `RESULTS.md`. `--markers` opts into `<user>`/`<bot>` turns; the
+current model tends to leak the tags back, which `RESULTS.md` also records.
+
+Learning writes through `Runtime.save_checkpoint` — the tagged, atomic, keep-k
+path — so talking to the model cannot destroy a checkpoint a result was
+measured on. Point `--path` somewhere else to keep a served model off
+`tmt.npz` entirely. `flask` is used if installed and `http.server` if not;
+this project ships with numpy and torch and nothing else. Binds to localhost.
+
+Gated by `tests/check_web.py` (free, CPU): the memory math against the
+half-lives recorded in `RESULTS.md`, the prime's line-boundary cut, the
+prompt format in both modes, all four routes on **both** servers, the SSE
+frame contract, and that learning writes a tagged checkpoint while
+`--no-learn` writes nothing.
