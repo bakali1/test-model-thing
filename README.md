@@ -133,11 +133,15 @@ the stop head does; and what the weights did.
 * **what this exchange changed** — RMS Δθ and Δ/θ per role, decay
   highlighted. It is a small number, and seeing how small is the useful part.
 
-The panels fold away (`Hide panels`, remembered across visits, folded by
-default on a short viewport) and collapse to a one-line strip, because they
-are tall and the conversation is the point. `Esc` stops a reply; it cannot
-stop the training pass once that has begun, and it says so rather than
-implying otherwise. `Export` downloads the session as JSON — the
+The panels sit **beside** the conversation, not above it: instruments in a
+left column, the thread on the right, both the full height of the window.
+Stacked, the instrument block measured 483px on an 800px screen and had to
+live behind a scroll ceiling, so it was always either cropped or squeezing
+the thread. As a column it gets the whole window, the meters stay pinned
+while only the plots scroll, and `Hide panels` gives the conversation the
+full width. Below 900px or 560px tall it falls back to stacked. `Esc` stops
+a reply; it cannot stop the training pass once that has begun, and it says so
+rather than implying otherwise. `Export` downloads the session as JSON — the
 checkpoint's full sha256, `t`, and per turn the prompt, reply, byte counts,
 CE, per-role SNR and whether the stop head fired — which is a `RESULTS.md`
 row per turn.

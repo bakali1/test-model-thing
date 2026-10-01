@@ -591,8 +591,45 @@ def check_page_contract():
     # greeting to y=745..802, i.e. off the bottom of the viewport
     ok("max-height" in page and "#mech" in page,
        "#mech has a height ceiling, so the thread cannot be squeezed out")
-    ok("innerHeight < 900" in body,
-       "the panels default to folded on a viewport too short to hold both")
+    ok("addEventListener('resize'" in body,
+       "the canvases are redrawn on resize, or they stay stretched")
+    ok("matchMedia" in body and "stacked()" in body,
+       "the fold default follows the layout's own breakpoint")
+
+    # the side-by-side
+    ok('id="split"' in page and 'id="chatcol"' in page,
+       "instruments and conversation are siblings, not stacked")
+    ok("#split{display:flex" in page.replace(" ", " ") or
+       "#split{flex:1 1 auto;min-height:0;display:flex" in page,
+       "#split is a row")
+    ok("#mechscroll" in page and "#mechscroll{flex:1 1 auto" in page,
+       "only the instruments scroll; the meters stay pinned above them")
+    ok("max-width:900px" in page and "max-height:560px" in page,
+       "and it falls back to stacked on a narrow or short viewport")
+    ok("flex-direction:column" in page,
+       "the fallback really does stack the split")
+    # the fold has to buy the whole window for the conversation, not just
+    # un-hide it -- verified in the browser at 717px -> 1280px of chat
+    ok("#chatcol{flex:1 1 auto" in page,
+       "the chat column absorbs the space the panels were using")
+    # two rows of meters, not a flex wrap that lands 3+1 at this width
+    ok(".mrow{flex:0 0 auto;display:grid" in page and
+       "grid-template-columns:1fr 1fr" in page,
+       "the meters are a deliberate 2x2 grid")
+    # the a11y edit dropped the canvases' width/height attributes, leaving
+    # width:100%/height:auto on a canvas with no intrinsic size -- every
+    # plot then took the 300x150 default ratio at full column width and the
+    # instrument column no longer fit on the screen
+    ok("canvas{" in page and "height:auto" not in page.split('canvas{')[1][:120],
+       "the plots have an explicit height rather than an inherited default")
+    ok("canvas#heat{height:" in page, "and the heatmap its own")
+    # latent and stop head must still pair inside a ~530px column
+    ok(".ipanel{flex:1 1 186px" in page,
+       "the instrument panels are narrow enough to stay side by side")
+    ok('aria-label="conversation"' in page,
+       "the conversation is a labelled landmark")
+    ok('id="note"' in page and "</header>" in page,
+       "the transient note has a home in the header, visible in both layouts")
     ok("localStorage" in body, "the folded/expanded choice is remembered")
     ok("redrawAll" in body and "LAST.stops" in body,
        "unfolding redraws the canvases, which come back blank otherwise")
@@ -637,10 +674,15 @@ def check_page_contract():
     ok('id="prov"' in page, "and there is an element to render it into")
 
     # accessibility: the panels are the content
+    ok(page.count('<canvas') == 3, "there are three canvases",
+       str(page.count('<canvas')))
     ok(page.count('role="img"') == 3,
-       "all three canvases expose a role", str(page.count('role="img"')))
-    ok(page.count("aria-label=") == 3,
-       "each canvas carries a label", str(page.count("aria-label=")))
+       "all three expose a role", str(page.count('role="img"')))
+    # three canvas labels plus two landmark labels, so the count is 5; what
+    # matters is that every CANVAS has one, not that the total is a number
+    ok(len(re.findall(r'<canvas[^>]*aria-label=', page)) == 3,
+       "each canvas carries a label",
+       str(len(re.findall(r'<canvas[^>]*aria-label=', page))))
     # the chips are built in JS, so their label is a setAttribute rather than
     # markup -- counting only the literal attribute would miss it
     ok("setAttribute('aria-label'" in body,

@@ -969,24 +969,33 @@ PAGE = r'''<!doctype html>
   details.prime pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;
                      word-wrap:break-word;overflow-wrap:anywhere;
                      font-size:12px;color:var(--dim);max-height:320px;overflow-y:auto}
-  #mech{border-bottom:1px solid var(--line);padding:9px 16px;flex:0 0 auto;
-        /* The panels are tall -- at 1280x800 the instrument block measured
-           483px and left the thread 168px, which pushed the empty-state
-           greeting to y=745..802 on an 800px screen: off the bottom. The
-           conversation is the point, so the panels get a ceiling and the
-           thread always keeps the majority of the height. */
-        max-height:min(46vh, 430px);overflow-y:auto;overscroll-behavior:contain}
+  /* Side by side: instruments left, conversation right.
+     This is the layout the panels actually want. Stacked, the instrument
+     block measured 483px on an 800px screen and had to live behind a scroll
+     ceiling, so it was always either cropped or squashing the thread. As a
+     column it gets the full height of the window instead, and the meters stay
+     pinned while only the instruments scroll -- the live numbers are the
+     thing you glance at, the plots are the thing you study. */
+  #split{flex:1 1 auto;min-height:0;display:flex;align-items:stretch}
+  #mech{flex:0 0 clamp(330px, 44%, 660px);min-width:0;
+        border-right:1px solid var(--line);padding:9px 16px 10px;
+        display:flex;flex-direction:column;overflow:hidden}
+  #mechscroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
   #mech.collapsed{display:none}
-  /* When collapsed, a one-line strip keeps the headline numbers visible, so
+  /* When the panels are folded, the conversation takes the whole width. */
+  /* When folded, a one-line strip keeps the headline numbers visible, so
      folding the panels away does not mean losing the state of the model. */
-  #mechbar{max-width:720px;margin:0 auto;font-size:11px;color:var(--dim);
-           display:flex;gap:16px;flex-wrap:wrap;
-           font-variant-numeric:tabular-nums}
+  #mechbar{border-bottom:1px solid var(--line);padding:6px 16px;flex:0 0 auto;
+           font-size:11px;color:var(--dim);display:flex;gap:16px;
+           flex-wrap:wrap;font-variant-numeric:tabular-nums}
   #mechbar b{color:var(--fg);font-weight:600}
   #mechbar[hidden]{display:none}
-  .mrow{max-width:720px;margin:0 auto;display:flex;gap:18px;
-        align-items:center;flex-wrap:wrap}
-  .meter{flex:1 1 158px;min-width:142px}
+  #chatcol{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
+  .mrow{flex:0 0 auto;display:grid;
+        /* 2x2 rather than a flex row: at 563px four meters wrapped 3+1, which
+           reads as a layout accident. A grid is 2+2 at every column width. */
+        grid-template-columns:1fr 1fr;gap:9px 18px;align-items:center}
+  .meter{min-width:0}
   .mlab{font-size:11px;color:var(--dim);display:flex;
         justify-content:space-between;align-items:baseline;gap:8px;
         margin-bottom:4px;white-space:nowrap}
@@ -1006,26 +1015,32 @@ PAGE = r'''<!doctype html>
         white-space:nowrap}
   .note.on{opacity:1}
   .note.swap{color:var(--accent)}
-  #chips{max-width:720px;margin:9px auto 0;display:flex;flex-wrap:wrap;gap:3px}
+  #chips{display:flex;flex-wrap:wrap;gap:3px;margin-top:5px}
   .chip{font:10px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
         padding:1px 5px;border-radius:3px;border:1px solid var(--line);
         color:var(--dim);transition:background .3s,color .3s,border-color .3s}
   .chip.live{color:var(--ok);border-color:var(--ok)}
   .chip.new{background:var(--accent);border-color:var(--accent);color:#fff}
-  .chiplab{font-size:10px;color:var(--dim);max-width:720px;margin:7px auto 0;
+  .chiplab{font-size:10px;color:var(--dim);margin:7px 0 0;
            display:flex;justify-content:space-between;gap:12px;
            align-items:baseline}
   /* the instrument panels */
-  #instr{max-width:720px;margin:0 auto}
+  #instr{max-width:720px}
   .irow{display:flex;gap:18px;flex-wrap:wrap;margin-top:13px}
-  .ipanel{flex:1 1 300px;min-width:280px}
+  .ipanel{flex:1 1 186px;min-width:168px}
   .ipanel.wide{flex:1 1 100%}
   .ihdr{font-size:10px;color:var(--dim);margin-bottom:5px;
         display:flex;justify-content:space-between;gap:10px;
         align-items:baseline}
   .ihdr em{font-style:normal;color:var(--fg);opacity:.7}
-  canvas{display:block;width:100%;height:auto;border:1px solid var(--line);
+  /* Explicit CSS heights, not width:100%/height:auto on a canvas with no
+     intrinsic size -- which is what dropping the width/height attributes for
+     the a11y labels left behind, so every plot settled on the 300x150 default
+     ratio blown up to the column width and ate the whole column. A plot's
+     height is a decision, not a side effect of having no intrinsic size. */
+  canvas{display:block;width:100%;height:150px;border:1px solid var(--line);
          border-radius:6px;background:var(--bg)}
+  canvas#heat{height:178px}
   table#delta{width:100%;border-collapse:collapse;font-size:11px;margin-top:2px}
   table#delta th{text-align:left;font-weight:600;color:var(--dim);
                  padding:2px 10px 4px 0;font-size:10px;text-transform:uppercase;
@@ -1039,6 +1054,16 @@ PAGE = r'''<!doctype html>
   .empty{color:var(--dim);text-align:center;margin-top:18vh;line-height:1.9}
   .empty code{background:var(--user);padding:2px 6px;border-radius:4px;
               font-size:13px}
+  /* Narrow, or a short window: the side-by-side is not worth more than the
+     conversation, so go back to stacked -- instruments first, capped, and the
+     thread keeps the majority of what is left. */
+  @media (max-width:900px), (max-height:560px){
+    #split{flex-direction:column}
+    #mech{flex:0 0 auto;max-height:min(46vh,430px);width:auto;
+          border-right:none;border-bottom:1px solid var(--line)}
+    #mechscroll{max-height:inherit}
+    #chatcol{flex:1 1 auto;min-height:0}
+  }
   footer{border-top:1px solid var(--line);padding:12px 16px;flex:0 0 auto}
   form{max-width:720px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
   textarea{flex:1;resize:none;font:inherit;color:var(--fg);
@@ -1064,13 +1089,14 @@ PAGE = r'''<!doctype html>
   <b>TMT</b><span class="sub" id="hdr"></span>
   <span class="sub" id="prov"></span>
   <span class="sp"></span>
+  <span class="note" id="note"></span>
   <button id="toggle" aria-expanded="true" aria-controls="mech">Hide panels</button>
   <button id="reset">New chat</button>
   <button id="export" disabled title="download this session as JSON — the checkpoint, its digest, and every turn's numbers">Export</button>
 </header>
 
-<div id="mechbar" hidden></div>
-<div id="mech">
+<div id="split">
+  <aside id="mech" aria-label="what the model is doing to itself">
   <div class="mrow">
     <div class="meter" id="m-learn">
       <div class="mlab"><span>test-time training</span><b id="learn-n">-</b></div>
@@ -1089,9 +1115,9 @@ PAGE = r'''<!doctype html>
       <div class="bar"><div class="fill snr" id="dec-f"></div></div>
     </div>
     </div>
+  <div id="mechscroll">
   <div class="chiplab">
     <span>long-lived dimensions &mdash; half-life, and whether the state is actually live</span>
-    <span class="note" id="note"></span>
   </div>
   <div id="chips"></div>
   <div id="instr">
@@ -1118,17 +1144,22 @@ PAGE = r'''<!doctype html>
       </div>
     </div>
   </div>
+  </div>
+  </aside>
+
+  <section id="chatcol" aria-label="conversation">
+    <div id="mechbar" hidden></div>
+    <div id="log"><div class="wrap"><div id="primebox"></div><div id="thread"></div></div></div>
+
+    <footer>
+      <form id="f">
+        <textarea id="q" rows="1" placeholder="Say something"></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+      <div class="stat"><span id="stat" role="status" aria-live="polite"></span><span class="hint">Enter to send &middot; Shift+Enter newline &middot; Esc to stop</span></div>
+    </footer>
+  </section>
 </div>
-
-<div id="log"><div class="wrap"><div id="primebox"></div><div id="thread"></div></div></div>
-
-<footer>
-  <form id="f">
-    <textarea id="q" rows="1" placeholder="Say something"></textarea>
-    <button id="send" type="submit">Send</button>
-  </form>
-  <div class="stat"><span id="stat" role="status" aria-live="polite"></span><span class="hint">Enter to send &middot; Shift+Enter newline &middot; Esc to stop</span></div>
-</footer>
 
 <script>
 const thread = document.getElementById('thread');
@@ -1468,6 +1499,10 @@ function applyMech(collapsed){
   $('mechbar').hidden = !collapsed;
   $('toggle').textContent = collapsed ? 'Show panels' : 'Hide panels';
   $('toggle').setAttribute('aria-expanded', String(!collapsed));
+  // the split is the default at any width that can hold two columns; folding
+  // is the way to buy the whole window for the conversation, so the old
+  // "fold on a short viewport" default only applies once the layout has
+  // already fallen back to stacked
   if (collapsed) drawStrip();
   try { localStorage.setItem(MECH_KEY, collapsed ? '1' : '0'); } catch (e) {}
   // the canvases are sized off the panel being visible, so they have to be
@@ -1482,12 +1517,23 @@ function redrawAll(){
   if (LAST.heat) drawHeat(LAST.heat, MECH.layers);
   if (LAST.delta) drawDelta(LAST.delta, MODE.learn);
 }
-// read the saved preference, else fold it on a viewport too short to hold
-// both. The empty state used to render at y=745 on an 800px screen, which is
-// a page that looks blank until you guess there is an input below.
+// The canvases are sized from clientWidth, so anything that changes the
+// column width leaves them stretched or blank. That is now three things --
+// folding, a window resize, and crossing the narrow-viewport breakpoint --
+// so it is handled once, here, rather than at each call site.
+let resizeTimer = null;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(redrawAll, 120);
+});
+// read the saved preference, else fold it only when the layout has already
+// fallen back to stacked and the panels would eat the thread again
 let saved = null;
 try { saved = localStorage.getItem(MECH_KEY); } catch (e) {}
-applyMech(saved === null ? innerHeight < 900 : saved === '1');
+const stacked = () => matchMedia('(max-width:900px), (max-height:560px)').matches;
+applyMech(saved === null ? stacked() : saved === '1');
+if (stacked()) matchMedia('(max-width:900px), (max-height:560px)')
+  .addEventListener('change', () => redrawAll());
 
 function empty(){
   thread.innerHTML = '<div class="empty">Ask it something.<br>'
