@@ -683,11 +683,13 @@ PAGE = r'''<!doctype html>
   #mech{border-bottom:1px solid var(--line);padding:9px 16px;flex:0 0 auto}
   .mrow{max-width:720px;margin:0 auto;display:flex;gap:22px;
         align-items:center;flex-wrap:wrap}
-  .meter{flex:1 1 190px;min-width:170px}
+  .meter{flex:1 1 200px;min-width:180px}
   .mlab{font-size:11px;color:var(--dim);display:flex;
-        justify-content:space-between;margin-bottom:4px;gap:8px}
+        justify-content:space-between;align-items:baseline;gap:8px;
+        margin-bottom:4px;white-space:nowrap}
+  .mlab span{overflow:hidden;text-overflow:ellipsis}
   .mlab b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;
-          white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          white-space:nowrap;flex:0 0 auto}
   .bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden}
   .fill{height:100%;width:0;border-radius:3px;background:var(--accent);
         transition:width .18s linear}
@@ -697,7 +699,8 @@ PAGE = r'''<!doctype html>
                    40%{transform:scale(1.03);box-shadow:0 0 0 7px transparent}
                    100%{transform:scale(1);box-shadow:0 0 0 0 transparent}}
   .fired{animation:flare .75s ease-out}
-  .note{font-size:11px;color:var(--ok);opacity:0;transition:opacity .2s}
+  .note{font-size:11px;color:var(--ok);opacity:0;transition:opacity .2s;
+        white-space:nowrap}
   .note.on{opacity:1}
   .note.swap{color:var(--accent)}
   #chips{max-width:720px;margin:9px auto 0;display:flex;flex-wrap:wrap;gap:3px}
@@ -706,7 +709,9 @@ PAGE = r'''<!doctype html>
         color:var(--dim);transition:background .3s,color .3s,border-color .3s}
   .chip.live{color:var(--ok);border-color:var(--ok)}
   .chip.new{background:var(--accent);border-color:var(--accent);color:#fff}
-  .chiplab{font-size:10px;color:var(--dim);max-width:720px;margin:7px auto 0}
+  .chiplab{font-size:10px;color:var(--dim);max-width:720px;margin:7px auto 0;
+           display:flex;justify-content:space-between;gap:12px;
+           align-items:baseline}
   .empty{color:var(--dim);text-align:center;margin-top:18vh;line-height:1.9}
   .empty code{background:var(--user);padding:2px 6px;border-radius:4px;
               font-size:13px}
@@ -741,9 +746,11 @@ PAGE = r'''<!doctype html>
       <div class="mlab"><span>gradient SNR</span><b id="snr-n">-</b></div>
       <div class="bar"><div class="fill snr" id="snr-f"></div></div>
     </div>
+    </div>
+  <div class="chiplab">
+    <span>long-lived dimensions &mdash; half-life, and whether the state is actually live</span>
     <span class="note" id="note"></span>
   </div>
-  <div class="chiplab" id="chiplab">long-lived dimensions &mdash; half-life, and whether the state is actually live</div>
   <div id="chips"></div>
 </div>
 
@@ -771,7 +778,8 @@ const $ = id => document.getElementById(id);
 // them per byte so the model's behaviour is visible while it is happening,
 // and re-syncs from the server whenever a step or a reply resets something
 // it cannot work out on its own.
-let MECH = {pending:0, chunk:0, steps:0, ids:[]};
+let MECH = {pending:0, chunk:0, steps:0, ids:[], maxTokens:400,
+            threshold:0.35};
 
 function note(text, kind){
   const n = $('note');
@@ -792,8 +800,8 @@ function drawLearn(){
   // the step is taken after the reply finishes, not mid-sentence, so a full
   // bar is true but would read as though nothing were going to happen
   $('learn-n').textContent = left
-      ? left + ' bytes to the next update'
-      : (busy ? 'updates when this reply finishes' : 'ready to update');
+      ? left + ' B to next update'
+      : (busy ? 'updates after this reply' : 'ready to update');
   $('learn-f').style.width = (100 * Math.min(pending, chunk) / chunk) + '%';
 }
 
@@ -844,6 +852,12 @@ function drawChips(rep){
 function applyState(d){
   if (d.learn){ MECH.pending = d.learn.pending; MECH.chunk = d.learn.chunk;
                 MECH.steps = d.learn.steps; }
+  // the SERVER is the authority for the byte cap and the stop threshold.
+  // The page used to hardcode max_new, which silently ignored --max-tokens:
+  // asking for 70 and getting 400 back is the kind of quiet mismatch that
+  // makes a number mean something other than what it says.
+  if (d.max_tokens !== undefined) MECH.maxTokens = d.max_tokens;
+  if (d.threshold !== undefined) MECH.threshold = d.threshold;
   if (d.snr !== undefined) drawSnr(d.snr);
   if (d.memory) drawMem(d.memory);
   drawLearn();
@@ -919,7 +933,8 @@ $('f').onsubmit = async (e) => {
   try {
     const r = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({messages, max_new: 400})
+      body: JSON.stringify({messages, max_new: MECH.maxTokens,
+                            threshold: MECH.threshold})
     });
     const reader = r.body.getReader();
     const dec = new TextDecoder();
