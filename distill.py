@@ -26,18 +26,32 @@ and writes one aligned array per stream, and asserts
 `reconstruct(table, ids) == stream_bytes` for every stream before saving. A
 mismatch is a hard failure, not a warning.
 
-Renormalization, in one place
------------------------------
-For a gold token whose bytes are g[0..m-1], and a byte at depth d (0-based),
-the MI target is
+The target, after the one-hot discovery (2026-10-03)
+----------------------------------------------------
+The first implementation followed the paper's depth-loop literally: condition on
+the gold byte prefix, keep the tokens that match it, renormalize. That was
+measured to produce a **point mass at the gold byte on 100.000000% of covered
+positions, entropy exactly 0.000000 nats** -- because every token matching
+`bytes(c)[:d+1] == g[:d+1]` has `bytes(c)[d] == g[d]` by definition. The "soft
+label" was a hard label, so alpha*KL + (1-alpha)*CE degenerated to
+position-dependent CE reweighting, the arm lost to its control and diverged.
 
-    S = { c in top-k : vocab_len[c] > d and vocab_bytes[c][:d+1] == g[:d+1] }
-    p_target[x] = sum(prob[c] for c in S if vocab_bytes[c][d] == x)
-    p_target /= p_target.sum()                       (if the sum is 0 -> backoff)
+What survives one teacher forward pass is depth 0 ONLY, and the paper's Case I
+constructs it WITHOUT conditioning on the gold byte:
 
-`S is empty` happens: it is the paper's Case III/IV, plus the k=32 truncation.
-The backoff is explicit and counted, never silent, because a target silently
-replaced by "no signal" would average away.
+    p_target[x] = sum(prob[c] for c in top-k if first_byte(c) == x)   # then / sum
+
+That is the teacher's genuine first-byte distribution -- measured entropy mean
+0.306 nats, 64.4% of positions non-degenerate. So:
+
+    depth 0  (a byte that begins a token, ~1 position in 4.1): real soft target
+    depth >=1 (inside a token): NO TARGET. Declined and counted, because one
+             forward pass conditioned on the gold prefix cannot represent byte
+             uncertainty there; restoring it needs the EoT channel or extra
+             teacher passes.
+
+A declined position returns an all-zero row, which contributes no KD gradient
+(the CE-only fallback). Declines are counted, never averaged away.
 """
 import hashlib
 import json
@@ -104,13 +118,17 @@ class VocabBytes:
         self.index = np.asarray(keep, np.int64)
         lens = np.asarray([len(table[i]) for i in keep], np.uint8)
         self.maxlen = int(lens.max()) if lens.size else 1
-        self.bytes = np.zeros((len(keep), self.maxlen), np.uint8)
+        self.bytes = np.zeros((len(keep), max(1, self.maxlen)), np.uint8)
         for r, i in enumerate(keep):
             b = table[i]
             if b:
                 self.bytes[r, :len(b)] = np.frombuffer(b, np.uint8)
         self.len = lens
         self.n_kept = len(keep)
+        # first byte of each token; all-zero when every token is empty (maxlen 0)
+        self.first = (self.bytes[:, 0].copy() if self.maxlen > 0
+                      else np.zeros(len(keep), np.uint8))
+        self.has_byte = (lens > 0)                    # empty tokens contribute 0
 
     def take(self, ids):
         """Map global ids -> row index in `self` (-1 if dropped)."""
@@ -176,7 +194,9 @@ class MiReader:
                     f"dump's token lengths imply {int(self.total_bytes[j])}; "
                     f"the dump was bucketed with a different B or a different "
                     f"file order and its targets are on the WRONG bytes")
-        width = int(min(self.total_bytes.max(), self.sdata.shape[1] - 1)) + 1
+        # +1 so a step whose predicted byte sits one past the end still indexes
+        # safely; that column is 0, so q=0 and `is_start` is false -> declined.
+        width = int(self.total_bytes.max()) + 1
         self.byte2tok = np.zeros((self.B, width), np.int32)
         self.tok_start = np.zeros((self.B, self.Ltok + 1), np.int32)
         for j in range(self.B):
@@ -188,36 +208,39 @@ class MiReader:
         self.dmax = self.vocab.maxlen
         self._cache_t0 = None
         self._cache = None
-        # statistics the trainer reports (never averaged away)
-        self.retained_sum = 0.0
-        self.retained_n = 0
-        self.retained_below_floor = 0
-        self.backoff_n = 0
-        self.floor = 0.05
+        # Statistics the trainer reports. Coverage is now "produced / positions",
+        # and `entropy` is the load-bearing number: a one-hot target means the
+        # KD term is not doing anything a reweighted CE could not.
+        self.positions = 0
+        self.produced_n = 0
+        self.declined = 0
+        self.empty = 0
+        self.entropy_sum = 0.0
+        self.top1_gold = 0
+        self.top1_n = 0
 
-    # -- MI -----------------------------------------------------------------
+    # -- the target -------------------------------------------------------
     def _build_block(self, t0, blk):
-        """Targets for steps [t0, t0+blk). Returns (B, blk, 256) and (B, blk)."""
+        """Targets for steps [t0, t0+blk).
+
+        Returns (targets (B, blk, 256) float32, produced (B, blk) float32).
+        `produced` is 1.0 where a target exists and 0.0 where the position was
+        declined (inside a token, so depth >= 1, where one forward pass cannot
+        represent byte uncertainty).
+        """
         # steps are BYTE positions; the arrays are indexed by TOKEN
         p = np.minimum(t0 + 1 + np.arange(blk, dtype=np.int64), self.L_step)
         q = self.byte2tok[:, p]                                   # (B, blk)
-        # NOTE: `tok_start[:, q]` would be advanced indexing on axis 1, which
-        # PREPENDS the index array's dims and yields (B, 1, blk).
-        starts = np.take_along_axis(self.tok_start, q, axis=1)    # (B, blk)
-        d = (p[None, :] - starts).astype(np.int64)                # (B, blk)
-        # `q` is an ABSOLUTE token-row index, but the arrays are huge, so read
-        # only the row window the block spans and index relative to it. (Indexing
-        # a t0-sliced array with `q` silently read the wrong row whenever q < t0.)
-        #
-        # OFF BY ONE, and it is the whole ballgame: dump row r holds the logits
-        # at token position r, which predict token r+1. Byte p belongs to token
-        # q, and the distribution that PREDICTED token q is therefore row q-1.
-        # Using row q asks the distribution for token q+1 which of its candidates
-        # starts with the gold byte — a different question, answered "no" most of
-        # the time: 66 % of positions fell through to the backoff before the fix.
+        # OFF BY ONE: dump row r holds the logits at token position r, which
+        # predict token r+1, so the distribution that predicted token q is q-1.
         qrow = q - 1
         ok = qrow >= 0
         qrow = np.maximum(qrow, 0)
+        # Only a byte that BEGINS a token gets a target; `starts == p` is that
+        # test. Everything inside a token is depth >= 1 and is declined.
+        starts = np.take_along_axis(self.tok_start, q, axis=1)     # (B, blk)
+        is_start = (p[None, :] == starts) & ok                    # (B, blk)
+
         qmin, qmax = int(qrow.min()), int(qrow.max())
         rel = (qrow - qmin)[:, :, None]
         cand = np.take_along_axis(self.ids[:, qmin:qmax + 1, :], rel,
@@ -225,50 +248,33 @@ class MiReader:
         prob = np.take_along_axis(self.probs[:, qmin:qmax + 1, :], rel,
                                  axis=1).astype(F)                # (B, blk, k)
         rows = self.vocab.take(cand)
-        live = rows >= 0                                          # control ids
-        live = live & ok[:, :, None]                              # q==0: no parent
+        live = (rows >= 0) & self.vocab.has_byte[np.where(rows >= 0, rows, 0)]
         rows = np.where(live, rows, 0)
-        vl = self.vocab.len[rows].astype(np.int64)                # (B, blk, k)
-        vb = self.vocab.bytes[rows]                               # (B, blk, k, Lmax)
+        b0 = self.vocab.first[rows].astype(np.int64)            # (B, blk, k)
 
-        # gold bytes of the token, from its start: the prefix test needs 0..d,
-        # not just the byte at d. (An earlier version compared every depth
-        # against the single gold byte and matched nothing at depth >= 1.)
-        ar = np.arange(self.dmax, dtype=np.int64)
-        gidx = np.minimum(starts[:, :, None] + ar[None, None, :],
-                          self.sdata.shape[1] - 1)                 # (B, blk, dmax)
-        gold_win = np.take_along_axis(self.sdata[:, None, :], gidx, axis=2)
-        gold_win = gold_win.astype(np.int64)[:, :, :, None]       # (B, blk, dmax, 1)
-
+        w = np.where(live, prob, F(0.0))
         out = np.zeros((self.B, blk, 256), F)
-        match = np.ones(cand.shape, bool)
-        maxd = int(min(self.dmax, int(d.max()) + 1))
-        for depth in range(maxd):
-            match &= ((vb[:, :, :, depth] == gold_win[:, :, depth, :])
-                      & (vl > depth) & live)
-            sel = d == depth
-            if not sel.any():
-                continue
-            wsel = np.where(match, prob, F(0.0))
-            mask3 = np.broadcast_to(sel[:, :, None], wsel.shape)
-            nb = vb[:, :, :, depth].astype(np.int64)
-            flat = (np.arange(self.B)[:, None, None] * (blk * 256)
-                    + np.arange(blk)[None, :, None] * 256 + nb)
-            np.add.at(out.reshape(-1), flat.reshape(-1)[mask3.reshape(-1)],
-                      wsel.reshape(-1)[mask3.reshape(-1)])
+        flat = (np.arange(self.B)[:, None, None] * (blk * 256)
+                + np.arange(blk)[None, :, None] * 256 + b0)
+        m3 = np.broadcast_to(is_start[:, :, None], w.shape)
+        np.add.at(out.reshape(-1), flat.reshape(-1)[m3.reshape(-1)],
+                  w.reshape(-1)[m3.reshape(-1)])
         tot = out.sum(axis=2)
-        retained = tot.copy()
-        dead = tot <= self.floor
-        if dead.any():
-            self.retained_below_floor += int(dead.sum())
-            if self.backoff == "skip":
-                out[dead] = 0.0
-                self.backoff_n += int(dead.sum())
+        produced = (tot > 0) & is_start
+        # normalize only where a target was produced
         nz = tot > 0
         out[nz] /= tot[nz][:, None]
-        self.retained_sum += float(retained.sum())
-        self.retained_n += int(retained.size)
-        return out, retained
+        out[~produced] = 0.0
+
+        self.positions += int(is_start.size)
+        self.produced_n += int(produced.sum())
+        self.declined += int((~is_start).sum())
+        self.empty += int((is_start & (tot <= 0)).sum())
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ent = -(out * np.log(out + 1e-12)).sum(axis=2)
+        self.entropy_sum += float(ent[produced].sum()) if produced.any() else 0.0
+        self.top1_gold += 0        # filled by the caller (needs the gold byte)
+        return out, produced.astype(F)
 
     def block(self, t0):
         """Whole cached block starting at t0: (targets (B,blk,256), retained (B,blk), blk)."""
@@ -287,11 +293,15 @@ class MiReader:
         return self._cache[:, i], self._cache_ret[:, i]
 
     def stats(self):
+        p = max(1, self.positions)
         return {
-            "retained_mass_mean": (self.retained_sum / max(1, self.retained_n)),
-            "positions": self.retained_n,
-            "below_floor": self.retained_below_floor,
-            "backoff": self.backoff_n,
-            "floor": self.floor,
+            "positions": self.positions,
+            "produced": self.produced_n,
+            "coverage": self.produced_n / p,
+            "declined_depth_ge_1": self.declined,
+            "declined_fraction": self.declined / p,
+            "empty_at_token_start": self.empty,
+            "target_entropy_nats": (self.entropy_sum / self.produced_n
+                                    if self.produced_n else None),
             "B": self.B, "L_step": self.L_step, "Ltok": self.Ltok, "k": self.k,
         }

@@ -54,7 +54,8 @@ def main():
     vocab = D.VocabBytes(table, drop_ids=control)
 
     B_STREAMS_MIN = 1024
-    report = {"dump": args.dump, "steps": args.steps, "by_depth": {}}
+    report = {"dump": args.dump, "steps": args.steps, "by_depth": {},
+              "reader_stats": {}}
     for path in files:
         stem = os.path.splitext(os.path.basename(path))[0]
         p = os.path.join(args.dump, f"{stem}.meta.json")
@@ -66,76 +67,81 @@ def main():
         r = D.MiReader(args.dump, stem, vocab, streams=streams, block=args.block)
         if int(np.asarray(r.tok_len).sum()) < B_STREAMS_MIN or r.Ltok < 2:
             raise SystemExit(
-                f"[FATAL] {stem}: the dump is degenerate (Ltok={r.Ltok}, "
-                f"{int(np.asarray(r.tok_len).sum())} token bytes). This is the "
-                f"all-padding dump, which has the CORRECT bytes-per-token and is "
-                f"therefore invisible to the storage check. Re-dump it; do not "
-                f"read coverage numbers off it.")
+                f"[FATAL] {stem}: the dump is degenerate (Ltok={r.Ltok}). "
+                f"An all-padding dump has the CORRECT bytes-per-token and is "
+                f"invisible to the storage check; re-dump it.")
         L = min(args.steps, r.L_step - 1)
-        ret_by_d = {d: [] for d in range(4)}
-        hit_by_d = {d: [0, 0] for d in range(4)}
-        ent_by_d = {d: [] for d in range(4)}
+        n_prod = 0
+        n_decl = 0
+        hit = 0
+        ents = []
+        firsts = []
+        per_depth = {}
         for t in range(0, L, args.block):
-            tgt, ret, n = r.block(t)
-            p_pos = np.minimum(t + 1 + np.arange(n), r.L_step)
+            tgt, produced, n = r.block(t)
+            pos = np.minimum(t + 1 + np.arange(n), r.L_step)
             gold = np.zeros((r.B, n), np.int64)
             dep = np.zeros((r.B, n), np.int64)
             for j in range(r.B):
                 s = streams[j]
                 for i in range(n):
-                    pp = int(p_pos[i])
+                    pp = int(pos[i])
                     if pp >= len(s):
                         continue
                     gold[j, i] = int(s[pp])
                     dep[j, i] = pp - int(r.tok_start[j, int(r.byte2tok[j, pp])])
-            live = ret > r.floor
             am = tgt.argmax(axis=2)
             with np.errstate(divide="ignore", invalid="ignore"):
                 ent = -(tgt * np.log(tgt + 1e-12)).sum(axis=2)
+            pr = produced > 0
+            n_prod += int(pr.sum())
+            n_decl += int((~pr).sum())
+            hit += int((am[pr] == gold[pr]).sum())
+            if pr.any():
+                ents.append(ent[pr])
+                firsts.append(tgt.max(axis=2)[pr])
             for d in range(4):
-                m = dep == d          # EVERY position at this depth, live or not
+                m = dep == d
                 if not m.any():
                     continue
-                ret_by_d[d].append(ret[m])
-                hit_by_d[d][0] += int((am[m] == gold[m]).sum())
-                hit_by_d[d][1] += int(m.sum())
-                ent_by_d[d].append(ent[m])
+                cur = per_depth.setdefault(d, [0, 0])
+                cur[0] += int((m & pr).sum())
+                cur[1] += int(m.sum())
+        tot = max(1, n_prod + n_decl)
+        ent = np.concatenate(ents) if ents else np.zeros(1)
+        firsts = np.concatenate(firsts) if firsts else np.zeros(1)
         print(f"\n[{stem}] B={r.B} L_step={r.L_step} walked {L} steps | "
-              f"{r.retained_n:,} positions | backoff {r.backoff_n:,} "
-              f"({r.backoff_n / max(1, r.retained_n):.2%})")
-        print(f"  {'depth':>5} {'n':>8} {'ret_mean':>9} {'ret_p05':>8} {'ret_p01':>8} "
-              f"{'KD@>0.05':>9} {'KD@>0.01':>9} {'argmax=gold':>11} {'entropy':>8}")
-        rows = {}
-        for d in range(4):
-            if not ret_by_d[d]:
-                continue
-            v = np.concatenate(ret_by_d[d])
-            h, tot = hit_by_d[d]
-            e = np.concatenate(ent_by_d[d])
-            # coverage = fraction of positions where MI still carries signal
-            c05 = float((v > 0.05).mean())
-            c01 = float((v > 0.01).mean())
-            rows[d] = {"n": int(v.size), "retained_mean": round(float(v.mean()), 4),
-                       "retained_p05": round(float(np.percentile(v, 5)), 4),
-                       "retained_p01": round(float(np.percentile(v, 1)), 4),
-                       "coverage_floor_0.05": round(c05, 4),
-                       "coverage_floor_0.01": round(c01, 4),
-                       "argmax_equals_gold": round(h / max(1, tot), 4),
-                       "target_entropy_nats": round(float(e[e > 0].mean()) if (e > 0).any() else 0.0, 4)}
-            print(f"  {d:>5} {v.size:>8,} {v.mean():>9.4f} "
-                  f"{np.percentile(v, 5):>8.4f} {np.percentile(v, 1):>8.4f} "
-                  f"{c05:>9.2%} {c01:>9.2%} {h / max(1, tot):>11.4f} "
-                  f"{rows[d]['target_entropy_nats']:>8.4f}")
-        report["by_depth"][stem] = rows
-        report.setdefault("reader_stats", {})[stem] = r.stats()
+              f"{tot:,} positions | {n_prod:,} produced ({n_prod / tot:.2%}), "
+              f"{n_decl:,} declined")
+        print(f"  target entropy (nats) : mean {ent.mean():.4f}  "
+              f"p05 {np.percentile(ent, 5):.4f}  max {ent.max():.4f}")
+        print(f"  top-1 mass             : mean {firsts.mean():.4f}")
+        print(f"  top-1 == gold byte     : {hit / max(1, n_prod):.4%}")
+        print(f"  {'depth':>5} {'positions':>10} {'produced':>9} {'coverage':>9}")
+        for d in sorted(per_depth):
+            prod, n = per_depth[d]
+            print(f"  {d:>5} {n:>10,} {prod:>9,} {prod / max(1, n):>9.2%}")
+        report["by_depth"][stem] = {
+            "positions": tot, "produced": n_prod,
+            "coverage": round(n_prod / tot, 4),
+            "declined": n_decl,
+            "target_entropy_nats": round(float(ent.mean()), 4),
+            "top1_mass_mean": round(float(firsts.mean()), 4),
+            "top1_equals_gold": round(hit / max(1, n_prod), 4),
+            "per_depth": {str(d): {"produced": v[0], "positions": v[1],
+                                   "coverage": round(v[0] / max(1, v[1]), 4)}
+                          for d, v in sorted(per_depth.items())},
+        }
+        report["reader_stats"][stem] = r.stats()
 
     out = args.out or os.path.join(ROOT, "docs", "results", "mi_report.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as fh:
         json.dump(report, fh, indent=2)
     print(f"\n[report] wrote {out}")
-    print("cross-check against RESULTS.md 2026-03/10 retained mass "
-          "(0.803 / 0.371 / 0.320 at depths 0/1/2)")
+    print("depth 0 is the ONLY depth that yields a target (the paper's Case I,")
+    print("unconditioned); depths >= 1 are declined because one teacher forward")
+    print("pass conditioned on the gold prefix cannot represent byte uncertainty.")
 
 
 if __name__ == "__main__":

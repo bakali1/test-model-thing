@@ -1432,3 +1432,81 @@ uncertainty to be faithful about. The gates, the dump format, the alignment
 contract, the α=0 bit-exactness guarantee, and the KD term's algebra all stand.
 The word "fidelity" in the earlier coverage text is what should have been
 questioned: fidelity to a distribution that does not exist in the target.
+
+---
+
+## Step B — the corrected target is real signal, and the KD arm STILL diverges (2026-10-03)
+
+The one-hot target was fixed first: **depth 0 only, the paper's Case I
+first-byte aggregate, no gold conditioning; depths ≥ 1 declined.** Gate
+`tests/check_mi.py` changed semantics deliberately and now PASSES, including a
+new **tripwire (t6)** that fails if the depth-0 target is one-hot again.
+
+On a real dump (788 kB of TinyStories, B=64, k=32, 129,024 positions):
+
+| | gold-conditioned (old) | Case I (corrected) |
+|---|---:|---:|
+| coverage | 51.7 % (any depth) | **24.00 %** (depth 0 only — 1 byte in 4.17) |
+| target entropy | **0.000000** nats | **0.3282** nats (max 2.74) |
+| top-1 mass | 1.0000 | **0.8794** |
+| top-1 == gold byte | 100.0000 % | **82.1420 %** |
+
+So the corrected target carries genuine uncertainty, and **the teacher disagrees
+with the gold byte on 17.9 % of token starts**. That is real signal — and real
+label conflict.
+
+### The A/B: 2,500 steps, B=64, seed 0, identical byte stream, laptop CPU
+
+| step | CE arm | KD arm (α=0.5, corrected) |
+|---:|---:|---:|
+| 250 | 2.61 | 3.07 (**+0.46**) |
+| 1,000 | 2.48 | 2.95 (**+0.47**) |
+| 1,250 | 2.11 | 2.79 |
+| 1,500 | 2.18 | **27.19** |
+| 1,750 | 2.02 | **148.11** |
+| 2,499 | **1.80** | **860.68** |
+
+**The corrected arm is worse from step 250 and still diverges**, exactly as the
+one-hot arm did — and harder. The control is stable and still improving at
+step 2,499.
+
+### Verdict: the KD arm is CLOSED as specified
+
+Pre-registered criterion from the plan before running: *"If the corrected arm is
+still ≈ CE, or still destabilizes, the answer is that distillation does not help
+TMT at this scale and I stop rather than spend T4 hours confirming it."* It
+destabilized. **No T4 time is spent on the science A/B.**
+
+Two independent target definitions (gold-conditioned one-hot; Case I soft) both
+lose to the control and both diverge, on CPU and on the T4 smoke. So the failure
+is not the one-hot bug — that was real but not the cause.
+
+**Best current explanation (a hypothesis, not a result).** The teacher's argmax
+disagrees with the gold byte at 17.9 % of token starts (~4.3 % of all byte
+positions), so CE and KD push in opposite directions on a few percent of
+positions. AdamW's per-parameter second-moment normalisation divides by a *small*
+√v exactly where the two gradients cancel, amplifying the oscillation instead of
+damping it. Consistent with: stable to ~1,000 steps, then exponential blow-up.
+
+Not established: one seed, one α (0.5), one corpus, B=64. This closes **KD as
+specified**, not "distillation can never work here".
+
+### What survives, and is reusable
+
+- the corrected target and its gate: 24 % of byte positions, entropy 0.33 nats,
+  teacher-vs-gold disagreement 17.9 % — the first genuine distillation signal
+  measured in this repo;
+- the depth-0/Case-I reading of the paper, which the earlier implementation had
+  wrong;
+- the dump format, alignment contract, completeness gate, α=0 bit-exactness
+  (max|Δθ| = 0.0), and every gate in `tests/`.
+
+### Recommended next direction
+
+`PLAN-2026-10-04-ROADMAP.md`'s reframe — the standing blocker is gradient SNR
+≈ 0.05, a *gradient-estimator* problem — is now better supported than the
+distillation route, and the rig has just closed the role-specific-LR axis
+(`5f5fe16`). The teacher-disagreement number above is itself evidence for that
+reading: the thing a better teacher supplies is a *better gradient*, and at
+4.5 M parameters with O(1) state there is a hard ceiling on how much of a
+full-context teacher is usable.
