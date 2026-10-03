@@ -245,7 +245,7 @@ Cost of the plan on CPU alone, for a 64 MB slice:
 | step 1 — generate the 64 MB corpus | **37.4** |
 | step 2 — two CE arms | **40.0** |
 | step 3 — dump 64 MB of MI targets | **18.4** |
-| step 3 — KD arm (overhead **unmeasured**, est. +10–30 %) | **20–26** |
+| step 3 — KD arm (**overhead now measured: −0.2 % at B=64, +1.5 % at B=256**; the earlier +10–30 % estimate was 10-20x too high) | **20** |
 | rulers (4 × ~15 min) | 1.0 |
 | **total** | **≈ 117–123 h ≈ 5 days** |
 
@@ -256,6 +256,11 @@ Two constraints make CPU-only worse than the hours suggest:
   A 256 MB slice needs 12 GB and will not fit.
 * **No parallelism.** One 889 B/s process already saturates the 8 cores; two arms
   in parallel each get ~50 %, so wall clock does not improve.
+
+**UPDATE 2026-10-03:** the KD term is nearly free (+1.5 % at B=256), and the
+frozen-config rate is 1,060 B/s rather than 889. A 2,000-step B=1024 smoke is
+**~68 min on CPU** (~35 min dump + ~33 min train). A 16 MB CE+KD A/B with one
+shared dump is **~13 h**, not ~16 h.
 
 **Verdict: CPU-only is ~5 days for the full 64 MB plan and is dominated by
 teacher generation (37 h) plus the two CE control arms (40 h).** Use the T4 for

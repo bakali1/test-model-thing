@@ -1197,3 +1197,43 @@ in the top-32. So the target carries the teacher's *ranking* far more than its
 The `argmax==gold` column in `mi_report.py` is tautological (an all-zero
 backoff target has argmax 0) and is not a correctness check; it is left in only
 as a coverage duplicate and should be dropped before the real run.
+
+---
+
+## KD cost on CPU: measured, and the plan's estimate was 10-20x too high (2026-10-03)
+
+Item 4 (the 2,000-step smoke) is blocked — no GPU. But its CPU cost is now
+measured rather than guessed, because the number the plan carried was an
+estimate: "KD term overhead **unmeasured**, est. +10-30 %" (§9b).
+
+Frozen student (dim 512, L16, fp32), laptop 8-core CPU, identical steps for
+both arms, timed after 10 warmup steps:
+
+| B | α=0 (CE) | α=0.5 (CE+KD) | KD overhead | coverage |
+|---:|---:|---:|---:|---:|
+| 64 | 160.6 ms/step · 399 B/s | 160.2 ms/step · 399 B/s | **−0.2 %** (noise) | 34.4 % |
+| 256 | 299.5 ms/step · 855 B/s | 304.0 ms/step · 842 B/s | **+1.5 %** | 31.6 % |
+| 1024 | 966.4 ms/step · 1,060 B/s | not run (needs a 2.05 MB dump) | ≤ ~2 % expected | — |
+
+**The Marginalize-It target is essentially free next to the model's own step.**
+The reader builds a block of 32 steps at a time, and the MI loop costs
+O(B·k·dmax) ≈ O(1024·32·18) per block, against a step that is already a second
+of 16 layer-norm + SiLU + AdamW passes. The plan's +10–30 % estimate was wrong
+by more than an order of magnitude.
+
+**2,000-step smoke on this laptop CPU:**
+
+| component | cost |
+|---|---:|
+| dump 2.05 MB of corpus at B=1024 (teacher forward, 500 k tokens at 965 B/s) | **~35 min** |
+| 2,000 training steps with KD at 966 ms/step × 1.015 | **~33 min** |
+| **total** | **≈ 68 min** |
+
+The dump must cover ≥2,000 bytes per stream, i.e. **≥2.05 MB of corpus at
+B=1024**; a 200 kB slice makes `make_streams` fall back to contiguous chunks and
+yields 1-byte streams, which fails loudly rather than silently misaligning.
+
+**Re-costed CPU-only science branch** (plan §9b said 16 MB ≈ 16 h, using the old
+889 B/s and the inflated KD overhead): at the measured 1,060 B/s, one 16 MB arm
+is **4.2 h**, so CE control + KD arm + one shared dump = **≈ 13 h**, with
+~32 % KD coverage. That is a genuine option, not just a fallback.
