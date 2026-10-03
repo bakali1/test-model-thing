@@ -388,13 +388,25 @@ if triton is not None:
 class GpuModel:
     """Flat-parameter torch model, 1:1 with numpy_port.Model's params/buffers."""
 
-    def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
+    def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, lr_decay=None,
+                 decay_init=None,
                  device=None, ring_credit="auto", sync_metrics=True,
                  grad_assembly="cat", seed=0, ring_k=None):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
         self.lr = float(lr)
+        # Optional per-ROLE learning rate. `lr_decay` applies ONLY to the 16
+        # per-layer `.decay` slices (512 coords each = 8,192 total = 0.183% of
+        # the 4,481,793 parameters); every other coordinate keeps `lr`. This is
+        # the role-specific-LR axis of the planned factorial, kept separate from
+        # the optimizer axis because its cost is completely different: this one
+        # is RESUMABLE (the AdamW state format is untouched), so arms can branch
+        # off the incumbent in one leg, whereas AdamW->SGD changes the stored
+        # state and forces from-scratch arms with their own LR grid.
+        # None means "one LR everywhere", the historical behaviour.
+        self.lr_decay = None if lr_decay is None else float(lr_decay)
+        self._lr_vec = None
         self.b1, self.b2, self.eps, self.wd = 0.9, 0.999, 1e-8, 0.01
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -857,10 +869,38 @@ class GpuModel:
             m.mul_(self.b1).add_((1.0 - self.b1) * gr)
             v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
             v.sqrt_()
-            th.sub_(self.lr * (m * (1.0 / (1.0 - self.b1 ** t)) /
-                               (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
-                               + self.wd * th))
+            # The learning rate is a per-coordinate VECTOR so a role can be
+            # scaled independently. Filled with exactly float32(self.lr) when
+            # lr_decay is unset, which makes this arithmetically identical to
+            # the old scalar form (a Python float promotes to float32 against a
+            # float32 tensor) -- tests/check_lr_roles.py gates that bit-exactly.
+            lv = self._role_lr_vec()
+            th.sub_(lv * (m * (1.0 / (1.0 - self.b1 ** t)) /
+                          (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
+                          + self.wd * th))
         return loss
+
+    def _role_lr_vec(self):
+        """The per-coordinate learning-rate vector, cached.
+
+        Per-role semantics follow the usual param-group convention: the role's
+        LR scales the WHOLE update bracket for that coordinate, i.e. both the
+        adaptive term and the decoupled weight-decay term. A decay coordinate
+        with `lr_decay=16*lr` therefore also gets 16x the weight decay.
+        """
+        if self._lr_vec is not None:
+            return self._lr_vec
+        n = self.theta.numel()
+        lv = torch.full((n,), self.lr, dtype=F, device=self.device)
+        if self.lr_decay is not None:
+            off = 0
+            for name, shape in self.shapes:
+                k = int(np.prod(shape)) if shape else 1
+                if name.endswith(".decay"):
+                    lv[off:off + k] = self.lr_decay
+                off += k
+        self._lr_vec = lv
+        return lv
 
     # ---------------- persistence / bridging -------------
     def params_dict(self):

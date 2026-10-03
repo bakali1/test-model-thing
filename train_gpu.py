@@ -382,6 +382,13 @@ def main():
                     help="explicit retained-lag count; when set, loading a "
                          "checkpoint with a different stored ring_k fails")
     ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr-decay", type=float, default=None,
+                    help="separate learning rate for the 16 per-layer .decay "
+                         "slices (8,192 coords = 0.183%% of all parameters); "
+                         "everything else keeps --lr. Omitted = one LR "
+                         "everywhere, the historical behaviour. Resumable: the "
+                         "AdamW state format is unchanged, so arms can branch "
+                         "off the incumbent checkpoint")
     ap.add_argument("--decay-init", type=float, default=None)
     ap.add_argument("--from-scratch", action="store_true",
                     help="start at t=0 with a seeded random init; no pull, no "
@@ -475,7 +482,8 @@ def main():
                 keep_k=args.keep_k, tagged=not args.no_tagged,
                 max_steps=args.steps, data_seed=args.data_seed,
                 device=args.device, dim=args.dim, layers=args.layers,
-                ring_k=args.ring_k, lr=args.lr, decay_init=args.decay_init,
+                ring_k=args.ring_k, lr=args.lr, lr_decay=args.lr_decay,
+                decay_init=args.decay_init,
                 ring_credit=args.ring_credit,
                 grad_assembly=args.grad_assembly,
                 sync_metrics=not args.async_metrics,

@@ -7,6 +7,7 @@ bundles/colab_fs_l.py
 bundles/colab_fs_n.py
 bundles/colab_fs_w.py
 bundles/colab_leg.py
+bundles/colab_lr_roles.py
 # eval transcripts cached beside checkpoints (fs_verdict.py); regenerate with
 cache/
 bundles/__pycache__/
