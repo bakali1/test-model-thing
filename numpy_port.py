@@ -254,6 +254,37 @@ class Model:
                 256 * self.dim + 256 + self.dim + 1)
 
     # ---------- inference (single stream, frozen) ----------
+    def observe_stats(self, c):
+        """observe, plus what the sampler knew when it chose the byte.
+
+        The extra fourth value is a dict: the probability the draw assigned
+        to the byte it actually emitted, the pre-temperature entropy of the
+        distribution in bits/byte, and the effective temperature that draw
+        used. This is the only place those three numbers exist -- sample()
+        computes all of them to make the draw and then drops them on the
+        floor -- so asking for them here is free, not a second forward pass.
+
+        They are the difference between "the model misspells" as a thing you
+        read in the output and as a thing you can point at: a byte emitted at
+        p=0.06 was a coin flip with 250 alternatives, and a byte emitted at
+        p=0.9 was not. Cross-entropy averages that distinction away, which is
+        why the reply panel needed a separate instrument for it.
+
+        observe() is a thin wrapper over this and returns exactly what it
+        always did, so Runtime.chat, tools/chat_models.py and the parity gate
+        are untouched.
+        """
+        s = 0  # stream 0 carries persistent memory
+        enc = self.embed[c]
+        x = enc[None, :]
+        for l in self.layers:
+            x, new_state, _, _ = l.forward(enc.reshape(1, -1), x, l.states[s:s + 1])
+            l.states[s:s + 1] = new_state
+        output = (x[0] @ self.Wd.T + self.bd)
+        stop = sigmoid(x[0] @ self.Ws + self.bs)[0]
+        b, p, ent, temp = self.sample_stats(output)
+        return b, stop, x[0], {"p": p, "entropy": ent, "temp": temp}
+
     def observe(self, c):
         """frozen_step, plus the latent and the stop score.
 
@@ -267,21 +298,34 @@ class Model:
         and the one the JEPA loss compares against embed(next byte). It is
         the model's actual prediction and nothing else is.
         """
-        s = 0  # stream 0 carries persistent memory
-        enc = self.embed[c]
-        x = enc[None, :]
-        for l in self.layers:
-            x, new_state, _, _ = l.forward(enc.reshape(1, -1), x, l.states[s:s + 1])
-            l.states[s:s + 1] = new_state
-        output = (x[0] @ self.Wd.T + self.bd)
-        stop = sigmoid(x[0] @ self.Ws + self.bs)[0]
-        return self.sample(output), stop, x[0]
+        # the forward pass itself lives in observe_stats, and only there: a
+        # second copy of it is a parity risk with no benefit, which is the
+        # whole reason this method was split out in the first place
+        b, stop, latent, _ = self.observe_stats(c)
+        return b, stop, latent
 
     def frozen_step(self, c):
         b, stop, _ = self.observe(c)
         return b, stop
 
     def sample(self, output):
+        """One byte, and nothing else. Unchanged contract: this is the draw
+        the generation loop and the offline sampling tool both call."""
+        return self.sample_stats(output)[0]
+
+    def sample_stats(self, output):
+        """The same draw, reporting the three numbers that made it.
+
+        `p` is the probability of the byte that was actually emitted, taken
+        from the TEMPERED distribution -- i.e. the model's confidence as the
+        sampler saw it, not as a greedy read of the logits would see it.
+        `entropy` is measured on the UNTAMPERED distribution, which is where
+        the original sampler measured it and therefore where the temperature
+        feedback term keeps its meaning. `temp` is the effective temperature.
+
+        Sampled once, from one rng call, in the same order as before, so a
+        seed reproduces the same byte sequence this did.
+        """
         probs = np.exp(output - output.max())
         probs /= probs.sum()
         entropy = -(probs * np.log(probs + 1e-8)).sum() / np.log(256.0)
@@ -289,7 +333,8 @@ class Model:
         logits = output / temp
         p = np.exp(logits - logits.max())
         p /= p.sum()
-        return int(rng.choice(256, p=p))
+        b = int(rng.choice(256, p=p))
+        return b, float(p[b]), float(entropy), float(temp)
 
     # ---------- training (B streams in lockstep) ----------
     def step_batch(self, cs, ns, ends):

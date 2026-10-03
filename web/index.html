@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TMT</title>
+<link rel="stylesheet" href="panels.css"></head>
+<body>
+<header>
+  <b>TMT</b><span class="sub" id="hdr"></span>
+  <span class="sub" id="prov"></span>
+  <span class="sp"></span>
+  <span class="note" id="note"></span>
+  <span id="conn" class="conn" title="whether the server is answering" role="status" aria-live="polite"></span>
+  <button id="theme" title="switch between the light and dark palette">Dark</button>
+  <button id="bigger" title="larger text — the instrument labels are 10-11px by default">A+</button>
+  <button id="toggle" aria-expanded="true" aria-controls="mech">Hide panels</button>
+  <button id="reset">New chat</button>
+  <button id="export" disabled title="download this session as JSON — the checkpoint, its digest, and every turn's numbers">Export</button>
+</header>
+
+<div id="split">
+  <div id="grip" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="resize the instrument panels — arrow keys move the divider"></div>
+  <aside id="mech" aria-label="what the model is doing to itself">
+  <div class="mrow">
+    <div class="meter wide" id="m-learn">
+      <div class="mlab"><span>test-time training</span><b id="learn-n">-</b></div>
+      <div class="bar"><div class="fill" id="learn-f"></div></div>
+    </div>
+    <div class="meter" id="m-mem">
+      <div class="mlab"><span>long memory</span><b id="mem-n">-</b></div>
+      <div class="bar"><div class="fill mem" id="mem-f"></div></div>
+    </div>
+    <div class="meter" id="m-snr">
+      <div class="mlab"><span>SNR trunk</span><b id="snr-n">-</b></div>
+      <div class="bar"><div class="fill snr" id="snr-f"></div></div>
+    </div>
+    <div class="meter" id="m-dec">
+      <div class="mlab"><span>SNR decay</span><b id="dec-n">-</b></div>
+      <div class="bar"><div class="fill snr" id="dec-f"></div></div>
+    </div>
+    </div>
+  <div id="xrow" tabindex="0" hidden role="group" aria-label="byte inspector — arrow keys move along the reply, and each panel header shows that byte">
+    <span class="xlab">byte</span><b id="x-i">—</b>
+    <span class="xlab">p</span><b id="x-p">—</b>
+    <span class="xlab">bits</span><b id="x-b">—</b>
+    <span class="xlab">stop</span><b id="x-s">—</b>
+    <span class="xlab">state rms</span><b id="x-r">—</b>
+    <span class="xlab">latent</span><b id="x-l">—</b>
+    <span class="xhint" id="x-hint"></span>
+  </div>
+  <div id="pinrow" hidden>
+    <div class="lhead"><span>pinned exchanges &mdash; the two most recent, compared</span><em id="pinnote"></em></div>
+    <div class="pscroll"><table id="pintab"></table></div>
+  </div>
+  <div id="lrow" hidden>
+    <div class="lhead"><span>the loss while this exchange was fitted &mdash; a step lands every <b id="lchunk">-</b> bytes</span><em id="lnote"></em></div>
+    <canvas id="ltrace" role="img" aria-label="the cross-entropy of each byte of this exchange, in the order it was trained on, so a fall inside one exchange reads as a slope and a step boundary as a jump"></canvas>
+  </div>
+  <div id="mechscroll">
+  <div class="chiplab">
+    <span>long-lived dimensions &mdash; half-life, and whether the state is actually live</span>
+  </div>
+  <div id="chips"></div>
+  <div id="instr">
+    <div class="irow">
+      <div class="ipanel">
+        <div class="ihdr"><span>JEPA latent, PCA to 2D</span><em id="lat-var"></em></div>
+        <canvas id="lat" role="img" aria-label="trajectory of the model's latent vector across the bytes of this reply, projected onto its first two principal components"></canvas>
+      </div>
+      <div class="ipanel">
+        <div class="ihdr"><span>stop head per byte</span><em id="stop-note"></em></div>
+        <canvas id="stop" role="img" aria-label="the stop head's score for each byte of this reply, against the cut-off"></canvas>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel wide">
+        <div class="ihdr"><span>how sure the model was, byte by byte &mdash; the probability it gave the byte it actually wrote</span><em id="conf-note"></em></div>
+        <canvas id="conf" role="img" aria-label="the probability the sampler assigned to each byte of this reply, as a filled trace, with the entropy of the distribution it drew from behind it and a rule at 0.1"></canvas>
+        <div class="ilegend"><span><i class="a"></i>p of the byte written</span><span><i class="d"></i>entropy of the draw</span><span><i class="d"></i>mean p</span><span><i class="w"></i>the 0.1 line</span></div>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel wide">
+        <div class="ihdr"><span>recurrent state RMS per layer, across the reply</span><em id="heat-note"></em></div>
+        <canvas id="heat" role="img" aria-label="the recurrent state's root-mean-square magnitude in each of the sixteen layers, for each byte of this reply"></canvas>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel wide">
+        <div class="ihdr"><span>half-life of every dimension &mdash; all of them, not just the long ones</span><em id="hl-note"></em></div>
+        <div id="hl" class="hl"></div>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel">
+        <div class="ihdr"><span>shape of this reply &mdash; what cross-entropy cannot see</span><em id="deg-note"></em></div>
+        <dl id="deg" class="kv"></dl>
+      </div>
+      <div class="ipanel">
+        <div class="ihdr"><span>where the time went</span><em id="clk-note"></em></div>
+        <dl id="clk" class="kv"></dl>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel wide">
+        <div class="ihdr"><span>signal-to-noise and gradient scale, per layer &mdash; is the decay of any one layer dead?</span><em id="lyr-note"></em></div>
+        <div id="lyr" class="lyr"></div>
+      </div>
+    </div>
+    <div class="irow">
+      <div class="ipanel wide">
+        <div class="ihdr"><span>what this exchange changed</span><em id="delta-note"></em></div>
+        <table id="delta"></table>
+      </div>
+    </div>
+  </div>
+  </div>
+  </aside>
+
+  <section id="chatcol" aria-label="conversation">
+    <div id="mechbar" hidden></div>
+    <div id="log"><div class="wrap"><div id="primebox"></div><div id="thread"></div></div></div>
+
+    <footer>
+      <form id="f">
+        <textarea id="q" rows="1" placeholder="Say something"></textarea>
+        <button id="stopbtn" type="button" hidden title="stop generating (Esc)">Stop</button>
+        <button id="send" type="submit">Send</button>
+      </form>
+      <div class="stat"><span id="stat" role="status" aria-live="polite"></span><span class="hint">Enter to send &middot; Shift+Enter newline &middot; Esc to stop</span></div>
+    </footer>
+  </section>
+</div>
+
+<script src="app.js"></script>
+</body></html>

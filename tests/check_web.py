@@ -181,6 +181,33 @@ def check_prompt():
 
 
 # ------------------------------------------------------------------ 4. http
+def drain(gen):
+    """Run a generator to its end: (the values it yielded, its return value).
+
+    remember() returns its learned record through StopIteration.value, the
+    same way stream() does, so a test that wants either half has to drive it
+    the way the SSE handler does.
+    """
+    out = []
+    try:
+        while True:
+            out.append(next(gen))
+    except StopIteration as stop:
+        return out, stop.value
+
+
+def page_sources():
+    """index.html, panels.css and app.js as one string.
+
+    The page used to be a single inline literal, so a heap of checks below
+    assert against CSS selectors and JS identifiers as though they were all
+    in the same blob -- and they still are, for the purpose of those checks.
+    The split into three files is real for the browser and invisible here.
+    """
+    return "\n".join(serve.web_source(n) for n in
+                     ("index.html", "panels.css", "app.js"))
+
+
 def sse_frames(text):
     """Parse an SSE body the way the page does, and return the payloads."""
     out = []
@@ -221,6 +248,20 @@ def check_http(server_kind, port):
             ok(r.status == 200 and "<title>TMT</title>" in page,
                "GET / serves the page")
             ok("text/event-stream" not in page, "the page is not itself a stream")
+            # the page is three files now, so the document has to actually
+            # reference the other two or the browser gets an unstyled page and
+            # a console full of 404s that look like a routing bug
+            ok('href="panels.css"' in page and 'src="app.js"' in page,
+               "the document links the stylesheet and the script")
+            for asset_path, ctype, needle in (
+                    ("/panels.css", "text/css", "#mechscroll"),
+                    ("/app.js", "text/javascript", "function drawConf")):
+                with urllib.request.urlopen(base + asset_path, timeout=20) as r:
+                    got, got_type = r.read().decode(), r.headers.get(
+                        "Content-Type", "")
+                ok(r.status == 200 and ctype in got_type and needle in got,
+                   f"GET {asset_path} serves {ctype}",
+                   f"{r.status} {got_type}")
 
             with urllib.request.urlopen(base + "/api/state", timeout=20) as r:
                 st = json.loads(r.read())
@@ -274,6 +315,23 @@ def check_http(server_kind, port):
                str(blank[:2]))
             ok(all(len(f["t"]) <= 1 for f in shown),
                "at most one byte per frame")
+            # ---- what the sampler knew about each byte ----
+            # The page underlines a byte the sampler barely believed and
+            # titles it with its probability, so a byte frame without one
+            # would be a panel quietly drawing nothing.
+            ok(all("p" in f for f in t_frames),
+               "every byte frame carries the probability of that byte",
+               str([f for f in t_frames if "p" not in f][:2]))
+            ok(all(isinstance(f["p"], float) and 0.0 <= f["p"] <= 1.0
+                   for f in t_frames),
+               "and it is a probability, not a logit or a rank")
+            # a fresh tiny model is close to uniform over 256, so this also
+            # pins that p belongs to the byte that was WRITTEN and not to the
+            # argmax: a bug that reported the max probability instead would
+            # sit far above 1/256 and fail here rather than on a real reply
+            ok(0 < sum(f["p"] for f in t_frames) / len(t_frames) < 0.25,
+               "an untrained model's mean p is near 1/256",
+               str(sum(f["p"] for f in t_frames) / len(t_frames)))
             ok(any(f.get("note") for f in frames),
                "hitting the cap is reported, not hidden",
                str([f.get("note") for f in frames if f.get("note")]))
@@ -299,6 +357,70 @@ def check_http(server_kind, port):
             ok(np.isfinite(d0["learned"]["ce"]),
                "the CE from those steps is finite",
                str(d0["learned"].get("ce")))
+            # ---- the confidence series on the terminal frame ----
+            c = d0.get("conf")
+            ok(isinstance(c, dict) and len(c.get("p") or []) > 0,
+               "the terminal frame carries the per-byte series",
+               str(type(c)))
+            ok(c["p"] == [f["p"] for f in t_frames][-len(c["p"]):],
+               "the series is the tail of the streamed ones, in order")
+            ok(len(c["p"]) == len(d0["stops"]) == len(d0["heat"]),
+               "p, stops and state heat are index-aligned",
+               f"{len(c['p'])}/{len(d0['stops'])}/{len(d0['heat'])}")
+            ok(all(0.0 <= v <= 1.0 for v in c["h"]),
+               "entropy is reported in bits/byte, on 0..1")
+            ok(all(t > 0 for t in c["t"]), "the effective temperature is positive")
+            ok(c["u"] == serve.UNSURE_P,
+               "the page is told the threshold the server counts with, rather "
+               "than keeping its own copy of the number",
+               str(c.get("u")))
+            # The window is indexed by BYTES. `n` counts only printable ones,
+            # and the page's per-byte index includes the placeholder it draws
+            # for each of the others, so keying the window off `n` puts the
+            # "bytes 0-11 of 12" label on the wrong columns by exactly the
+            # number of non-printable bytes in the reply.
+            ok(c["to"] == d0["n"] + d0["nonprint"],
+               "'to' is the last byte index, counting non-printables too",
+               f"{c['to']} vs {d0['n'] + d0['nonprint']}")
+            ok(c["from"] == c["to"] - len(c["p"]),
+               "'from' is where the plotted window starts")
+            # ---- the training pass reports as it goes ----
+            # remember() is 97% of the turn's wall clock. If these frames stop
+            # arriving the page is a blinking caret again, and only a test can
+            # notice, because the pass still completes either way.
+            train = [f["train"] for f in frames if "train" in f]
+            ok(train, "the training pass reports progress", str(len(train)))
+            ok([t["i"] for t in train] == sorted(t["i"] for t in train),
+               "progress only moves forward")
+            ok(train[-1]["i"] == train[-1]["total"],
+               "the last frame is the last byte, so the bar cannot stop short",
+               f"{train[-1]['i']}/{train[-1]['total']}")
+            ok(len(train) > 3, "and it reports more than once for a short "
+                              "exchange", str(len(train)))
+            ok(all(t["ce"] is not None for t in train),
+               "every progress frame carries a ce")
+            ok(all("elapsed" in t and t["elapsed"] >= 0 for t in train),
+               "and the elapsed seconds, so the cost of the pass is visible")
+            # the frames have to arrive BETWEEN the reply finishing and the
+            # terminal frame, or the page has nothing to draw them into
+            order = [k for k, f in enumerate(frames)
+                     if "learning" in f or "train" in f or f.get("done")]
+            kinds = ["learning" if "learning" in frames[i]
+                     else ("done" if frames[i].get("done") else "train")
+                     for i in order]
+            ok(kinds[0] == "learning" and kinds[-1] == "done"
+               and set(kinds[1:-1]) == {"train"},
+               "the order is: reply done, then progress, then the terminal "
+               "frame", str(kinds[:3] + ["..."] + kinds[-2:]))
+            # and the trace the loss panel draws is the per-byte record of the
+            # same pass, not a summary of it
+            ok(L_trace := (d0["learned"].get("trace") or []),
+               "the learned record keeps the per-byte loss trace")
+            ok(len(L_trace) == d0["learned"]["bytes"],
+               "one point per byte fitted",
+               f"{len(L_trace)} vs {d0['learned']['bytes']}")
+            ok("trace_from" in d0["learned"],
+               "and says where the kept window starts, when it is capped")
 
             # 5. the tagged save discipline
             tags = sorted(f for f in os.listdir(d) if "_t" in f and f.endswith(".npz"))
@@ -323,9 +445,10 @@ def check_no_learn():
                            model=m, path=ckpt, learn=False, pending=0, steps=0)
         serve.PRIME = ""
         before = sorted(os.listdir(d))
-        out = serve.remember("hello", "hi", save_every=1)
+        prog, out = drain(serve.remember("hello", "hi", save_every=1))
         after = sorted(os.listdir(d))
         ok(out is None, "remember() is a no-op when learning is off", str(out))
+        ok(prog == [], "and yields no progress frames either", str(prog[:1]))
         ok(before == after, "no file appeared", f"{before} -> {after}")
         ok(serve.learn_state() is None, "learn_state() is None when off")
 
@@ -333,13 +456,24 @@ def check_no_learn():
 # ---------------------------------------------------- 6. router well-formed
 def check_router():
     print("\n[6] route table")
+    # The four mini-AGI routes, plus session export and cancel, plus the two
+    # static assets the page is made of. The API surface is still the same
+    # five endpoints it was -- the assets are not API and are checked apart
+    # below, so a new /api/* route still trips the no-accidents line.
     ok(set(serve.ROUTES) == {("/", "GET"), ("/api/chat", "POST"),
                              ("/api/state", "GET"), ("/api/prime", "GET"),
-                             ("/api/session", "GET"), ("/api/cancel", "POST")},
-       "mini-AGI's four routes, plus session export and cancel",
+                             ("/api/session", "GET"), ("/api/cancel", "POST"),
+                             ("/app.js", "GET"), ("/panels.css", "GET")},
+       "the four API routes, plus the two static assets the page is made of",
        str(sorted(serve.ROUTES)))
     ok(len([k for k in serve.ROUTES if k[0].startswith("/api")]) == 5,
-       "no route was added by accident")
+       "no API route was added by accident")
+    ok(sorted(k for k in serve.ROUTES if k[0].startswith("/api")) ==
+       [("/api/cancel", "POST"), ("/api/chat", "POST"),
+        ("/api/prime", "GET"), ("/api/session", "GET"),
+        ("/api/state", "GET")],
+       "the API surface is still two POSTs and three GETs, unchanged",
+       str(sorted(k for k in serve.ROUTES if k[0].startswith("/api"))))
     status, headers, body = serve.index()
     ok(status == 200 and headers["Content-Type"].startswith("text/html"),
        "the index route declares html")
@@ -518,6 +652,178 @@ def check_cancel_and_session():
 
 
 # ------------------------------- 9. page/server field agreement
+# ------------------------------------------------- 11. the added stats
+def check_new_stats():
+    print("\n[11] half-life histogram, reply shape, per-layer SNR, churn")
+    m = numpy_port.Model(dim=64, layers=3)
+    m.new_states(1)
+
+    # --- the histogram covers EVERY dimension, not the long ones ---
+    h = serve.halflife_histogram(m, 4.0)
+    ok(h["total"] == 3 * 64, "the histogram counts every dimension",
+       f"{h['total']} vs {3*64}")
+    ok(sum(b["n"] for b in h["buckets"]) == h["total"],
+       "the buckets are a partition, so nothing is dropped between them")
+    ok([b["label"] for b in h["buckets"]]
+       == ["<1", "1-2", "2-4", "4-8", "8-16", "16-32", ">32"],
+       "the buckets are the ones RESULTS.md reports in")
+    ok(all(np.isfinite(b["lo"]) for b in h["buckets"]),
+       "no bucket boundary is inf or nan")
+    ok(h["n_long"] == 0, "at init nothing is long-lived, as documented",
+       str(h["n_long"]))
+    ok(h["buckets"][0]["n"] + h["buckets"][1]["n"] == h["total"],
+       "every dim sits at or below one byte of half-life at init")
+    m.layers[2].decay[0] = 8.0
+    h2 = serve.halflife_histogram(m, 4.0)
+    top = h2["buckets"][-1]
+    ok(top["n"] == 1, "a dim pinned to a long half-life reaches >32",
+       str(top["n"]))
+    ok(h2["n_long"] == 1, "and is counted as long-lived", str(h2["n_long"]))
+    ok(np.isfinite(top["bytes"]) and top["bytes"] > 100,
+       "a decay of 8 gives a half-life of hundreds of bytes",
+       str(top["bytes"]))
+    # the sub-byte bucket's mean must not be rounded to a whole byte: 0.8B
+    # displayed as "0B" says these dims hold nothing, which is the opposite
+    # of the truth, and it is exactly the defect class this project keeps
+    # hitting -- a number that does not mean what it appears to mean
+    sub = h2["buckets"][0]
+    ok(sub["n"] == 0 or (sub["bytes"] is None or sub["bytes"] != 0),
+       "a bucket of sub-byte half-lives is never reported as 0 bytes",
+       str(sub))
+    ok(h2["buckets"][1]["bytes"] is not None
+       and isinstance(h2["buckets"][1]["bytes"], float),
+       "bucket means are floats, so a fractional byte survives",
+       str(type(h2["buckets"][1]["bytes"])))
+    # sigma == 1 exactly (a saturated decay) must not produce inf or nan, and
+    # must not drop the dim out of the partition
+    m.layers[1].decay[3] = 1e9
+    h3 = serve.halflife_histogram(m, 4.0)
+    ok(sum(b["n"] for b in h3["buckets"]) == h3["total"],
+       "an effectively-infinite decay still lands in a bucket")
+    ok(np.isfinite(serve._half_lives(m)).all(),
+       "no half-life is inf or nan even at a saturated decay")
+    ok(h3["n_live_long"] <= h3["n_long"],
+       "live cannot exceed long", f"{h3['n_live_long']} vs {h3['n_long']}")
+
+    # --- reply shape: the documented collapse modes are caught ---
+    ok(serve.degeneracy(b"") is None, "an empty reply has no shape")
+    ok(serve.degeneracy(b"a") is None, "nor does a single byte")
+    nl = serve.degeneracy(b"\n" * 16)
+    ok(nl["max_newlines"] == 16, "a 16-newline run is measured",
+       str(nl["max_newlines"]))
+    ok(nl["degenerate"],
+       "and flagged -- RESULTS.md's FS-N mode is invisible to CE")
+    ok(nl["max_run"] == 16, "the longest byte run is the newlines")
+    rep = serve.degeneracy(b"the " * 40)
+    ok(rep["unique"] == 4, "unique bytes are counted", str(rep["unique"]))
+    ok(rep["repeat"] > 0.9, "a strictly repeating block reads as repeats",
+       str(rep["repeat"]))
+    ok(rep["degenerate"],
+       "and is flagged: four distinct bytes over 160 is a loop")
+    # a long run of DISTINCT bytes is not a loop, however many there are, and
+    # must not be flagged -- the flag has to mean something
+    ran = serve.degeneracy(bytes(range(64)) * 3)
+    ok(ran["unique"] == 64 and ran["max_run"] == 1,
+       "a cycling run of 64 distinct bytes has no run at all",
+       str(ran["max_run"]))
+    prose = serve.degeneracy(b"The quick brown fox jumps over the lazy dog. "
+                             b"It was the best of times, it was the worst "
+                             b"of times, it was the age of wisdom.")
+    ok(not prose["degenerate"], "prose is not called degenerate",
+       str(prose))
+    ok(0.0 <= prose["repeat"] <= 1.0, "repeat is a fraction",
+       str(prose["repeat"]))
+    ok(0.0 < prose["entropy"] <= 8.0,
+       "entropy is bits per byte, so it cannot exceed 8",
+       str(prose["entropy"]))
+    ok(abs(serve.degeneracy(b"a" * 100)["entropy"]) < 1e-9,
+       "one repeated byte is 0 bits of entropy")
+
+    # --- per-layer SNR and the gradient magnitude that used to be dropped ---
+    for _ in range(25):
+        m.step_batch([65], [32], [False])
+    serve.STATE.update(ema=None, snr=None, gmean=None, steps=25)
+    serve.update_snr(m)
+    s = serve.snr_state()
+    ok(len(s["layers"]) == m.layercount, "one SNR row per layer",
+       str(len(s["layers"])))
+    ok([r["layer"] for r in s["layers"]] == list(range(m.layercount)),
+       "the rows are in layer order")
+    for r in s["layers"]:
+        ok(0.0 <= r["snr"] <= 1.0, f"layer {r['layer']} SNR in [0,1]")
+        ok(r["gmean"] >= 0.0, f"layer {r['layer']} |g| is not negative")
+        ok(r["dsnr"] >= 0.0, f"layer {r['layer']} decay SNR exists")
+    ok(all(r["gmean"] > 0 for r in s["layers"]),
+       "every layer has a non-zero gradient, so |g| is really read")
+    ok(s["trunk_g"] > 0 and s["decay_g"] > 0,
+       "the role gradients carry a magnitude too")
+    ok(s["warm"] is False and s["steps"] == 25,
+       "25 steps is past the warm-up, so the reading is comparable")
+    serve.STATE.update(steps=1)
+    ok(serve.snr_state()["warm"] is True,
+       "one step is still warm, because one sample is always 0.1")
+    serve.STATE.update(steps=25)
+
+    # --- group cache: per-layer groups must sit inside the buffer ---
+    g = serve.model_groups(m)
+    ok(len(g["per_layer"]) == m.layercount, "one group per layer",
+       str(len(g["per_layer"])))
+    ok(sum(v.size for v in g["per_layer"].values()) <= m.grads.size,
+       "the per-layer groups are inside the buffer")
+    ok(set(g["per_layer_decay"]) == set(g["per_layer"]),
+       "every layer has its decay indexed too")
+    ok(all(g["per_layer_decay"][k].size == 64
+           for k in g["per_layer_decay"]),
+       "each layer's decay group is one vector of dim")
+    ok(g["decay"].size + g["trunk"].size == m.grads.size,
+       "trunk and decay still partition the buffer")
+
+    # --- churn: the exact-credit set diff ---
+    import tail_credit
+    serve.STATE.update(hot_set=None)
+    m.tail = tail_credit.TailCredit(1, 4)
+    m.tail.cols = {0: np.array([3, 9, 11]), 1: np.array([7])}
+    c = serve.hot_churn(m)
+    ok(c["n"] == 4, "the set size is counted", str(c["n"]))
+    ok(c["entered"] == 0 and c["left"] == 0,
+       "the first look has no baseline, so nothing has entered or left")
+    m.tail.cols = {0: np.array([9, 11, 40]), 1: np.array([7, 13])}
+    c = serve.hot_churn(m)
+    ok(c["entered"] == 2 and c["left"] == 1,
+       "adopted dims enter and dropped dims leave", str(c))
+    m.tail.cols = {0: np.array([9]), 1: np.array([7, 13])}
+    ok(serve.hot_churn(m)["left"] == 2,
+       "two more leaving is counted against the previous look")
+    ok(serve.hot_churn(m)["entered"] == 0,
+       "an unchanged set reports no churn")
+    m.tail = None
+    serve.STATE.update(hot_set=None)
+    ok(serve.hot_churn(m)["n"] == 0, "a model with no tail has no hot set")
+
+    # --- the session clock accumulates rather than reporting one turn ---
+    serve.STATE.update(gen_s_total=0.0, learn_s_total=0.0)
+    serve.STATE["gen_s_total"] += 1.5
+    serve.STATE["learn_s_total"] += 38.5
+    ok(abs(serve.STATE["gen_s_total"] - 1.5) < 1e-9,
+       "generation time accumulates across a session")
+    ok(serve.STATE["learn_s_total"]
+       / (serve.STATE["gen_s_total"] + serve.STATE["learn_s_total"]) > 0.9,
+       "the measured split is ~97% training")
+
+    # --- ce must be labelled as a training reading, not a result ---
+    serve.STATE.update(ce=0.0077, ce_best=None, steps=30)
+    ok(serve.snr_state()["ce"] == 0.0077, "the training ce is carried")
+    page = page_sources()
+    ok("train ce" in page,
+       "the page names it a TRAINING ce, since a low value here is the model "
+       "fitting the text it was just fed, not a held-out measurement")
+    ok("not held out" in page,
+       "and says so in words, because 0.0077 looks like a triumph")
+    ok("0.03" in page,
+       "and quotes the project's noise bar, so a reader knows what 0.0077 "
+       "is being compared against")
+
+
 def check_page_contract():
     """
     The page and the server must agree on field names, statically.
@@ -534,7 +840,8 @@ def check_page_contract():
     """
     print("\n[9] page/server contract")
     import re
-    page = serve.PAGE
+    page = page_sources()
+    js = serve.web_source("app.js")
 
     # the field the server sends vs the ones the page reads
     with tempfile.TemporaryDirectory() as d:
@@ -555,7 +862,7 @@ def check_page_contract():
 
     # every field the server sends must be READ by the page somewhere, or the
     # server grew a field the page silently ignores
-    body = page[page.index("<script>"):]
+    body = js
     unread = [f for f in sent if ("." + f) not in body]
     ok(not unread, "every SNR field the server sends is read by the page",
        str(unread))
@@ -567,6 +874,82 @@ def check_page_contract():
     ok("s.snr" not in body, "the page no longer reads the retired s.snr field")
     ok(re.search(r"\bs\.snr\b", body) is None,
        "and not in any form, so a future rename cannot reintroduce it")
+
+    # ---- the composer has three states, and a stop affordance that reaches
+    # all of them. Esc alone is a keyboard affordance, and this page gets
+    # opened on phones.
+    ok('id="stopbtn"' in page, "there is a stop button, not just an Esc key")
+    ok("$('stopbtn').onclick = stopTurn" in body,
+       "and it calls the same function Esc does, so the two cannot diverge")
+    ok("function stopTurn" in body and body.count("function stopTurn") == 1,
+       "there is exactly one stop implementation")
+    ok("CUR.learning" in body and "'Training…'" in body,
+       "and it says why it cannot be pressed during the training pass")
+
+    # ---- ids. A duplicated id is silent: $('stop') returns the FIRST match,
+    # so a button that shares an id with a canvas takes the canvas's place and
+    # the button does nothing at all, with no error anywhere. This is the
+    # cheapest possible check against the whole class.
+    html = serve.web_source("index.html")
+    all_ids = re.findall(r'\bid="([^"]+)"', html + "\n" + js)
+    dupes = sorted({i for i in all_ids if all_ids.count(i) > 1})
+    ok(not dupes, "no id appears twice in the page", str(dupes))
+    # every element the script reaches for has to exist. Ids the script
+    # creates itself count, which is why the script is searched too.
+    known = set(all_ids)
+    used = set(re.findall(r"\$\('([^']+)'\)", js))
+    ok(not sorted(used - known),
+       "every element the script looks up exists in the page",
+       str(sorted(used - known)))
+    # ---- the connection pill, because "the model is thinking" and "the
+    # server is gone" look identical from the other side of a dead socket
+    ok('id="conn"' in page and "server unreachable" in body,
+       "a dropped server is reported as such, not as a slow model")
+    ok("connWrap" in body and body.count("connWrap(") >= 3,
+       "and every request reports through it, so it cannot claim to be "
+       "connected while the last call failed")
+    # ---- seed prompts and per-message copy
+    ok("const SEEDS" in body and "class=\"seeds\"" in page,
+       "the empty state offers prompts that make the model do something")
+    ok("copyText" in body and "execCommand" in body,
+       "copy has a fallback, because clipboard needs a secure context and "
+       "this page is opened on LAN addresses")
+    # "ask again" must not be called regenerate: the model has been trained on
+    # the exchange, so a second answer is a different state, not a resample
+    ok("b.textContent = 'ask again'" in body
+       and "'regenerate'" not in body and '"regenerate"' not in body,
+       "the retry is not named as a resample, because it is not one")
+
+    # ---- the A/B comparison
+    ok("while (PINS.length > 2) PINS.shift()" in body,
+       "the pin tray holds two, and drops the oldest past that")
+    ok("LAST.pin" not in body,
+       "a pin record belongs to its own message, not to one global slot -- a "
+       "global would file the newest turn's numbers under an older message")
+    ok("offerAgain(msgEl, CUR.prompt || '', rec)" in body,
+       "and each message is handed the record built from its own turn")
+    # a difference against a value that was never measured must not be
+    # printed: that is how a comparison claims a change nobody observed
+    ok("if (kind !== 'text' && a != null && b != null)" in body,
+       "no difference is printed unless both sides have the number")
+    ok("return '—'" in body,
+       "and a missing number prints as a dash, not as a zero")
+
+    # ---- the byte cursor: one control, not one per canvas
+    ok('id="xrow"' in page and 'tabindex="0"' in page,
+       "the byte inspector is one focusable control")
+    ok("ArrowRight" in body and "ArrowLeft" in body,
+       "and the arrow keys move it along the reply")
+    ok("e.stopPropagation()" in body,
+       "Esc inside it does not also stop a running turn")
+    # it has to be drawn on the per-byte panels, and those are the three that
+    # share a byte axis; the latent has none, so it gets a ring instead
+    ok(body.count("cursor(g,") >= 3,
+       "the cursor is drawn on the byte-axis panels")
+    ok("pts[mark]" in body,
+       "and ringed on the latent, which has no byte axis to draw a line on")
+    ok("dataset.i" in body and "data-i" in body,
+       "hovering a byte in the reply itself moves the same cursor")
 
     # the SNR branch must not produce the literal string 'undefined' for any
     # field the server can send
@@ -674,15 +1057,31 @@ def check_page_contract():
     ok('id="prov"' in page, "and there is an element to render it into")
 
     # accessibility: the panels are the content
-    ok(page.count('<canvas') == 3, "there are three canvases",
-       str(page.count('<canvas')))
-    ok(page.count('role="img"') == 3,
-       "all three expose a role", str(page.count('role="img"')))
-    # three canvas labels plus two landmark labels, so the count is 5; what
-    # matters is that every CANVAS has one, not that the total is a number
-    ok(len(re.findall(r'<canvas[^>]*aria-label=', page)) == 3,
-       "each canvas carries a label",
-       str(len(re.findall(r'<canvas[^>]*aria-label=', page))))
+    canvases = re.findall(r'<canvas[^>]*>', page)
+    ok(len(canvases) >= 3, "the instrument panels are canvases",
+       str(len(canvases)))
+    # What matters is that EVERY canvas has a role and a label, and not that
+    # the total comes to a particular number: a count is a test that a new
+    # panel fails until someone remembers to edit it, which is a test that
+    # gets deleted instead of satisfied. The per-canvas form cannot be passed
+    # by adding a plot and forgetting it.
+    ok(all('role="img"' in c for c in canvases),
+       "every canvas exposes a role",
+       str([c[:44] for c in canvases if 'role="img"' not in c]))
+    ok(all('aria-label=' in c for c in canvases),
+       "every canvas carries a label",
+       str([c[:44] for c in canvases if 'aria-label=' not in c]))
+    # and the label has to say something: an empty aria-label satisfies the
+    # count above and tells a screen reader nothing at all
+    ok(all(len(re.search(r'aria-label="([^"]*)"', c).group(1)) > 20
+           for c in canvases),
+       "no canvas has an empty label",
+       str([c[:44] for c in canvases
+            if len(re.search(r'aria-label="([^"]*)"', c).group(1)) <= 20]))
+    # the confidence panel is a canvas like the rest, and is held to the same
+    # rule rather than being the one that was added without a label
+    ok('id="conf" role="img" aria-label=' in page,
+       "the confidence panel is labelled like the other three")
     # the chips are built in JS, so their label is a setAttribute rather than
     # markup -- counting only the literal attribute would miss it
     ok("setAttribute('aria-label'" in body,
@@ -713,6 +1112,7 @@ if __name__ == "__main__":
         print("\n[4] http — flask server SKIPPED (flask not installed; the "
               "stdlib path is the one this project ships)")
     check_page_contract()
+    check_new_stats()
 
     print()
     if FAIL:

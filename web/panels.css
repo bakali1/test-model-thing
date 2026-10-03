@@ -1,0 +1,351 @@
+  :root{
+    --bg:#ffffff; --fg:#1f2328; --dim:#6b7280; --line:#e5e7eb;
+    --user:#f3f4f6; --accent:#2563eb; --err:#b91c1c;
+    --ok:#15803d; --warn:#b45309; --glow:rgba(37,99,235,.28);
+    --warnbg:rgba(180,83,9,.17);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#21262d;
+           --user:#1c2128; --accent:#58a6ff; --err:#f85149;
+           --ok:#3fb950; --warn:#d29922; --glow:rgba(88,166,255,.30);
+           --warnbg:rgba(210,153,34,.19); }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:0.9375rem/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       display:flex;flex-direction:column}
+  header{border-bottom:1px solid var(--line);padding:10px 16px;
+         display:flex;align-items:center;gap:12px;flex:0 0 auto}
+  header b{font-weight:600}
+  header .sub{color:var(--dim);font-size:0.7500rem}
+  header .sp{flex:1}
+  button{font:inherit;color:var(--fg);background:none;cursor:pointer;
+         border:1px solid var(--line);border-radius:6px;padding:5px 11px}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  #log{flex:1 1 auto;min-height:0;overflow-y:auto;padding:24px 16px}
+  .wrap{max-width:720px;margin:0 auto}
+  .msg{margin:0 0 20px}
+  .who{font-size:0.7500rem;color:var(--dim);margin-bottom:5px}
+  .body{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+  .user .body{background:var(--user);padding:10px 13px;border-radius:10px}
+  .err{color:var(--err)}
+  .caret::after{content:"\258B";color:var(--accent);
+                animation:blink 1s step-end infinite}
+  @keyframes blink{50%{opacity:0}}
+  /* A byte the sampler barely believed, and a byte that is not text at all.
+     Both are marked by line STYLE as well as colour, and both carry their
+     numbers on hover: the placeholder dot standing in for a non-printable
+     byte is close to useless on its own, and its byte value is the entire
+     reason it is shown rather than dropped.
+     A wash, not an underline, for the unsure bytes: on a mid-training model
+     most of a reply is below the threshold, and underlining all of it struck
+     the whole message through and made it unreadable -- the flag then means
+     "this reply is mostly guesses", which the byline and the plot already
+     say, and it stops marking the bytes that are individually surprising.
+     text-decoration rather than a border on the non-printable ones, because a
+     border on an inline span grows the line box and would silently re-space
+     every annotated reply. The per-byte numbers are a hover affordance on
+     purpose -- one aria-label per byte would make a screen reader read four
+     hundred characters, so the aggregate goes in the message's own byline
+     instead (mean p, and how many bytes were unsure). */
+  .body .u{background:var(--warnbg);border-radius:2px}
+  .body .u:hover{text-decoration:underline dotted var(--warn);
+                 text-underline-offset:3px}
+  .body .np{text-decoration:underline dashed var(--dim);opacity:.6}
+  .body span:hover{background:var(--user)}
+  details.prime{border:1px solid var(--line);border-radius:8px;
+                margin:0 0 22px;background:var(--user)}
+  details.prime summary{cursor:pointer;padding:8px 12px;font-size:0.7500rem;
+                        color:var(--dim);list-style:none}
+  details.prime summary::-webkit-details-marker{display:none}
+  details.prime summary::before{content:"\25B8  ";display:inline-block;
+                                transition:transform .15s}
+  details.prime[open] summary::before{transform:rotate(90deg)}
+  details.prime pre{margin:0;padding:0 12px 12px;white-space:pre-wrap;
+                     word-wrap:break-word;overflow-wrap:anywhere;
+                     font-size:0.7500rem;color:var(--dim);max-height:320px;overflow-y:auto}
+  /* Side by side: instruments left, conversation right.
+     This is the layout the panels actually want. Stacked, the instrument
+     block measured 483px on an 800px screen and had to live behind a scroll
+     ceiling, so it was always either cropped or squashing the thread. As a
+     column it gets the full height of the window instead, and the meters stay
+     pinned while only the instruments scroll -- the live numbers are the
+     thing you glance at, the plots are the thing you study. */
+  #split{flex:1 1 auto;min-height:0;display:flex;align-items:stretch}
+  /* the divider. It is a real control and not a decoration: the panels are
+     44% of the window by default and the right number depends on what you are
+     looking at -- a plot, or the conversation. */
+  #grip{flex:0 0 5px;cursor:col-resize;background:transparent;
+        position:relative;margin:0 -2px;z-index:2;touch-action:none}
+  #grip::after{content:"";position:absolute;inset:0 2px;
+               background:transparent;transition:background .15s}
+  #grip:hover::after,#grip:focus-visible::after,#grip.drag::after{
+               background:var(--accent)}
+  #grip:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  /* Text size. The panel labels are 10-11px, which is small on a laptop and
+     unusable on a projector; this scales the whole page rather than patching
+     individual selectors, so a new panel inherits the setting. */
+  /* The size control scales the ROOT, and every text size on the page is in
+     rem, so this one line moves the header, the conversation and all seven
+     instrument panels together. Widths, heights and paddings stay in px on
+     purpose: a 5px meter bar is a meter bar, and scaling it would change
+     what it appears to measure. */
+  html{font-size:16px}
+  html[data-size="2"]{font-size:18.5px}
+  html[data-size="3"]{font-size:21px}
+  /* a light/dark switch, independent of the OS setting: the panels are read
+     for hours, and some people read a dark page in a bright room all day */
+  body[data-theme="light"]{--bg:#ffffff; --fg:#1f2328; --dim:#6b7280;
+                           --line:#e5e7eb; --user:#f3f4f6; --accent:#2563eb;
+                           --err:#b91c1c; --ok:#15803d; --warn:#b45309;
+                           --glow:rgba(37,99,235,.28);
+                           --warnbg:rgba(180,83,9,.17)}
+  body[data-theme="dark"]{--bg:#0d1117; --fg:#e6edf3; --dim:#8b949e;
+                          --line:#21262d; --user:#1c2128; --accent:#58a6ff;
+                          --err:#f85149; --ok:#3fb950; --warn:#d29922;
+                          --glow:rgba(88,166,255,.30);
+                          --warnbg:rgba(210,153,34,.19)}
+  /* per-panel collapse. Seven always-open panels is a long scroll to reach the
+     fifth, and the panels you did not come for are the ones in the way. */
+  .ipanel>h2,.ipanel>.ihdr{cursor:default}
+  .icol{font-size:0.6250rem;color:var(--dim);border:1px solid var(--line);
+        border-radius:5px;padding:0 5px;line-height:1.5;flex:0 0 auto}
+  .icol:hover{color:var(--accent);border-color:var(--accent)}
+  .irow.folded{display:none}
+  #mech{flex:0 0 clamp(330px, 44%, 660px);min-width:0;
+        border-right:1px solid var(--line);padding:9px 16px 10px;
+        display:flex;flex-direction:column;overflow:hidden}
+  #mechscroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
+  #mech.collapsed{display:none}
+  /* When the panels are folded, the conversation takes the whole width. */
+  /* When folded, a one-line strip keeps the headline numbers visible, so
+     folding the panels away does not mean losing the state of the model. */
+  #mechbar{border-bottom:1px solid var(--line);padding:6px 16px;flex:0 0 auto;
+           font-size:0.6875rem;color:var(--dim);display:flex;gap:16px;
+           flex-wrap:wrap;font-variant-numeric:tabular-nums}
+  #mechbar b{color:var(--fg);font-weight:600}
+  #mechbar[hidden]{display:none}
+  #chatcol{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
+  .mrow{flex:0 0 auto;display:grid;
+        /* 2x2 rather than a flex row: at 563px four meters wrapped 3+1, which
+           reads as a layout accident. A grid is 2+2 at every column width. */
+        grid-template-columns:1fr 1fr;gap:9px 18px;align-items:center}
+  .meter{min-width:0}
+  /* The training meter spans the row while a pass is running: it is the one
+     thing happening on the page, and a progress bar for it belongs where the
+     eye already goes for "how is training going". */
+  .meter.wide{grid-column:1/-1}
+  /* the loss trace: only present once an exchange has been fitted */
+  #lrow{flex:0 0 auto;padding:2px 0 8px}
+  #lrow[hidden]{display:none}
+  .lhead{font-size:0.6250rem;color:var(--dim);margin-bottom:4px;
+         display:flex;justify-content:space-between;gap:10px;
+         align-items:flex-start}
+  .lhead b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+  .lhead em{font-style:normal;color:var(--fg);opacity:.7;
+            font-variant-numeric:tabular-nums}
+  canvas#ltrace{height:56px}
+  /* the pinned-exchange comparison. A table, not a set of meters: the whole
+     point is two numbers side by side with their difference, and two meters
+     side by side is a comparison the reader has to do in their head. */
+  #pinrow{flex:0 0 auto;padding:2px 0 8px}
+  /* Nineteen rows of comparison is a table, and a table that can grow without
+     bound will push every actual instrument off the top of a 900px window.
+     The comparison is worth the space; it is not worth more than this. */
+  #pinrow .pscroll{max-height:min(38vh,340px);overflow-y:auto;
+                   overscroll-behavior:contain}
+  #pinrow[hidden]{display:none}
+  table#pintab{width:100%;border-collapse:collapse;
+               font-variant-numeric:tabular-nums;
+               font:0.6875rem/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+  table#pintab th{text-align:right;font-weight:600;color:var(--dim);
+                  padding:2px 0 3px 8px;font-size:0.6250rem;
+                  text-transform:uppercase;letter-spacing:.03em}
+  table#pintab th:first-child{text-align:left;padding-left:0}
+  table#pintab td{padding:1.5px 0 1.5px 8px;text-align:right;
+                  border-top:1px solid var(--line);white-space:nowrap}
+  table#pintab td:first-child{text-align:left;padding-left:0;color:var(--dim);
+                              font-family:-apple-system,BlinkMacSystemFont,
+                              "Segoe UI",Roboto,sans-serif}
+  table#pintab td.d{color:var(--dim)}
+  /* a difference is only interesting if it is signed and non-zero, so a
+     difference of exactly zero is dimmed rather than coloured */
+  table#pintab td.d.up{color:var(--ok)}
+  table#pintab td.d.dn{color:var(--err)}
+  .clearpin{font-size:0.6250rem;padding:1px 6px;margin-left:6px}
+  /* the byte inspector: one focusable strip that owns the cursor over every
+     per-byte panel, rather than four focusable canvases that each mean the
+     same thing. Arrow keys move it; the value is announced. */
+  #xrow{flex:0 0 auto;display:flex;align-items:baseline;gap:4px 8px;
+        flex-wrap:wrap;padding:4px 0 7px;font-size:0.6250rem;
+        font-variant-numeric:tabular-nums;
+        font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  #xrow[hidden]{display:none}
+  #xrow:focus{outline:2px solid var(--accent);outline-offset:3px;
+              border-radius:3px}
+  .xlab{color:var(--dim)}
+  #xrow b{font-weight:600;color:var(--fg)}
+  .xhint{color:var(--dim);margin-left:auto}
+  /* a byte under the cursor, in the reply itself */
+  .body span.sel{background:var(--user);border-radius:2px}
+  .mlab{font-size:0.6875rem;color:var(--dim);display:flex;
+        justify-content:space-between;align-items:baseline;gap:8px;
+        margin-bottom:4px;white-space:nowrap}
+  .mlab span{overflow:hidden;text-overflow:ellipsis}
+  .mlab b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;
+          white-space:nowrap;flex:0 0 auto}
+  .bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden}
+  .fill{height:100%;width:0;border-radius:3px;background:var(--accent);
+        transition:width .18s linear}
+  .fill.mem{background:var(--ok)}
+  .fill.snr{background:var(--warn)}
+  @keyframes flare{0%{transform:scale(1);box-shadow:0 0 0 0 var(--glow)}
+                   40%{transform:scale(1.03);box-shadow:0 0 0 7px transparent}
+                   100%{transform:scale(1);box-shadow:0 0 0 0 transparent}}
+  .fired{animation:flare .75s ease-out}
+  .note{font-size:0.6875rem;color:var(--ok);opacity:0;transition:opacity .2s;
+        white-space:nowrap}
+  .note.on{opacity:1}
+  .note.swap{color:var(--accent)}
+  #chips{display:flex;flex-wrap:wrap;gap:3px;margin-top:5px}
+  .chip{font:0.625rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+        padding:1px 5px;border-radius:3px;border:1px solid var(--line);
+        color:var(--dim);transition:background .3s,color .3s,border-color .3s}
+  .chip.live{color:var(--ok);border-color:var(--ok)}
+  .chip.new{background:var(--accent);border-color:var(--accent);color:#fff}
+  .chiplab{font-size:0.6250rem;color:var(--dim);margin:7px 0 0;
+           display:flex;justify-content:space-between;gap:12px;
+           align-items:baseline}
+  /* the instrument panels */
+  #instr{max-width:720px}
+  .irow{display:flex;gap:18px;flex-wrap:wrap;margin-top:13px}
+  .ipanel{flex:1 1 186px;min-width:168px}
+  .ipanel.wide{flex:1 1 100%}
+
+  /* half-life histogram: seven rows, each a bar with its own counts. Bars are
+     drawn in CSS rather than on a canvas because the counts are text and text
+     belongs to the DOM -- a canvas would have to fake it and would drop out
+     of both the accessibility tree and the zoom path. Widths are percentages
+     of the largest bucket, so the tallest bar is always full width. */
+  .hl{display:flex;flex-direction:column;gap:2px;margin-top:3px}
+  .hlrow{display:grid;grid-template-columns:48px 1fr 50px 56px;align-items:center;
+         gap:7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.6875rem;line-height:16px}
+  .hlrow .lab{color:var(--dim);text-align:right;white-space:nowrap}
+  .hlbar{height:9px;background:var(--line);border-radius:2px;overflow:hidden;display:block}
+  .hlbar i{display:block;height:100%;background:var(--accent);border-radius:2px}
+  .hlrow.long .hlbar i{background:var(--warn)}
+  .hlrow.dim .lab,.hlrow.dim .n,.hlrow.dim .live{color:var(--dim)}
+  .hlrow .n{text-align:right;color:var(--fg)}
+  .hlrow .live{color:var(--dim);text-align:right;white-space:nowrap}
+
+  /* key/value rows: the reply-shape and clock panels */
+  .kv{display:grid;grid-template-columns:1fr auto;gap:1px 10px;margin:3px 0 0;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.6875rem;line-height:17px}
+  .kv dt{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .kv dd{margin:0;text-align:right;color:var(--fg)}
+  .kv dd.flag{color:var(--warn)}
+  .kv .empty{grid-column:1/-1;color:var(--dim)}
+
+  /* per-layer SNR table: 16 rows would make the column very tall, so two
+     columns of 8 side by side, which fits the panel width exactly */
+  .lyr{display:grid;grid-template-columns:1fr 1fr;gap:0 20px;margin-top:3px;
+       font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.6875rem;line-height:16px}
+  .lyrhd{color:var(--dim);grid-column:1/-1;display:grid;
+         grid-template-columns:34px 1fr 1fr 1fr;gap:6px;padding-bottom:2px}
+  .lyrhd span:not(:first-child){text-align:right}
+  .lyrrow{display:grid;grid-template-columns:34px 1fr 1fr 1fr;gap:6px}
+  .lyrrow span:not(:first-child){text-align:right}
+  .lyrrow .lid{color:var(--dim)}
+  .lyrrow .dead{color:var(--dim)}
+  .ihdr{font-size:0.6250rem;color:var(--dim);margin-bottom:5px;
+        display:flex;justify-content:space-between;gap:10px;
+        /* top, not baseline: a panel note that wraps onto a second line
+           otherwise drags the fold button down beside its last line */
+        align-items:flex-start}
+  .ihdr em{font-style:normal;color:var(--fg);opacity:.7}
+  /* Explicit CSS heights, not width:100%/height:auto on a canvas with no
+     intrinsic size -- which is what dropping the width/height attributes for
+     the a11y labels left behind, so every plot settled on the 300x150 default
+     ratio blown up to the column width and ate the whole column. A plot's
+     height is a decision, not a side effect of having no intrinsic size. */
+  canvas{display:block;width:100%;height:150px;border:1px solid var(--line);
+         border-radius:6px;background:var(--bg)}
+  canvas#heat{height:178px}
+  /* a key for the traces, in line styles as well as colour */
+  .ilegend{font-size:0.6250rem;color:var(--dim);margin-top:5px;display:flex;
+           flex-wrap:wrap;gap:3px 14px}
+  .ilegend i{display:inline-block;width:15px;height:0;border-top:2px solid;
+             vertical-align:middle;margin-right:5px}
+  .ilegend .a{border-color:var(--accent)}
+  .ilegend .d{border-color:var(--dim);border-top-style:dashed}
+  .ilegend .w{border-color:var(--warn);border-top-style:dotted}
+  table#delta{width:100%;border-collapse:collapse;font-size:0.6875rem;margin-top:2px}
+  table#delta th{text-align:left;font-weight:600;color:var(--dim);
+                 padding:2px 10px 4px 0;font-size:0.6250rem;text-transform:uppercase;
+                 letter-spacing:.03em}
+  table#delta td{padding:3px 10px 3px 0;color:var(--fg);
+                 font-variant-numeric:tabular-nums;
+                 border-top:1px solid var(--line)}
+  table#delta td.n{color:var(--dim);text-align:right}
+  table#delta td.r{text-align:right}
+  table#delta tr.hl td{color:var(--warn);font-weight:600}
+  .empty{color:var(--dim);text-align:center;margin-top:18vh;line-height:1.9}
+  .empty code{background:var(--user);padding:2px 6px;border-radius:4px;
+              font-size:0.8125rem}
+  /* Narrow, or a short window: the side-by-side is not worth more than the
+     conversation, so go back to stacked -- instruments first, capped, and the
+     thread keeps the majority of what is left. */
+  @media (max-width:900px), (max-height:560px){
+    #split{flex-direction:column}
+    #mech{flex:0 0 auto;max-height:min(46vh,430px);width:auto;
+          border-right:none;border-bottom:1px solid var(--line)}
+    #mechscroll{max-height:inherit}
+    #chatcol{flex:1 1 auto;min-height:0}
+  }
+  footer{border-top:1px solid var(--line);padding:12px 16px;flex:0 0 auto}
+  form{max-width:720px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
+  textarea{flex:1;resize:none;font:inherit;color:var(--fg);
+           background:var(--bg);border:1px solid var(--line);
+           border-radius:9px;padding:10px 12px;max-height:180px;overflow-y:auto}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .stat{max-width:720px;margin:7px auto 0;font-size:0.7500rem;color:var(--dim);
+        height:16px;display:flex;justify-content:space-between;gap:12px}
+  .hint{color:var(--dim);white-space:nowrap}
+  button[disabled]{opacity:.4;cursor:default}
+  button[disabled]:hover{border-color:var(--line);color:var(--fg)}
+  button[hidden]{display:none}
+  /* connection state. A dot and a word, never the dot alone: colour is the
+     one signal a page like this cannot rely on, and "the server is gone" is
+     the single most confusing thing that can happen here. */
+  .conn{font-size:0.6875rem;color:var(--dim);display:flex;align-items:center;gap:5px;
+        font-variant-numeric:tabular-nums}
+  .conn::before{content:"";width:7px;height:7px;border-radius:50%;
+                background:var(--line);flex:0 0 auto}
+  .conn.ok::before{background:var(--ok)}
+  .conn.bad::before{background:var(--err)}
+  .conn.bad{color:var(--err)}
+  /* the per-message actions. Small, and out of the way until the message is
+     hovered or focused, because a row of buttons under every reply turns the
+     thread into a form. Focus-within keeps them reachable by keyboard. */
+  .acts{display:flex;gap:4px;margin-top:5px;opacity:0;transition:opacity .15s}
+  .msg:hover .acts,.msg:focus-within .acts{opacity:1}
+  .acts button{font-size:0.6250rem;padding:2px 7px;border-radius:5px;
+               color:var(--dim)}
+  .acts button:hover{color:var(--accent);border-color:var(--accent)}
+  /* seed prompts on the empty state: three things that show the model doing
+     something rather than three lines of encouragement */
+  .seeds{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;
+         margin-top:18px}
+  .seeds button{font-size:0.7500rem;padding:4px 10px;border-radius:14px;
+                color:var(--dim)}
+  .seeds button:hover{color:var(--accent);border-color:var(--accent)}
+  .seeds em{font-style:normal;opacity:.65;margin-left:5px;font-size:0.6875rem}
+  /* the caret and the flare are the only motion on the page; both are
+     decorative and both are unreadable as animation */
+  @media (prefers-reduced-motion: reduce){
+    .caret::after{animation:none;opacity:.7}
+    .fired{animation:none}
+    .fill{transition:none}
+    details.prime summary::before{transition:none}
+  }
