@@ -1,0 +1,125 @@
+{
+  "repo": "LiquidAI/LFM2.5-230M-Base",
+  "model": "/home/baku/.cache/tmt-teacher/LFM2.5-230M-Base",
+  "topk": 32,
+  "tokenizer_sha256": "df1d8d5ec5d091b460562ffd545e4a5e91d17d4a0db7ebe733be34ed374377bd",
+  "files": {
+    "data/eval/tinystories_valid.txt": {
+      "bytes": 100000,
+      "tokens": 24356,
+      "bytes_per_token": 4.105764493348661,
+      "ce_nats_per_token": 2.8137133252765087,
+      "ce_nats_per_byte": 0.6852798803710938,
+      "bits_per_byte": 0.9886498850323591,
+      "seconds": 103.4,
+      "tokens_per_second": 235.5,
+      "retention": {
+        "k0": {
+          "n": 6144,
+          "matched_mass_mean": 0.8028977627136862,
+          "matched_mass_p05": 0.07898932255920965,
+          "matched_mass_p01": 0.0025242062962206545,
+          "matched_over_stored_mean": 0.8522741805836223,
+          "stored_mass_mean": 0.9413870698966397,
+          "full_mass_mean": 1.0000144882651512
+        },
+        "k1": {
+          "n": 5441,
+          "matched_mass_mean": 0.37088160175276236,
+          "matched_mass_p05": 0.00032844807719811797,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.38258658400825757,
+          "stored_mass_mean": 0.9373701756008406,
+          "full_mass_mean": 1.0000146862624038
+        },
+        "k2": {
+          "n": 4784,
+          "matched_mass_mean": 0.31976325014008516,
+          "matched_mass_p05": 0.0,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.328730173208174,
+          "stored_mass_mean": 0.9349240355168696,
+          "full_mass_mean": 1.0000148506641986
+        }
+      }
+    },
+    "data/eval/wiki_tinystories_005.txt": {
+      "bytes": 100000,
+      "tokens": 24930,
+      "bytes_per_token": 4.011231448054553,
+      "ce_nats_per_token": 3.024893142814656,
+      "ce_nats_per_byte": 0.7540756115722657,
+      "bits_per_byte": 1.08790114527062,
+      "seconds": 109.2,
+      "tokens_per_second": 228.3,
+      "retention": {
+        "k0": {
+          "n": 6497,
+          "matched_mass_mean": 0.7870060527508709,
+          "matched_mass_p05": 0.06541020316071808,
+          "matched_mass_p01": 0.0005372681433800608,
+          "matched_over_stored_mean": 0.8455412397732766,
+          "stored_mass_mean": 0.9304004076312684,
+          "full_mass_mean": 1.0000163604153731
+        },
+        "k1": {
+          "n": 5719,
+          "matched_mass_mean": 0.35552599158613757,
+          "matched_mass_p05": 0.0,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.369303816069769,
+          "stored_mass_mean": 0.9252127632459658,
+          "full_mass_mean": 1.0000164640764815
+        },
+        "k2": {
+          "n": 5136,
+          "matched_mass_mean": 0.3129376473271135,
+          "matched_mass_p05": 0.0,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.32342970543479815,
+          "stored_mass_mean": 0.9239557093311089,
+          "full_mass_mean": 1.0000164428046932
+        }
+      }
+    },
+    "data/eval_shift/tinystories_v2gpt4_valid.txt": {
+      "bytes": 100000,
+      "tokens": 24756,
+      "bytes_per_token": 4.039424785910486,
+      "ce_nats_per_token": 3.0086221286971697,
+      "ce_nats_per_byte": 0.7447844079589844,
+      "bits_per_byte": 1.0744967718938494,
+      "seconds": 103.2,
+      "tokens_per_second": 239.8,
+      "retention": {
+        "k0": {
+          "n": 6323,
+          "matched_mass_mean": 0.7814263688588688,
+          "matched_mass_p05": 0.07109713177196682,
+          "matched_mass_p01": 0.0012587163642456289,
+          "matched_over_stored_mean": 0.8397173090277784,
+          "stored_mass_mean": 0.9320027001405957,
+          "full_mass_mean": 1.000015793251271
+        },
+        "k1": {
+          "n": 5495,
+          "matched_mass_mean": 0.3269642327323541,
+          "matched_mass_p05": 0.00018794683510350282,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.34080942279773613,
+          "stored_mass_mean": 0.926124261567764,
+          "full_mass_mean": 1.0000160604200112
+        },
+        "k2": {
+          "n": 4965,
+          "matched_mass_mean": 0.2764876041611141,
+          "matched_mass_p05": 0.0,
+          "matched_mass_p01": 0.0,
+          "matched_over_stored_mean": 0.28694163624097485,
+          "stored_mass_mean": 0.9238564350153624,
+          "full_mass_mean": 1.0000161745396985
+        }
+      }
+    }
+  }
+}

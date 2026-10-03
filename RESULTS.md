@@ -790,3 +790,137 @@ entirely on TinyStories. Two consequences, both visible above:
 
 Neither is measured. A multi-domain ruler is the prerequisite for deciding
 whether 400k or 890k is the better checkpoint.
+
+---
+
+## Teacher quality + distillation-target fidelity — LFM2.5-230M-Base (2026-10-03)
+
+Preparation for `docs/plans/PLAN-2026-10-03-DISTILL.md`. Two questions, one CPU
+pass, before any distillation GPU hour is spent. **No distillation has been run
+yet**; everything below is a measurement of the *teacher* and of the fidelity of
+the target a Marginalize-It dump would produce.
+
+### The teacher
+
+| | |
+|---|---|
+| repo | `LiquidAI/LFM2.5-230M-**Base**` (not the instruct/RL sibling) |
+| params | 229,693,184 |
+| architecture | 14 layers = 8 short-conv (`conv_L_cache: 3`) + 6 GQA full-attention, hidden 1024 |
+| vocab | 64,402 ids = 63,893 text + 509 control tokens; 32,768 ctx; 19 T tokens; cutoff mid-2024 |
+| tokenizer | BPE, **`normalizer: null`**, ByteLevel pre-tokenizer, sha256 `df1d8d5ec5d0…` |
+| license | LFM Open License v1.0 (non-OSI) |
+| bytes/token | 4.106 / 4.011 / 4.039 on the three eval files (4.153 on a 2 MB window) |
+
+### Ruler setting (stated because it differs from the CE rows above)
+
+`tools/teacher_eval.py --bytes 100000`, **one** contiguous 100,000-byte window
+per file, fp32, CPU, one forward pass. The CE rows in the tables above are
+`--slices 3 --bytes 20000`. Different windows, so the two are **not** directly
+comparable; the comparison below is a magnitude check, not a verdict.
+
+| file | nats/token | nats/byte | BPB | tok/s |
+|---|---:|---:|---:|---:|
+| `tinystories_valid.txt` | 2.8137 | **0.6853** | 0.9886 | 236 |
+| `wiki_tinystories_005.txt` | 3.0249 | 0.7541 | 1.0879 | 228 |
+| `tinystories_v2gpt4_valid.txt` | 3.0086 | 0.7448 | 1.0745 | 240 |
+
+**The teacher is ~0.49 nats/byte better than TMT on the same file** (TMT 1.1741
+at t=64,747 / 1.1902 at t=94,747; teacher 0.6853). So there is real information
+in the teacher's byte distribution that TMT does not have — the premise of
+distillation holds, and "the teacher is only 230 M" was the right worry to check
+rather than assume. (`causal_conv1d` is absent locally, so the reference
+conv path ran; correctness unaffected, throughput is not a GPU number.)
+
+### GATE 0 — the token→byte contract: PASS
+
+`tests/check_distill.py`, free, CPU, ~10 s. **Exact byte-for-byte
+reconstruction** of all three eval files. Three traps pinned as permanent
+assertions, two of which were found *by the gate during development*:
+
+1. **`tokenizer.decode()` is lossy** — 791 ids return U+FFFD for non-UTF-8 byte
+   tokens (id 604 → `b'\xa1'`). A table built the obvious way silently corrupts
+   1.2 % of the vocabulary's byte targets; it still trains and still lowers the
+   loss.
+2. **`added_tokens` shadow the base BPE vocab** — 507 of 509 added ids also exist
+   in `model.vocab`. My first table builder read `model.vocab` only, which is a
+   real bug that mapped 507 ids to the wrong bytes.
+3. **The post-processor injects BOS**, the literal 15-byte string
+   `<|startoftext|>`. Dump with it disabled or every sequence gains 15 phantom
+   bytes.
+
+Storage math at k=32 (fp16 value + int32 index = 192 B/token, ÷4.106 B/tok):
+**46.8 B per training byte** ⇒ 64 MB slice = 3.0 GB, 256 MB slice = 12.0 GB.
+
+### Retained prefix mass — and why top-32 is NOT the problem
+
+Marginalize-It renormalizes over tokens whose bytes START WITH the gold byte
+prefix. The mass those tokens hold is the target's fidelity. Measured mean mass
+(top-32, `tinystories_valid`, n≈6.1k positions per depth):
+
+| byte depth k | mean matched mass | p05 | fraction < 0.5 |
+|---|---:|---:|---:|
+| 0 (first byte of a token) | 0.803 | 0.079 | 13 % |
+| 1 | 0.371 | 0.0003 | **64 %** |
+| 2 | 0.320 | 0.0000 | **69 %** |
+
+**The k-sweep (4,993 tokens, 20 kB) settles the cause:**
+
+| depth | k=8 | k=32 | k=128 | k=1024 (≈ full vocab) |
+|---|---:|---:|---:|---:|
+| 0 | 0.752 | 0.807 | 0.835 | 0.852 |
+| 1 | 0.367 | **0.374** | 0.376 | 0.377 |
+| 2 | 0.321 | **0.324** | 0.324 | 0.324 |
+
+Going from k=32 to the whole 64 k vocabulary moves depth-1 mass by **0.005** and
+depth-2 by **0.000**. So:
+
+- **top-32 truncation is not the binding constraint** (k=8 is — it costs 5 points
+  at depth 0). Storage at k=32 is justified.
+- **The mass loss is inherent to prefix matching**: at byte depth ≥1 the teacher
+  genuinely puts ~63 % of its mass on tokens that do NOT share the 2-byte
+  prefix — overwhelmingly, on tokens that *end* at that position. That is
+  precisely the EoT case the paper describes, and Marginalize-It discards it.
+
+**Consequence, and it is the most important line in this section:** the MI target
+at depth ≥1 is *not* the teacher's distribution. It is the teacher's
+distribution conditioned on **not ending the token here**, renormalized. At
+~76 % of byte positions (4.1 bytes/token ⇒ 3 of 4 positions are at depth ≥1) and
+64–69 % of those below 0.5 mass, **roughly half of all byte positions carry a
+heavily-reconditioned target.**
+
+That is a *bias*, not just noise: it teaches TMT that tokens run longer than
+they do. It may be benign for a byte model that learns line ends separately via
+its stop head — but it is not the paper's exact conversion, and it must be
+stated wherever a distillation number is quoted.
+
+### New, cheap, mandatory post-hoc diagnostic
+
+If a KD arm trains, measure **word-length drift** on its samples: mean bytes per
+generated word and the rate of premature line-ends vs the CE control. That is the
+direct signature of the bias above, it costs one pass over 250-byte samples, and
+CE cannot see it (the paper's §6.6, and this repo's own 600k caveat).
+
+### Decontamination gate (new; exists because the corpus register = the ruler)
+
+Choosing a teacher-generated corpus in the ruler's register opens a channel the
+FS-W byte-offset trick cannot cover: the teacher was trained on web text that
+likely CONTAINS TinyStories, so it can regurgitate eval stories verbatim.
+`tools/decontaminate.py` widens `fetch_eval_data.prepare()`'s membership set from
+the training glob to **train ∪ eval ∪ shift ∪ novels**. Gated in `check_distill.py`
+t5: a story copied from `tinystories_valid.txt` **is** dropped by the widened set
+and **is not** dropped by the training-only set (the gap being fixed).
+
+**Known limit, demonstrated by the same gate:** the rule is line-exact, so a
+rewrite with the same beats is NOT dropped. TinyStories is heavily templated, so
+**near-paraphrase contamination remains undetectable here.** Generated-corpus CE
+numbers are not comparable to real-corpus rows and carry a caveat at least as
+strong as FS-W's byte-offset caveat.
+
+### Operational
+
+| | |
+|---|---|
+| teacher weights | 459,401,112 B; at **2.5 MiB/s ≈ 3 min** (the `hf_hub_download` xet path stalled twice at exactly 320 MB — resumable `curl -C -` completed it) |
+| implication | HF checkpoint push/pull ≈ 1.5–2 min per 250 MB artifact from this box; the 0.9 GB corpus fetch ≈ 6 min. Neither is a blocker. |
+| local env | `transformers` 5.18.0 + `tokenizers` 0.23.2 added to `.venv` (additive; the engine imports neither). LFM2.5 needs `model_type: lfm2` support. |

@@ -13,6 +13,7 @@ from-scratch experiment).
 | `plans/PLAN-2026-09-23-GPU.md` | the GPU port plan: engine, hub, correctness gate, week-1 order | **current** |
 | `plans/PLAN-2026-09-25.md` | next-day execution plan | **current** (written by the other model) |
 | `plans/PLAN-2026-09-22.md` | the original phase plan | superseded by the GPU plan |
+| `plans/PLAN-2026-10-03-DISTILL.md` | distil an open model into TMT (teacher `LFM2.5-230M-Base`, Marginalize-It, teacher-generated corpus); gate 0 cleared | **current — read before optimizing** |
 | `optimization/OPTIMIZATION_TEST_STATUS.md` | what was measured, what was **not**, what to try next | **current — read before optimizing** |
 | `optimization/GPU_OPTIMIZATION_PLAN.md` | the optimization plan and its measured outcome (§0) | historical + measured |
 | `optimization/GPU_OPTIMIZATION_PLAN-REVIEW.md` | review of that plan | review, closed |
@@ -20,6 +21,7 @@ from-scratch experiment).
 | `runbooks/MORNING-RUNBOOK.md` | how to run the GPU legs | **current** |
 | `runbooks/SCHEDULE.md` | quotas and weekly schedule | **current** |
 | `ideas/ARCHITECTURE_IDEAS.md`, `ideas/ARCHITECTURE_IDEAS2.md` | speculative directions | ideas, not plans |
+| `ideas/papers/README.md`, `ideas/papers/*` | external papers with the notes taken from them, source text beside the notes | ideas, not plans |
 
 ## Reading order
 
@@ -57,12 +59,17 @@ test_tail.py  tmt.npz                              the rolling working checkpoin
 
 tools/     eval.py  eval_npz.py  bench_variants.py        the ruler + benchmark board
            chat_models.py  fs_verdict.py  memory_report.py  sampling + experiment analysis
+           teacher_table.py  teacher_eval.py                 distillation: token->byte table
+           decontaminate.py                                  (zero deps) + teacher quality
+                                                           + eval-copy filter (train u eval)
 bundles/   make_*.py                                       Colab bundle generators
            colab_*.py                                      GENERATED (gitignored)
 legacy/    main.py  main_torch.py  benchmark*.py          the original per-byte line
            smaller-4.5m.safetensors  tinystories_bench.txt
 tests/     check_*.py                                      free CPU gates; run these first
-docs/      INDEX.md  plans/  optimization/  reviews/  runbooks/  ideas/
+           check_distill.py                                GATE 0: exact token->byte map +
+                                                           target fidelity + decontamination
+docs/      INDEX.md  plans/  optimization/  reviews/  runbooks/  ideas/  ideas/papers/
 cache/     cached eval transcripts (gitignored)            lets tables re-render free
 models/    banked + historical checkpoints (gitignored)
 kaggle/    tmt_gpu_train.py                               the Kaggle mirror

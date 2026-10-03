@@ -1,4 +1,7 @@
 archive/
+# teacher tokenizer cache (tools/teacher_table.py); 4.7 MB per teacher, and the
+# digest that matters is printed by tests/check_distill.py, not the file
+.cache/
 bundles/colab_bench.py
 bundles/colab_fs_l.py
 bundles/colab_fs_n.py
