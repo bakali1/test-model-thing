@@ -95,52 +95,46 @@ mechanism) alive; the teacher only informs the byte decoder.
 
 ## 4. Sequence
 
-### Step 1 — teacher-generated, prefix-conditioned corpus (~20 min GPU)
+### Step 1 — ~~teacher-generated corpus~~ **WITHDRAWN 2026-10-03**
 
-`tools/gen_teacher_corpus.py`: seed each generation with a **real corpus
-prefix**, keep the teacher's continuation. Prompts, seed and per-part sha256
-recorded in a manifest. Register: TinyStories-style children's prose, because
-that is the ruler's register.
+Built (`tools/gen_teacher_corpus.py`, `tools/calibrate_corpus.py`) and working,
+then **withdrawn from the main experiment by measurement**: every generation
+setting tested lands 0.11–0.23 below the real corpus on `unique_4gram`
+(0.457–0.579 vs 0.687), with up to 12.5 % of stories flagged degenerate
+(`RESULTS.md`, "CORRECTION to the distillation corpus plan"). A corpus that is
+both differently-registered *and* less diverse would have made step 2 measure two
+things at once.
 
-*Why prefix-conditioned:* unconditional generation loses the prefix structure,
-and the ruler scores *continuations of real text*. Prompt-conditioned rollouts
-keep the real prompt distribution while the targets come from a strong model.
+It is also unnecessary: the real corpus is already local, already in the ruler's
+register, and already decontaminated by construction — `wiki_tinystories_005.txt`
+and `tinystories_valid.txt` were moved out of the training glob in Phase 0.1. And
+local files have stable digests, which fixes the reproducibility gap that made
+the 889,897-step CE rows unusable as a control.
 
-*Throughput:* 230 M ⇒ ~0.46 GFLOP/token; 4.15 B/token ⇒ a 64 MB corpus is ~15 M
-tokens. **Calibrate decode throughput for 10 minutes first** and derive the
-budget from the measurement, as `fetch_corpus.py --speed` already does.
+Kept in the tree because it is the evidence, and because it is the right tool if
+a synthetic arm is ever wanted at small scale. If used, it **must** be run with
+the degeneracy summary reported and `tools/decontaminate.py` applied.
 
-**⚠ CONTAMINATION GATE (new, and it exists because of this register choice).**
-The teacher was trained on web text that very likely *contains TinyStories
-itself*, so it can regurgitate eval stories verbatim — poisoning the very ruler
-we score with. FS-W dodged this with a byte offset; generated text has no
-offset, so it must be filtered:
+### Step 2 — ~~corpus-identity A/B~~ **WITHDRAWN 2026-10-03**
 
-* reuse `fetch_eval_data.prepare()` — story-level, drop if ≥0.6 of its ≥40-char
-  lines appear verbatim in the corpus;
-* **but** the membership set must be training lines **∪ all three eval files**
-  (`data/eval/*`, `data/eval_shift/*`), not the training glob alone. The current
-  `train_lines()` covers only the training path;
-* report dropped count and surviving bytes as a first-class result;
-* state the residual risk plainly: 0.6 verbatim-line matching does **not** catch
-  near-paraphrases, and TinyStories is heavily templated. Synthetic-corpus rows
-  therefore carry a contamination caveat at least as strong as FS-W's byte-offset
-  caveat, and their CE numbers are **not** directly comparable to real-corpus rows.
+Withdrawn with step 1: without a comparable synthetic corpus there is nothing to
+A/B, and the real corpus is already digest-verifiable. Replaced by a plain
+**byte-matched CE control arm** over the same real corpus files (step 3), which
+is the control this experiment actually needs.
 
-### Step 2 — the corpus-identity measurement (~3 h GPU, 2 arms)
+### Step 3 — off-policy MI distillation — **THE EXPERIMENT** (~1.5 h T4 + 10 min dump)
 
-| arm | corpus | why |
-|---|---|---|
-| A | real corpus, CE only | control (existing path, must be bit-identical) |
-| B | step-1 generated corpus, CE only | **load-bearing**: how much of the 0.55 CE TinyStories-vs-Gutenberg spread is register, not capability? |
+Corpus: `data/wikipedia_clean/wikistories/wiki_tinystories_00{1..4}.txt`, with
+each file's **sha256 recorded in RESULTS.md** so both arms are provably
+byte-matched. Two arms, same seed 0, same `--data-seed 0`, same file order:
 
-Because the distillation corpus is in the ruler's register, this arm is no
-longer optional — without it, a KD win on held-out CE is uninterpretable.
+| arm | objective |
+|---|---|
+| A | CE only (existing path; must be bit-identical at α=0) |
+| B | MI-KD, α = 0.5, τ = 1 |
 
-### Step 3 — off-policy MI distillation (~1.5 h GPU + 10 min dump)
-
-Arm C = KD on whichever corpus step 2 favours, byte-matched against step 2's
-control arm.
+Dump input is the same corpus, bucketed with `numpy_port.Runtime.make_streams`
+at B=1024 so the targets align position-for-position with the trainer.
 
 * **retained prefix mass** — the statistic most likely to silently corrupt the
   target. **Already measured on real ruler text** (`RESULTS.md`, 2026-10-03):

@@ -391,11 +391,19 @@ class GpuModel:
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, lr_decay=None,
                  decay_init=None,
                  device=None, ring_credit="auto", sync_metrics=True,
-                 grad_assembly="cat", seed=0, ring_k=None):
+                 grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
         self.lr = float(lr)
+        # Distillation (PLAN-2026-10-03-DISTILL.md). alpha = 0 is the default and
+        # MUST reproduce the pre-KD engine bit-for-bit (gate 3), so the KD path
+        # is skipped entirely rather than multiplied by zero.
+        self.distill_alpha = float(distill_alpha)
+        self._target_fn = None
+        self.kd_positions = 0
+        self.kd_covered = 0
+        self.last_kd = 0.0
         # Optional per-ROLE learning rate. `lr_decay` applies ONLY to the 16
         # per-layer `.decay` slices (512 coords each = 8,192 total = 0.183% of
         # the 4,481,793 parameters); every other coordinate keeps `lr`. This is
@@ -456,6 +464,23 @@ class GpuModel:
                 np.log(RING_TOL) / np.log(max(dmax, 1e-3)))))
             self.ring_k = int(ring_k) if self._ring_k_explicit else inferred_ring_k
         self._build(dim, layers, decay_init)
+
+    def set_target_fn(self, fn):
+        """Install ``step -> (B,256) target on device`` (or None to disable).
+
+        The provider owns the dump; the engine only consumes a distribution.
+        Positions MI could not resolve arrive as all-zero and contribute no KD
+        gradient — the CE-only fallback, counted in kd_stats, never averaged
+        away.
+        """
+        self._target_fn = fn
+        return self
+
+    def kd_stats(self):
+        return {"alpha": self.distill_alpha, "positions": self.kd_positions,
+                "covered": self.kd_covered,
+                "coverage": (self.kd_covered / self.kd_positions
+                             if self.kd_positions else None)}
 
     def _build(self, dim, layers, decay_init):
         lim = 1.0 / np.sqrt(dim)
@@ -754,10 +779,44 @@ class GpuModel:
             lse = mx + torch.log(torch.exp(output - mx).sum(dim=1, keepdim=True))
             ar = torch.arange(B, device=self.device)
             ce = lse[:, 0] - output[ar, n_arr]
+        # alpha = 0 must not perturb a single bit, so the CE weight is not
+        # applied at all in that case (gate 3 checks this over 120 steps).
+        ce_weight = 1.0 - self.distill_alpha if self.distill_alpha > 0.0 else 1.0
         loss_tensor = (torch.where(var_active, 1.0 - torch.sqrt(xv), 0.0).sum()
                        + ((x - tgt) ** 2).sum() / self.dim
-                       + ce.sum() + ((stop - end_arr) ** 2).sum()) / B
+                       + ce_weight * ce.sum() + ((stop - end_arr) ** 2).sum()) / B
         ce_tensor = ce.mean()
+        # ---- distillation: KL(p_teacher_bytes || p_student_bytes) -----------
+        # L_KD = sum_v p_T(v) (log p_T(v) - log p_S(v)); with tau = 1 frozen its
+        # gradient wrt the pre-softmax logits is exactly (p_S - p_T).
+        p_t = None
+        if self.distill_alpha > 0.0:
+            if self._target_fn is None:
+                raise RuntimeError(
+                    f"distill_alpha={self.distill_alpha} but no target provider "
+                    f"was installed (model.set_target_fn); refusing to train a "
+                    f"KD arm with a silently missing target")
+            p_t = self._target_fn(self.t)
+            if p_t is None:
+                raise RuntimeError(f"target provider returned None at step "
+                                   f"{self.t}")
+            p_t = p_t.to(output.device, non_blocking=True).float()
+            if p_t.shape != output.shape:
+                raise RuntimeError(f"target shape {tuple(p_t.shape)} != logits "
+                                   f"{tuple(output.shape)}")
+            logp = torch.log_softmax(output, dim=1)
+            s_t = (p_t * (torch.log(p_t.clamp_min(1e-9)) - logp)).sum(dim=1)
+            covered = p_t.sum(dim=1) > 0
+            s_t = torch.where(covered, s_t, torch.zeros_like(s_t))
+            loss_tensor = loss_tensor + self.distill_alpha * s_t.sum() / B
+            # exposed for telemetry and for tests/check_kd.py: total loss across
+            # different alphas is NOT comparable (CE is down-weighted by
+            # (1-alpha) by design), so the KD term has to be readable directly.
+            self.last_kd = float(s_t.sum()) / B
+            self.kd_positions += int(B)
+            self.kd_covered += int(covered.sum())
+        else:
+            self.last_kd = 0.0
         self.last_loss_tensor = loss_tensor.detach()
         self.last_ce_tensor = ce_tensor.detach()
         if self.sync_metrics:
@@ -770,8 +829,13 @@ class GpuModel:
             self.last_ce = ce_tensor
 
         with rf("bwd_decoder"):
-            doutput = torch.exp(output - lse)            # softmax
+            p_s = torch.exp(output - lse)              # softmax
+        doutput = p_s.clone()
         doutput[ar, n_arr] -= 1.0
+        if ce_weight != 1.0:
+            doutput *= ce_weight
+        if p_t is not None:
+            doutput += self.distill_alpha * (p_s - p_t)
         dWd = doutput.t() @ x
         dbd = doutput.sum(dim=0)
         dx = doutput @ self.Wd

@@ -27,8 +27,10 @@ import numpy as np
 import torch
 
 import gpu_port
+import distill as _distill
 from gpu_port import GpuModel
 import numpy_port as np_
+import teacher_table as _tt
 
 import checkpoint_hub as hub
 from telemetry import RunTelemetry
@@ -94,16 +96,103 @@ def save_checkpoint(model, rolling, keep_k, tagged, tag_dir=None):
     return tag_path
 
 
+class DistillTargets:
+    """Per-file Marginalize-It targets for the trainer.
+
+    Built lazily, once per corpus file, from the dump written by
+    tools/mi_dump.py. The alignment contract is the whole point: the dump was
+    bucketed with the SAME `make_streams(data, B)` call, and MiReader refuses to
+    load unless the dump's token lengths imply exactly the stream lengths it was
+    handed. A mismatch is a hard error, because the alternative is a KD arm
+    quietly training on targets belonging to other bytes.
+
+    Every KD arm prints coverage at the end. Coverage is NOT 1.0: MI resolves a
+    target at ~92% of first-byte positions and ~36-51% of positions inside a
+    token (measured, RESULTS.md 2026-10-03), and the rest fall back to CE-only.
+    """
+
+    def __init__(self, dump_dir, corpus_file, batch, block=32,
+                 repo="LiquidAI/LFM2.5-230M-Base", verbose=True):
+        self.path = dump_dir
+        self.batch = batch
+        self.block = block
+        self.repo = repo
+        self.verbose = verbose
+        self.corpus_file = corpus_file
+        self.stem = os.path.splitext(os.path.basename(corpus_file))[0]
+        self.reader = None
+        self._bind = 0
+        self._vocab = None
+        self._torch = torch
+
+    def _ensure(self):
+        if self.reader is not None:
+            return self.reader
+        tok_path = _tt.fetch_tokenizer_json(self.repo)
+        table, meta = _tt.build_table(tok_path)
+        control = set(meta["control_ids"]) | set(meta["nonbyte_ids"])
+        vocab = _distill.VocabBytes(table, drop_ids=control)
+        with open(self.corpus_file, "rb") as fh:
+            data = fh.read()
+        streams, _ends = np_.Runtime.make_streams(data, self.batch)
+        r = _distill.MiReader(self.path, self.stem, vocab, streams=streams,
+                              block=self.block)
+        if self.verbose:
+            print(f"  [distill] {self.stem}: B={r.B} L_step={r.L_step} "
+                  f"Ltok={r.Ltok} k={r.k}", flush=True)
+        self.reader = r
+        self._vocab = vocab
+        return r
+
+    def at(self, model_step):
+        """(B,256) float32 for this step.
+
+        `model_step` is the ENGINE's counter, which step_batch increments BEFORE
+        calling the provider. With `bind(m.t)` taken while m.t still pointed at
+        the previous step, the first call for this file arrives as bind+1, so
+        the file-local step is `model_step - bind - 1`.
+        """
+        r = self._ensure()
+        t = int(model_step) - self._bind - 1
+        if not (0 <= t < r.L_step):
+            return None
+        tgt, _ret = r.targets(t)
+        return self._torch.from_numpy(np.ascontiguousarray(tgt)).float()
+
+    def bind(self, model_step_before_file):
+        self._bind = int(model_step_before_file)
+        return self
+
+    def stats(self):
+        return self.reader.stats() if self.reader is not None else {}
+
+
 class Trainer:
     def __init__(self, path, batch=1024, save_every=1000, keep_k=8,
                  tagged=True, max_steps=0, data_seed=0, device=Device,
                  from_scratch=False, seed=0, log_every=0, warmup=0,
                  hub_save_every=0, telemetry_every=0, telemetry_path=None,
-                 measure_after=0, verify_final=False, **model_kw):
+                 measure_after=0, verify_final=False, distill_dir=None,
+                 distill_alpha=0.0, distill_block=32, distill_repo=None, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
         # is what makes them byte-matched on the data axis alone.
+        #
+        # The distillation block runs BEFORE the model is built: `model_kw` is
+        # consumed here, so injecting distill_alpha after this line silently
+        # trained a CE arm while the log claimed alpha was set.
+        self.distill_dir = distill_dir
+        self.distill_alpha = float(distill_alpha)
+        self.distill_block = int(distill_block)
+        self.distill_repo = distill_repo or os.environ.get(
+            "TMT_TEACHER", "LiquidAI/LFM2.5-230M-Base")
+        self.distill = None
+        if self.distill_alpha > 0.0:
+            if not distill_dir:
+                raise SystemExit("--distill-alpha > 0 requires --distill-dir "
+                                 "(the dump made by tools/mi_dump.py)")
+            model_kw["distill_alpha"] = self.distill_alpha
         self.model = GpuModel(device=str(device), seed=seed, **model_kw)
         self.path = path
         self.seed = int(seed)
@@ -130,6 +219,26 @@ class Trainer:
         self.measure_after = int(measure_after)
         self.verify_final = bool(verify_final)
         self.telemetry = None
+
+    def _kd_provider(self, file, m):
+        """Fresh per-file provider, bound to the engine's step counter."""
+        if self.distill_alpha <= 0.0:
+            return None
+        p = DistillTargets(self.distill_dir, file, self.batch,
+                           self.distill_block, self.distill_repo)
+        p.bind(m.t)
+        prov = p
+        m.set_target_fn(lambda step, _p=prov: _p.at(step))
+        return p
+
+    def _kd_report(self, m):
+        if self.distill_alpha <= 0.0:
+            return
+        st = m.kd_stats()
+        print(f"  [distill] alpha={st['alpha']} | KD target supplied at "
+              f"{st['covered']:,}/{st['positions']:,} positions "
+              f"({(st['coverage'] or 0) * 100:.2f}% coverage; the rest fell "
+              f"back to CE-only)", flush=True)
 
     def train(self, save, dataset, hub_repo=None):
         m = self.model
@@ -194,6 +303,7 @@ class Trainer:
                     axis=1).astype(np.int64)).to(self.device)
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
+                self._kd_provider(file, m)
                 for t in range(L):
                     m.step_batch(mats[t], mats[t + 1], ets[t])
                     wsteps += 1
@@ -282,6 +392,7 @@ class Trainer:
                     axis=1).astype(np.int64)).to(self.device)
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
+                self._kd_provider(file, m)
                 for t in range(L):
                     loss = m.step_batch(mats[t], mats[t + 1], ets[t])
                     if self.telemetry is not None:
@@ -311,6 +422,7 @@ class Trainer:
                                 digest = verify_saved(out)
                             print(f"  [final] saved {os.path.basename(out)}",
                                   flush=True)
+                        self._kd_report(m)
                         emit_telemetry(digest if save else None)
                         return
                     if save and self.save_every and m.t % self.save_every == 0:
@@ -436,6 +548,20 @@ def main():
     ap.add_argument("--measure-after", type=int, default=0,
                     help="start steady-state throughput clock after N relative "
                          "training steps; training is not rewound or repeated")
+    ap.add_argument("--distill-dir", default=os.environ.get("TMT_MI_DUMP"),
+                    help="directory written by tools/mi_dump.py; one dump per "
+                         "corpus file, bucketed with the SAME B as training")
+    ap.add_argument("--distill-alpha", type=float,
+                    default=float(os.environ.get("TMT_KD_ALPHA", "0")),
+                    help="KD weight. alpha=0 is the CE baseline and is "
+                         "BIT-EXACT vs the pre-KD engine (tests/check_kd.py). "
+                         "The paper's mixed objective is alpha*KL + "
+                         "(1-alpha)*CE.")
+    ap.add_argument("--distill-block", type=int, default=32,
+                    help="steps of targets computed per vectorized block")
+    ap.add_argument("--distill-repo", default=None,
+                    help="HF repo for the teacher's tokenizer.json "
+                         "(default $TMT_TEACHER)")
     ap.add_argument("--verify-final", action="store_true",
                     help="reload the final tag through a clean CPU engine and "
                          "verify t/B/K plus its local SHA-256 sidecar")
@@ -493,7 +619,20 @@ def main():
                 telemetry_every=args.telemetry_every,
                 telemetry_path=args.telemetry_path,
                 measure_after=args.measure_after,
-                verify_final=args.verify_final)
+                verify_final=args.verify_final,
+                distill_dir=args.distill_dir,
+                distill_alpha=args.distill_alpha,
+                distill_block=args.distill_block,
+                distill_repo=args.distill_repo)
+    if args.distill_alpha > 0.0:
+        if not args.distill_dir or not os.path.isdir(args.distill_dir):
+            sys.exit(f"--distill-alpha {args.distill_alpha} but --distill-dir "
+                     f"{args.distill_dir!r} is not a directory; run "
+                     f"tools/mi_dump.py first (the KD arm must not silently "
+                     f"degrade to CE)")
+        print(f"[distill] alpha={args.distill_alpha} | dump={args.distill_dir} "
+              f"| block={args.distill_block} | B={args.batch} (the dump must "
+              f"have been written with this same B)", flush=True)
     print(f"parameters: {t.model.theta.shape[0]:,} | device {args.device}",
           flush=True)
     if args.mode == "train":

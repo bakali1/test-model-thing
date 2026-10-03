@@ -1045,3 +1045,155 @@ blocked any pre-Volta GPU outright. It does not make this box a training host.
 Reproduction: `.venv-gpu/bin/python tools/bench_variants.py tmt.npz --B 1024
 --steps 200` on the box (add `nvrtc` to the board), and
 `.venv-gpu/bin/python tests/check_variants.py` for the parity half.
+
+---
+
+## CORRECTION to the distillation corpus plan — the teacher cannot write a corpus (2026-10-03)
+
+Appended per convention; nothing above is edited. `PLAN-2026-10-03-DISTILL.md`
+§4 steps 1–2 (teacher-generated corpus, then the corpus-identity A/B) are
+**withdrawn as the main experiment.** The tool that would have executed them is
+built and working (`tools/gen_teacher_corpus.py`, `tools/calibrate_corpus.py`),
+and it is kept, because the measurement that withdrew the step is the evidence.
+
+### Measurement 1 — the teacher's generations are measurably less diverse than the real corpus
+
+Same metric code (`chat_models.degeneracy_metrics`), same story granularity:
+
+| corpus | n | degenerate | unique_4gram | unique_8gram | rep_4gram_frac | max_run_newlines | unique_bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `wiki_tinystories_003.txt` (real, train) | 800 | **0.0 %** | **0.687** | 0.912 | 0.0146 | 1 | 36.0 |
+| `tinystories_valid.txt` (real, held out) | 800 | **0.0 %** | **0.687** | 0.912 | 0.0146 | 1 | 36.0 |
+| teacher, 2 shots, T 0.85, nrng 4, **260 tok** | 8 | 0.0 % | 0.579 | 0.818 | 0.0161 | 1 | 37.9 |
+| teacher, 2 shots, T 0.85, nrng 4, **700 tok** | 8 | 12.5 % | 0.510 | 0.777 | 0.0141 | 2 | 45.4 |
+| teacher, 3 shots, T 0.90, nrng 4, 700 tok | 8 | 0.0 % | 0.457 | 0.738 | 0.0178 | 2 | 44.0 |
+
+Ruler setting: 8–24 generated stories per cell, MX150 fp16, seed 1000+start,
+temperature/top-p/repetition/no-repeat-ngram as tabulated; baseline is 800 real
+stories per file. **Every setting tested lands 0.11–0.23 below the real corpus
+on `unique_4gram`.** The gap is not a tail that filtering removes — it is the
+bulk of the output.
+
+Consequence: step 2's arms would have differed by **register AND degeneracy at
+once**, so the corpus-identity number would not have meant what the plan claimed
+it meant. That is the exact class of confound this repo keeps refusing to
+publish.
+
+Also measured, and required to get anything usable at all: a 230 M **base** model
+given a ~40-token prefix and no pattern emits one sentence 8× verbatim
+(batch=1, no padding, so this is not a padding artifact). Few-shot (2–3
+in-register stories) plus `no_repeat_ngram_size=4` is what produces prose;
+`repetition_penalty` alone does not (tried 1.05 and 1.10, both still looped).
+
+### Measurement 2 — the MX150 cannot run the teacher at all
+
+| machine | teacher generation | note |
+|---|---:|---|
+| laptop, 8c CPU fp32 | **475 B/s** (batch 64; flat to batch 256) | reference conv path |
+| MX150, fp16 | **18–26 B/s** | `causal_conv1d` absent there too |
+
+**The GPU box is ~20× SLOWER than the laptop for teacher generation**, because
+the optimized conv kernel is missing and the reference path is pathological on
+Pascal. Teacher work therefore belongs on the T4 (or the laptop CPU); the MX150
+stays what the brief says it is — gates, rulers and TMT smokes. The dump's
+single-forward cost on the MX150 would be ~10.5 h for a 64 MB slice, so it is
+T4 work too.
+
+### What replaces steps 1–2
+
+The real corpus is **already on disk and already the right register**:
+`data/wikipedia_clean/wikistories/wiki_tinystories_00{1..4}.txt`, 158 MB, and
+Phase 0.1 already moved `wiki_tinystories_005.txt` + `tinystories_valid.txt`
+*out* of the training glob. So training on files 001–004 and scoring on the
+held-out set is decontaminated **by construction** — no generation, no
+decontamination pass, and no contamination caveat.
+
+It also fixes the reproducibility gap found earlier today: local files have
+stable digests, so both arms can be byte-matched and *proven* so. That is
+exactly what the 889,897-step run could not offer (its `spec_hash` and dataset
+revisions were never recorded), which is why its CE rows cannot serve as a free
+control.
+
+New sequence: **step 3 only** — MI dump of the real corpus, KD arm, CE control
+arm, both byte-matched with recorded digests. Steps 4 (on-policy) and the
+decontamination gate stay in the plan, unused by this experiment.
+
+### NOT retracted
+
+The MI target-fidelity result (retained prefix mass 0.803/0.371/0.320 at depths
+0/1/2; k=32 sufficient) is unaffected — it was measured on real eval text, not
+on generated text. The word-length-drift diagnostic it predicts is unaffected.
+
+---
+
+## MI dump + reader: round trip, and three bugs the gates caught (2026-10-03)
+
+`distill.py` (format + reader), `tools/mi_dump.py` (writer), `tests/check_mi.py`
+(gate), `tools/mi_report.py` (gate 2). Round trip on 200,000 B of
+`wiki_tinystories_003.txt`, B=8, k=32, fp32 teacher, laptop CPU.
+
+**Gate `tests/check_mi.py`: PASS — vectorized MI == brute force, max |Δ| = 0.00e+00
+over 308 randomized cases at depth ≥ 1.** That gate caught three bugs, all of
+which would have trained on a plausible-looking wrong target:
+
+1. **Gold-prefix bug (the worst).** The reader was handed only the gold byte at
+   depth *d*, so its prefix test compared every depth against that one byte and
+   matched nothing at depth ≥ 1. Consequence: every byte position inside a token
+   would have fallen through to the backoff — about **76 % of positions** — and
+   the KD arm would have looked like it worked while training on ~¼ of the data.
+2. **Absolute-vs-relative row indexing.** `q` is an absolute token-row index but
+   the arrays were sliced at `t0`; indexing the slice with `q` read the wrong row
+   whenever `q < t0`.
+3. **Off-by-one in which row predicts which token.** Dump row *r* holds the
+   logits at token position *r*, which predict token *r+1*; byte *p* belongs to
+   token *q*, so the distribution that predicted token *q* is row **q−1**. Using
+   row *q* asks a different question and left **66 % of positions** at the
+   backoff. Fixed; cross-checked by CE (below).
+
+A fourth, in the dumper: the token axis was padded to the byte-position loop
+length, costing 4.1× storage — **791 B/token against the frozen 193**. Now sized
+by real token counts: **208.4 B/token at B=8**, the residue being per-stream
+padding (8 %); at the frozen B=1024 this shrinks further.
+
+### Independent cross-checks (two code paths, same data)
+
+| check | dump path | independent (`tools/teacher_eval.py`) |
+|---|---:|---:|
+| CE of gold token, covered positions | **2.6893** nats/token | 2.8137 (held-out eval text) |
+| gold token inside top-32 | 76.5 % | — |
+| depth-0 retained mass, mean | **0.7007** | 0.803 |
+| fraction below 0.05 at depth 0 | 7.7 % | p05 = 0.079 |
+
+The CE is *lower* on the training file, which is what memorization predicts. Both
+paths agree that row *i−1* predicts token *i*. The depth-1 mean does **not**
+agree across the two measurements (0.22 here vs 0.371 earlier) — different text
+(training file vs held-out eval) and different context window (256-token dump
+chunks vs one 20 k-token sequence). **Recorded as unexplained**; the number that
+governs the KD arm is the coverage below, which is measured on the exact data and
+chunking the trainer will use.
+
+### Gate 2 — what KD actually gets: coverage, not mean
+
+32,000 positions walked through the real reader (`tools/mi_report.py`):
+
+| byte depth | retained mass mean | p05 | KD coverage @ floor 0.05 | @ floor 0.01 |
+|---|---:|---:|---:|---:|
+| 0 | 0.7007 | 0.0103 | **91.6 %** | 95.0 % |
+| 1 | 0.2238 | 0.0000 | **51.2 %** | 71.3 % |
+| 2 | 0.1733 | 0.0000 | **40.6 %** | 58.8 % |
+| 3 | 0.1527 | 0.0000 | **36.0 %** | 52.7 % |
+
+**At the frozen floor of 0.05, Marginalize-It supplies a usable target at 91.6 %
+of first-byte positions but only ~36–51 % of positions inside a token — 49.1 %
+of all positions fall back to CE-only.** That is the MI bias showing up as lost
+coverage rather than as a small distortion, and it is the single most important
+number for interpreting the KD arm: it is not "distillation on every byte".
+
+Note also that the surviving targets are essentially **one-hot** (mean target
+entropy ≈ 0): when MI keeps a token, it is usually the only prefix-matching one
+in the top-32. So the target carries the teacher's *ranking* far more than its
+*uncertainty* on this data.
+
+The `argmax==gold` column in `mi_report.py` is tautological (an all-zero
+backoff target has argmax 0) and is not a correctness check; it is left in only
+as a coverage duplicate and should be dropped before the real run.
