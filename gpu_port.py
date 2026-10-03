@@ -240,6 +240,124 @@ def _ring_credit_compiled(dest, w, dlds, hot_mask, rows):
     return dest
 
 
+# NVRTC ring credit -- the path for GPUs that Triton cannot serve.
+#
+# `compiled` and `triton` both die on pre-Volta devices: Triton requires
+# compute capability >= 7.0, and torch._inductor raises GPUTooOldForTriton on
+# anything older (measured on an MX150, cc 6.1, where the shipped `auto`
+# default therefore CRASHED rather than falling back). NVRTC has no such floor,
+# so this path works on every CUDA device torch itself runs on, with no nvcc,
+# no ninja and no build step -- torch.cuda._compile_kernel JITs from source at
+# first use (~1 s, cached in-process).
+#
+# Why fusing is worth it. `full` issues three ops per layer over (B,K,D):
+#     w.mul_(dec)          read+write
+#     w * dlds   -> vals   read+write
+#     index_add_(rows,vals) read + atomic scatter
+# i.e. five passes over the ring, of which two are pure re-reads of the same
+# data. Measured at B=1024, K=14, D=512 (29 MiB ring) on an MX150, per layer:
+#     full   5.60 ms (no hot mask) / 6.83 ms (with)   [39.1 GiB/s = peak copy]
+#     nvrtc  2.55 ms / 2.53 ms                         -> 2.2x / 2.7x
+# The fused kernel does one pass: read w, multiply by the decay, write the
+# decayed value back, multiply by the gradient, atomically add to dest.
+#
+# Parity (measured, tests/ is the durable gate; see RESULTS.md):
+#   * the ring buffer is BIT-IDENTICAL (max|d| = 0.0) -- decay and credit are
+#     per-element and the arithmetic order is unchanged;
+#   * dembed differs by 5.9e-07 of RMS, which is SMALLER than the `full`
+#     path's own run-to-run difference (8.8e-07): index_add_ is an atomic
+#     scatter whose summation order was never deterministic, so exact equality
+#     was never a property of the reference to begin with.
+_NVRTC_RING_SRC = r"""
+extern "C" __global__
+void tmt_ring_credit(float* __restrict__ w,
+                     const float* __restrict__ dec,
+                     const float* __restrict__ dlds,
+                     const long* __restrict__ rows,
+                     float* __restrict__ dest,
+                     const unsigned char* __restrict__ hotmask,
+                     int B, int K, int D, int has_mask) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)B * K * D) return;
+    int d = (int)(idx % D);
+    long bk = idx / D;
+    int b = (int)(bk / K);
+    // dec is (D,), NOT (B,D): the layer decay is a per-dimension sigmoid
+    // broadcast over the batch (see TorchLayer.forward / w.mul_(dec[None,None,:])).
+    float wv = w[idx] * dec[d];
+    w[idx] = wv;
+    float v = wv * dlds[(long)b * D + d];       // ring credit
+    if (has_mask && hotmask[d]) v = 0.0f;       // hot-dim mask (bool, 1 byte)
+    atomicAdd(&dest[rows[bk] * D + d], v);
+}
+"""
+
+_NVRTC_RING_KERNEL = None
+_NVRTC_RING_FAILED = False
+
+
+def _ensure_cuda_home():
+    """torch.cuda._compile_kernel insists on resolving CUDA include paths,
+    which raises OSError when CUDA_HOME is unset. Our kernel includes no CUDA
+    headers, so a CUDA_HOME is synthesized from the header-only layout the
+    `nvidia-*-cu12` pip wheels ship, which is how a torch CUDA build without a
+    system toolkit can still JIT. Returns True if CUDA_HOME is resolvable.
+    """
+    if os.environ.get("CUDA_HOME"):
+        return True
+    import glob as _glob
+    import tempfile
+    import site
+    roots = []
+    for base in site.getsitepackages() + [site.getusersitepackages()]:
+        roots.append(base)
+    inc = None
+    for base in roots:
+        hit = _glob.glob(os.path.join(base, "nvidia", "cuda_runtime", "include",
+                                     "cuda_runtime.h"))
+        if hit:
+            inc = os.path.dirname(hit[0])
+            break
+    if inc is None:
+        return False
+    home = tempfile.mkdtemp(prefix="tmt-cuda-home-")
+    dst = os.path.join(home, "include")
+    os.makedirs(dst, exist_ok=True)
+    for f in os.listdir(inc):
+        try:
+            os.symlink(os.path.join(inc, f), os.path.join(dst, f))
+        except OSError:
+            pass
+    os.environ["CUDA_HOME"] = home
+    return True
+
+
+def _nvrtc_ring_kernel():
+    """Compile (once) and return the fused ring kernel, or None if unavailable.
+
+    None is a normal outcome, not an error: torch.cuda._compile_kernel insists
+    on resolving CUDA include paths, which raises when CUDA_HOME is unset, and
+    any NVRTC failure must degrade to `full` rather than kill a run.
+    """
+    global _NVRTC_RING_KERNEL, _NVRTC_RING_FAILED
+    if _NVRTC_RING_KERNEL is not None or _NVRTC_RING_FAILED:
+        return _NVRTC_RING_KERNEL
+    try:
+        if not hasattr(torch.cuda, "_compile_kernel"):
+            raise RuntimeError("torch.cuda._compile_kernel is unavailable")
+        if not _ensure_cuda_home():
+            raise RuntimeError("no CUDA_HOME and no bundled cuda_runtime headers")
+        _NVRTC_RING_KERNEL = torch.cuda._compile_kernel(
+            _NVRTC_RING_SRC, "tmt_ring_credit")
+    except Exception as exc:                     # pragma: no cover
+        _NVRTC_RING_FAILED = True
+        print(f"[ring_credit] nvrtc unavailable ({type(exc).__name__}: "
+              f"{str(exc).splitlines()[0][:90]}) -> falling back to 'full'",
+              flush=True)
+        return None
+    return _NVRTC_RING_KERNEL
+
+
 if triton is not None:
     @triton.jit
     def _fused_ring_credit_kernel(dest_ptr, w_ptr, grad_ptr, rows_ptr, factor_ptr,
@@ -286,7 +404,7 @@ class GpuModel:
         if self._ring_k_explicit:
             if not isinstance(ring_k, (int, np.integer)) or int(ring_k) < 1 or int(ring_k) > 256:
                 raise ValueError(f"ring_k must be an integer in [1, 256], got {ring_k!r}")
-        if ring_credit not in ("auto", "full", "compiled", "triton"):
+        if ring_credit not in ("auto", "full", "compiled", "triton", "nvrtc"):
             raise ValueError(f"unknown ring_credit={ring_credit!r}")
         if grad_assembly not in ("cat", "loop"):
             raise ValueError(f"unknown grad_assembly={grad_assembly!r}")
@@ -304,6 +422,7 @@ class GpuModel:
                                 if str(device).startswith("cuda") else "full")
         self._compiled_ring_credit = None
         self._compile_failed = False
+        self._ring_resolved = None
         self.sync_metrics = bool(sync_metrics)
         if self.device.startswith("cuda"):
             torch.backends.cuda.matmul.allow_tf32 = False  # fp32 only
@@ -482,26 +601,87 @@ class GpuModel:
             self.tail.mask[l] = m
 
     # ---------------- ring credit variants ----------------
-    def _scatter_ring_credit(self, layer, w, dlds, rows, hot_mask):
-        """Apply one layer's ring credit to dembed via the selected path.
+    def _ring_mode(self):
+        """The effective ring-credit path, resolved once and cached.
 
-        Only the three paths that survived measurement on the T4 remain:
-        `full` (portable reference), `compiled` (the +27% winner, default on
-        CUDA) and `triton` (the +9% fallback when Inductor is unavailable).
-        The `cold`, `kloop` and `segmented` candidates were removed after
-        measuring 0.95x, 0.90x and 0.81x respectively -- see RESULTS.md.
+        `auto` means compiled on CUDA, but Inductor/Triton have a hard
+        compute-capability floor (7.0) that is NOT reported until the compiled
+        function is executed. Checking the capability up front is what lets the
+        default degrade instead of crashing: on a pre-Volta GPU (measured: MX150,
+        cc 6.1) `auto` used to raise GPUTooOldForTriton on the very first step.
         """
+        if self._ring_resolved is not None:
+            return self._ring_resolved
         mode = self.ring_credit
+        is_cuda = str(self.device).startswith("cuda")
+        if not is_cuda:
+            # compiled/triton/nvrtc are all CUDA-only; `full` is portable.
+            if mode in ("compiled", "triton", "nvrtc"):
+                mode = "full"
+        elif mode == "auto":
+            mode = "compiled"
+        if is_cuda and mode in ("compiled", "triton") and torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            if major < 7:
+                fused = "nvrtc" if _nvrtc_ring_kernel() else "full"
+                print(f"[ring_credit] cc {major}.x is below Triton's floor (7.0); "
+                      f"{mode} unavailable -> {fused}", flush=True)
+                mode = fused
+        self._ring_resolved = mode
+        return mode
+
+    def _scatter_ring_credit(self, layer, w, dlds, rows, hot_mask, dec):
+        """Decay this layer's ring in place and credit dembed, via one path.
+
+        The decay lives INSIDE each path, not in the caller, because the fused
+        NVRTC path does decay+credit+scatter in a single pass. Every path keeps
+        the reference arithmetic order (`w.mul_(dec)`, then `w * dlds`, then the
+        atomic scatter), so switching paths cannot change a number.
+
+        Paths that survived measurement on the T4: `full` (portable reference),
+        `compiled` (the +27% winner, `auto` on CUDA), `triton` (the +9% fallback
+        when Inductor is unavailable), plus `nvrtc` -- fused, and the only fused
+        option below cc 7.0 (measured 2.2-2.7x on an MX150). The `cold`,
+        `kloop` and `segmented` candidates were removed after measuring 0.95x,
+        0.90x and 0.81x respectively -- see RESULTS.md.
+        """
+        mode = self._ring_mode()
+        if mode == "nvrtc":
+            kern = _nvrtc_ring_kernel()
+            if kern is not None:
+                B, K, D = w.shape
+                # The hot mask reaches us as EITHER a cuda bool tensor (the
+                # rebase path writes one) or a numpy bool array (tail_credit's
+                # own _mask dict holds numpy, and masked_fill_ silently accepts
+                # both). A raw-pointer kernel accepts neither implicitly, so
+                # normalise here rather than fail at the launch.
+                if hot_mask is None:
+                    marg = self._nvrtc_nomask()
+                elif (isinstance(hot_mask, torch.Tensor)
+                      and hot_mask.is_cuda and hot_mask.dtype == torch.bool):
+                    marg = hot_mask
+                else:
+                    marg = torch.as_tensor(np.asarray(hot_mask),
+                                           dtype=torch.bool,
+                                           device=self.device)
+                grid = ((B * K * D + 255) // 256, 1, 1)
+                kern(grid=grid, block=(256, 1, 1),
+                     args=[w, dec, dlds, rows, self._ring_dest, marg,
+                           B, K, D, 0 if hot_mask is None else 1])
+                return
+            mode = "full"        # kernel unavailable: portable reference
         if mode == "compiled":
             if self._compiled_ring_credit is None:
                 self._compiled_ring_credit = torch.compile(
                     _ring_credit_compiled, dynamic=False)
+            w.mul_(dec[None, None, :])
             self._compiled_ring_credit(self._ring_dest, w, dlds, hot_mask, rows)
             return
         if mode == "triton":
             if triton is None or not w.is_cuda:
                 raise RuntimeError("ring_credit=triton requires a CUDA torch "
                                    "build with Triton")
+            w.mul_(dec[None, None, :])
             if not hasattr(self, "_triton_dummy"):
                 self._triton_dummy = torch.empty(1, dtype=F, device=w.device)
             block_d = triton.next_power_of_2(self.dim)
@@ -510,12 +690,19 @@ class GpuModel:
                 w.shape[0], w.shape[1], w.shape[2],
                 False, hot_mask is not None, block_d, num_warps=4)
             return
-        # full: materialize, mask, scatter (the portable reference path)
+        # full: decay, materialize, mask, scatter (the portable reference path)
+        w.mul_(dec[None, None, :])
         torch.mul(w, dlds[:, None, :], out=self.ring_vals)
         if hot_mask is not None:
             self.ring_vals.masked_fill_(hot_mask[None, None, :], 0.0)
         self._ring_dest.index_add_(0, rows,
                                   self.ring_vals.reshape(-1, self.dim))
+
+    def _nvrtc_nomask(self):
+        if not hasattr(self, "_nvrtc_nomask_t"):
+            self._nvrtc_nomask_t = torch.zeros(1, dtype=torch.bool,
+                                               device=self.device)
+        return self._nvrtc_nomask_t
 
     # ---------------- training step --------------------
     def step_batch(self, cs, ns, ends):
@@ -610,13 +797,14 @@ class GpuModel:
             dlds = lgrads[i]                             # (B, dim)
             w = l.ring_w
             dec = decays[i]
-            w.mul_(dec[None, None, :])               # decay the ring in place
             if self.tail is not None and self.tail.nhot(i):
                 self.tail.begin_step(i, dec[self.tail.cols_of(i)])
             hot_mask = (self.tail.mask_of(i)
                         if self.tail is not None and self.tail.nhot(i) else None)
             with rf("ring_credit"):
-                self._scatter_ring_credit(i, w, dlds, rows, hot_mask)
+                # the decay itself lives in _scatter_ring_credit: the fused
+                # nvrtc path folds it into the same pass as the credit
+                self._scatter_ring_credit(i, w, dlds, rows, hot_mask, dec)
                 w[:, p] = 1.0                            # this byte = lag 1
             if self.tail is not None and self.tail.nhot(i):
                 with rf("tail_credit"):
@@ -695,6 +883,21 @@ class GpuModel:
     def save(self, path):
         data = self.params_dict()
         tmp = path + ".tmp.npz"
+        # DEFLATE, not stored. Measured on models/tmt_t094747.npz (B=1024,
+        # ring_k=18, 115 hot dims): 230.3 -> 115.9 MiB, i.e. 2.0x, and it is
+        # LOSSLESS -- a compressed checkpoint reloads bit-exact (107/107 keys
+        # identical) and np.load auto-detects either form, so old and new
+        # checkpoints stay interchangeable.
+        #
+        # It compresses this well because the B-dependent state is mostly
+        # small-magnitude: only ~7% of tail_E entries exceed 1e-4 of their
+        # layer max (per-layer, all 16 measured), so the rest is long runs of
+        # near-identical bytes. A freshly seeded model is 7.3x (15.9 vs
+        # 115.3 MiB) because its tail_E is still all zeros.
+        #
+        # Cost: ~8.4s to write a 230 MiB checkpoint (vs ~0.2s stored), ~0.2s
+        # extra to read. Against a 1.5-2 min HF push/pull per 250 MB artifact
+        # that is free, and it halves every transport in the leg.
         np.savez(tmp, **data)
         os.replace(tmp, path)
 

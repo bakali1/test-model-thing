@@ -924,3 +924,124 @@ strong as FS-W's byte-offset caveat.
 | teacher weights | 459,401,112 B; at **2.5 MiB/s ≈ 3 min** (the `hf_hub_download` xet path stalled twice at exactly 320 MB — resumable `curl -C -` completed it) |
 | implication | HF checkpoint push/pull ≈ 1.5–2 min per 250 MB artifact from this box; the 0.9 GB corpus fetch ≈ 6 min. Neither is a blocker. |
 | local env | `transformers` 5.18.0 + `tokenizers` 0.23.2 added to `.venv` (additive; the engine imports neither). LFM2.5 needs `model_type: lfm2` support. |
+
+---
+
+## Fused NVRTC ring credit — the pre-Volta path (2026-10-03)
+
+The distillation plan needs a machine to run gates and rulers on. The candidate
+was a laptop with an **MX150 (Pascal, cc 6.1)**. It could not run TMT at all:
+`ring_credit="auto"` — the shipped default — resolves to `compiled`, and
+`GPUTooOldForTriton` was raised on the first step, because **Triton requires
+compute capability >= 7.0**. `triton` fails the same way. `full` is the only
+path that ran. Recorded here because the default crashing on a whole class of
+GPUs is a portability bug, not a tuning note.
+
+### Where the time actually goes (measured, not guessed)
+
+Before optimizing anything, two probes decided the whole approach.
+
+**Is it launch-bound?** `cpu(no sync)/wall = 0.97` and profiler device time
+195 ms/step against a 195.9 ms wall: the GPU is saturated and the CPU is nearly
+so, but the *device* time is real work. **CUDA graphs would have bought nothing**,
+so none were built. (The repo has a `--compile-step ... reduce-overhead` flag
+that does use graphs; it needs Inductor, so it is dead here too.)
+
+**Which region?** `tools`-free microbenchmark at the real shapes (B=1024,
+K=14, D=512, ring = 29 MiB), against a measured 39.1 GiB/s copy ceiling:
+
+| per layer | ms | vs bandwidth-optimal |
+|---|---:|---|
+| `w.mul_(dec)` (decay, in place) | 1.455 | optimal (2 passes) |
+| `torch.mul(w, dlds, out=vals)` | 1.456 | optimal (2 passes) |
+| `dest.index_add_(rows, vals)` | **2.521** | **3.5x worse** (atomics) |
+| **total ×16 layers** | **86.9 ms of 195** | **45 % of the step** |
+
+The `full` path makes five passes over the ring per layer where two of them are
+re-reads of the same bytes. `w[:, p] = 1.0` and the GEMMs were never the issue.
+
+### What was built: `ring_credit="nvrtc"`
+
+One fused kernel, compiled at first use by **`torch.cuda._compile_kernel`
+(NVRTC)** — no nvcc, no ninja, no build step, and no cc floor. It reads `w`,
+multiplies by the decay, writes the decayed value back, multiplies by the
+gradient and atomically scatters, in a single pass.
+
+| per layer, MX150 | full | nvrtc | speedup |
+|---|---:|---:|---:|
+| no hot dims | 5.370 ms | 2.486 ms | **2.16x** |
+| with hot-dim mask | 6.793 ms | 2.483 ms | **2.74x** |
+
+**End to end**, 680 steps (past the 500-step tail rebase, so hot dims are live),
+fp32, TF32 off, `ring_credit=auto`:
+
+| | full | auto→nvrtc | speedup |
+|---|---:|---:|---:|
+| B=1024 | 5,196 B/s | **6,931 B/s** | **1.33x** |
+| B=4096 | 5,679 B/s | **7,806 B/s** | **1.37x** |
+
+Peak VRAM unchanged (926 MiB / 3,148 MiB) — it is the same arithmetic, fewer
+passes.
+
+### Parity: the fused path is inside the reference's own noise
+
+The ring buffer is **bit-identical** (`max|d| = 0.0`): the decay and credit are
+per-element and the arithmetic order is unchanged. `dembed` differs by
+**8.8e-07 of RMS — exactly the spread of `full` against itself**, run to run.
+`index_add_` is an atomic scatter, so its summation order was never
+deterministic; exact equality was never a property of the reference.
+
+The control that settles it, 150 steps, same seed, same byte stream:
+
+| | full vs nvrtc | **full vs full (control)** |
+|---|---:|---:|
+| max per-step \|dloss\| | 4.768e-07 | **4.768e-07** |
+| theta max\|d\|/RMS | 1.138e-06 | **1.138e-06** |
+| ring_w max\|d\|/RMS | 9.656e-08 | **9.656e-08** |
+| ring_b identical | True | True |
+
+Same path twice is as far from itself as the fused path is from it. Gated in
+`tests/check_variants.py` (now lists `nvrtc`, SKIPs on CPU) and in
+`tools/bench_variants.py`.
+
+**Side finding, worth its own line:** the engine is **not** run-to-run
+reproducible on CUDA at ~1e-06 on theta. The "bit-identical" contract holds on
+CPU; on CUDA the scatter makes every run a new trajectory.
+
+### The default no longer crashes
+
+`_ring_mode()` resolves once, up front: `auto` → `compiled` on CUDA, and if the
+device is below cc 7.0 it falls through to `nvrtc`, printing one line. It also
+forces `full` when the model is on CPU — the earlier check keyed off
+`torch.cuda.is_available()`, which is true in a CUDA-capable process running a
+CPU model, and that mismatch reached the kernel with CPU tensors.
+
+### Two pre-existing bugs found on the way (both fixed)
+
+1. **`tail_credit._tail_add`, pure-numpy fallback, was wrong.** It indexed
+   `E[ids, ids, h]` — using the *byte id* for axis 0, which is the *stream*
+   index (`E` is `(B, 256, H)`). The numba path has always been correct. It
+   only ever worked when `B = 256`: with `B=32` it raised
+   `IndexError: index 127 is out of bounds for axis 0 with size 32`. Any box
+   without numba was running a broken reference — here it failed
+   `tests/check_parity.py` on **pristine HEAD**, and passes after the fix.
+2. `gpu_port._compile_failed` was assigned and then **never read** — the
+   fallback that field was clearly written for did not exist.
+
+`tests/check_trainer.py` still fails `['2 tail cap pre-allocation', '3
+state/rebase invalidation']` on the MX150 box, **identically on pristine HEAD**
+— the box has 11 GB RAM against the laptop's 14 GB, so the tail cap trips
+differently. Not a regression, not fixed here.
+
+### What this does NOT change
+
+The MX150 is now **6.9 kB/s**, still ~3.2x slower than a T4's measured 22.1
+kB/s live leg, and the 889,897-step run is still ~36 h here versus ~11.5 h on a
+T4. `PLAN-2026-10-03-DISTILL.md` §9b's verdict stands: **the T4 is still
+required for steps 1-3.** This optimization makes the box good enough for
+gates, rulers and 2,000-step smokes, and it removes a crash that would have
+blocked any pre-Volta GPU outright. It does not make this box a training host.
+
+Reproduction: `.venv-gpu/bin/python tools/bench_variants.py tmt.npz --B 1024
+--steps 200` on the box (add `nvrtc` to the board), and
+`.venv-gpu/bin/python tests/check_variants.py` for the parity half.

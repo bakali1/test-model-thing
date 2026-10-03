@@ -30,14 +30,19 @@ from gpu_port import GpuModel
 VARIANTS = {
     # name: (ring_credit, grad_assembly) -- only measured survivors remain.
     #   full   -- the portable reference (materialize + mask + index_add)
-    #   auto   -- THE DEFAULT on CUDA: compiled (Inductor-fused ring credit)
+    #   auto   -- THE DEFAULT on CUDA: compiled (Inductor-fused ring credit),
+    #             degrading to nvrtc below compute capability 7.0
     #   triton -- the fused-kernel fallback when Inductor is unavailable
+    #   nvrtc  -- fused decay+credit+scatter via NVRTC; the only fused option
+    #             on pre-Volta GPUs (measured +34% end to end on an MX150,
+    #             and indistinguishable from `full` in a trajectory control)
     "full": ("full", "cat"),
     "auto": ("auto", "cat"),
     "triton": ("triton", "cat"),
+    "nvrtc": ("nvrtc", "cat"),
     "g-loop": ("full", "loop"),
 }
-DEFAULT_VARIANTS = "full,auto,triton,g-loop"
+DEFAULT_VARIANTS = "full,auto,triton,nvrtc,g-loop"
 
 
 def bytes_for(B, steps, device, seed=0xBEEF):
@@ -423,6 +428,9 @@ def main():
             continue
         if name == "triton" and triton_missing(device):
             print(f"skip {name}: Triton/CUDA unavailable")
+            continue
+        if name == "nvrtc" and device.type != "cuda":
+            print(f"skip {name}: NVRTC ring credit is CUDA-only")
             continue
         result = run_variant(args.checkpoint, args.B, args.steps, device, cs, ns,
                              ends, name, base_ref_state)

@@ -35,7 +35,7 @@ DEVICE_CPU_COMPILE_SKIP = False
 # Everything else -- factored ring/tail decay, cold-column credit, k-loop,
 # sort+segment, and whole-step torch.compile -- was removed after measuring
 # 0.81x-0.98x or being unsafe, and its code is gone from gpu_port.py.
-RING_PATHS = ("full", "compiled", "triton")
+RING_PATHS = ("full", "compiled", "triton", "nvrtc")
 GRAD_PATHS = ("cat", "loop")
 
 # variant -> (ring_algorithm, tail_algorithm, ring_credit, tolerance)
@@ -125,7 +125,7 @@ def main():
           f"hot={sum(base_m.tail.nhot(i) for i in range(args.layers))}")
 
     bad = []
-    names = ["full", "cat", "loop", "compiled", "triton"]
+    names = ["full", "cat", "loop", "compiled", "triton", "nvrtc"]
     tol = 1e-4
     print(f"\n{'ring path':16s} {'tol':>8s} {'state/RMS':>12s} {'loss d':>10s}  verdict")
     for name in names:
@@ -134,6 +134,10 @@ def main():
             continue
         if name == "compiled" and DEVICE_CPU_COMPILE_SKIP:
             print(f"{name:16s} {'-':>8s} {'-':>12s} {'-':>10s}  SKIP")
+            continue
+        if name == "nvrtc" and not torch.cuda.is_available():
+            print(f"{name:16s} {'-':>8s} {'-':>12s} {'-':>10s}  "
+                  f"SKIP (CUDA-only)")
             continue
         rc = "full" if name in ("full", "cat", "loop") else name
         ga = "loop" if name == "loop" else "cat"

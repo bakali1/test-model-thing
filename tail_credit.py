@@ -77,8 +77,13 @@ else:                                    # pragma: no cover
 
     def _tail_add(E, ids):
         B, H = E.shape[0], E.shape[2]
-        hh = np.arange(H)[None, :]                       # (1, H)
-        np.add.at(E, (ids[:, None], ids[:, None], hh), 1.0)  # broadcast (B, H)
+        # E is (B, 256, H): axis 0 is the STREAM, axis 1 the byte. Indexing axis
+        # 0 with `ids` (the byte id) is a real bug -- it raised IndexError
+        # whenever a byte id >= B (e.g. 127 with B=32), so this fallback only
+        # ever worked for B=256. The numba path above has always been correct.
+        bidx = np.arange(B)[:, None]                    # (B, 1) stream index
+        hh = np.arange(H)[None, :]                      # (1, H)
+        np.add.at(E, (bidx, ids[:, None], hh), 1.0)     # broadcast (B, H)
 
 
 class TailCredit:
