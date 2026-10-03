@@ -883,22 +883,33 @@ class GpuModel:
     def save(self, path):
         data = self.params_dict()
         tmp = path + ".tmp.npz"
-        # DEFLATE, not stored. Measured on models/tmt_t094747.npz (B=1024,
-        # ring_k=18, 115 hot dims): 230.3 -> 115.9 MiB, i.e. 2.0x, and it is
-        # LOSSLESS -- a compressed checkpoint reloads bit-exact (107/107 keys
-        # identical) and np.load auto-detects either form, so old and new
-        # checkpoints stay interchangeable.
+        # DEFLATE, not stored. np.savez writes a ZIP with STORED members; the
+        # B-dependent state is mostly small-magnitude, so DEFLATE collapses it.
+        # Measured on real checkpoints, LOSSLESS -- a compressed checkpoint
+        # reloads bit-exact (107/107 keys identical) and np.load auto-detects
+        # either form, so old and new checkpoints stay interchangeable.
         #
-        # It compresses this well because the B-dependent state is mostly
-        # small-magnitude: only ~7% of tail_E entries exceed 1e-4 of their
-        # layer max (per-layer, all 16 measured), so the rest is long runs of
-        # near-identical bytes. A freshly seeded model is 7.3x (15.9 vs
-        # 115.3 MiB) because its tail_E is still all zeros.
+        #   tmt_t094747.npz  B=1024 ring_k=18 115 hot dims
+        #       stored  230.3 MiB  ->  DEFLATE  115.9 MiB   (2.0x)
+        #   tmt_t101847.npz  B=1024 ring_k=18 123 hot dims
+        #       stored  238.4 MiB  ->  DEFLATE  ~119   MiB   (2.0x)
+        #   a freshly seeded model (tail_E still all zeros)
+        #       stored  115.3 MiB  ->  DEFLATE   15.9 MiB   (7.3x)
         #
-        # Cost: ~8.4s to write a 230 MiB checkpoint (vs ~0.2s stored), ~0.2s
-        # extra to read. Against a 1.5-2 min HF push/pull per 250 MB artifact
-        # that is free, and it halves every transport in the leg.
-        np.savez(tmp, **data)
+        # The win is entirely in the B-dependent state: only ~7% of tail_E
+        # entries exceed 1e-4 of their layer max (all 16 layers measured), so
+        # most of it is long runs of near-identical bytes. params (theta, m, v,
+        # ~51 MiB) are float noise and barely compress.
+        #
+        # WHAT THIS DOES NOT DO: it does not reduce RAM or VRAM. The live
+        # buffers are the same size; only the file shrinks. So it makes a big
+        # checkpoint cheap to push/pull, but it does NOT raise the batch
+        # ceiling -- VRAM is the limit there, and B=4096 already needs
+        # 3,148 MiB of a 3.94 GiB card.
+        #
+        # Cost: ~8.4s to write a 230 MiB checkpoint vs ~0.2s stored, ~0.2s
+        # extra to read. Against a 1.5-2 min network transfer, free.
+        np.savez_compressed(tmp, **data)
         os.replace(tmp, path)
 
     def load(self, path):

@@ -399,10 +399,14 @@ def main():
                     help="run N steps before starting the throughput clock "
                          "(torch.compile/allocator/autotune). Required for a "
                          "short calibration run to report a real rate.")
-    ap.add_argument("--ring-credit", choices=("auto", "full", "compiled", "triton"),
+    ap.add_argument("--ring-credit",
+                    choices=("auto", "full", "compiled", "triton", "nvrtc"),
                     default="auto",
                     help="auto = Inductor-fused on CUDA (+27%% measured), full "
-                         "on CPU; triton = fused-kernel fallback")
+                         "on CPU, and nvrtc below compute capability 7.0 where "
+                         "Triton cannot run at all; triton = fused-kernel "
+                         "fallback; nvrtc = NVRTC fused decay+credit+scatter, "
+                         "the only fused path on pre-Volta GPUs (+33%% there)")
     ap.add_argument("--grad-assembly", choices=("cat", "loop"), default="cat",
                     help="cat = one fused gradient-buffer write (default, "
                          "bit-identical); loop = 69-copy reference for A/B")
