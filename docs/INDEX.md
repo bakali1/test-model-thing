@@ -16,6 +16,7 @@ from-scratch experiment).
 | `plans/PLAN-2026-10-04-LR-ROLES.md` | role-specific-LR factorial (the cheap half of the SNR blocker's two-axis plan); gate + Colab bundle built, run not launched | **current** |
 | `plans/PLAN-2026-10-03-DISTILL.md` | distil an open model into TMT (teacher `LFM2.5-230M-Base`, Marginalize-It, teacher-generated corpus); gate 0 cleared | **current — read before optimizing** |
 | `plans/PLAN-2026-10-04-ROADMAP.md` | roadmap v2 — credit → SSM → memory ruler; synthesis of YT/issues/Karpathy-1506.02078v2/video decisions; ranked queue + rejected ideas | **current — read before new experiments** |
+| `plans/PLAN-2026-10-04-ROUTER.md` | 4.5M intent→JSON tool router (SFT, short-horizon, teacher-as-labeler); the two pilot gates that decide it | **design — pilot costed, nothing measured yet** |
 | `optimization/OPTIMIZATION_TEST_STATUS.md` | what was measured, what was **not**, what to try next | **current — read before optimizing** |
 | `optimization/GPU_OPTIMIZATION_PLAN.md` | the optimization plan and its measured outcome (§0) | historical + measured |
 | `optimization/GPU_OPTIMIZATION_PLAN-REVIEW.md` | review of that plan | review, closed |

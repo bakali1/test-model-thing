@@ -53,6 +53,7 @@ def main():
     control = set(meta["control_ids"]) | set(meta["nonbyte_ids"])
     vocab = D.VocabBytes(table, drop_ids=control)
 
+    B_STREAMS_MIN = 1024
     report = {"dump": args.dump, "steps": args.steps, "by_depth": {}}
     for path in files:
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -63,6 +64,13 @@ def main():
         data = open(path, "rb").read()
         streams, _ends = NP.Runtime.make_streams(data, man["B"])
         r = D.MiReader(args.dump, stem, vocab, streams=streams, block=args.block)
+        if int(np.asarray(r.tok_len).sum()) < B_STREAMS_MIN or r.Ltok < 2:
+            raise SystemExit(
+                f"[FATAL] {stem}: the dump is degenerate (Ltok={r.Ltok}, "
+                f"{int(np.asarray(r.tok_len).sum())} token bytes). This is the "
+                f"all-padding dump, which has the CORRECT bytes-per-token and is "
+                f"therefore invisible to the storage check. Re-dump it; do not "
+                f"read coverage numbers off it.")
         L = min(args.steps, r.L_step - 1)
         ret_by_d = {d: [] for d in range(4)}
         hit_by_d = {d: [0, 0] for d in range(4)}

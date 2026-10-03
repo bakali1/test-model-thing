@@ -1307,3 +1307,128 @@ in the trunk. The per-role-LR axis is answered; do not extend it.
   rather than pushing only at arm end, because `Trainer.train(save=...)` takes a
   **boolean**, not a callback — the first draft's push-inside-callback never ran,
   which cost two arms before it was caught live.
+
+---
+
+## Colab T4 smoke (item 4) — PASS, and it killed the KD arm (2026-10-03)
+
+`bundles/make_kd_smoke_bundle.py` → `colab_kd_smoke.py`, T4, 2,000 steps at
+B=1024, α=0.5, 6.24 MB TinyStories slice, dump written in-session.
+**`[RESULT] OVERALL: PASS`** in 510 s. It is a plumbing smoke, not a science arm
+— and the plumbing verdict is that three numbers in this file are wrong and one
+whole idea does not work.
+
+### What passed
+
+| stage | result |
+|---|---|
+| teacher | `model_type=lfm2`, 14 layers, vocab 65,536, 464 MB, fp32, TF32 off |
+| dump | 1,511,812 tokens in 287 s (≈21.7 kB/s of teacher scoring) |
+| coverage (T4) | depth 0 **91.2 %**, 47.3 %, 36.7 %, 31.6 % — reproduces the laptop CPU (91.6/51.2/40.6/36.0) |
+| gate 3 on Colab's CPU | α=0 bit-exact, max\|Δθ\| = 0.0 over 120 steps |
+| throughput | 35,832 B/s CE-only, 25,722 B/s with KD (real leg measures 22–27.5 kB/s) |
+| engine α | 0.5 honoured, coverage 52.13 % live, KD moved the loss |
+
+### First Colab run failed, and the failure was the most useful thing in it
+
+`TinyStories-train.txt` separates stories with `<|endoftext|>` — **246 markers
+per 200 kB** — which the LFM2 tokenizer maps to control id 2. `mi_dump` refused,
+correctly. But it then substituted an empty array per stream and **exited 0**,
+and the resulting all-padding dump measured **193.4 B/token — exactly the frozen
+target**, because padding has the same bytes-per-token as content. The storage
+check could not see an empty dump; a *completeness* check (bytes ÷ tokens in
+1.2–8.0) can, and now does, and the guard raises with the offending id named.
+The bundle now strips the markers, as `fetch_eval_data.py` documents.
+
+### Correction 1 — the dump is 259.1 B/token, not 193
+
+At B=1024 on real text the token axis is padded to the longest stream: **259.1
+B/token = 63 B per training byte**, i.e. a 64 MB slice is a **4.1 GB** dump, not
+3.0 GB. The 193.4 figure from the first run was the degenerate dump. Per-stream
+padding does not shrink with corpus size, so this is the real number.
+
+### Correction 2 — KD costs +39.3 % on a T4, not +1.5 %
+
+| | laptop CPU | T4 |
+|---|---:|---:|
+| α=0 | 966 ms/step | 28.6 ms/step |
+| α=0.5 | +1.5 % | **+39.3 %** (39.8 ms/step) |
+
+The target build is single-threaded numpy on the host and is **serial with the
+step**, so on a fast GPU it stops being amortized: 11 ms of host work against a
+29 ms device step. A KD arm on the T4 costs ~40 % more wall clock per step than
+the plan assumed.
+
+### The KD arm diverges — and the reason invalidates the idea
+
+CE-only and KD arms, identical seed 0, identical byte stream, laptop CPU,
+B=64, 2,500 steps, same dump:
+
+| step | α=0 (CE) | α=0.5 (KD) |
+|---:|---:|---:|
+| 1,000 | 2.48 | 2.68 |
+| 1,800 | **1.89** | 2.20 |
+| 2,100 | 2.25 | 2.70 |
+| 2,300 | 1.97 | 5.04 |
+| 2,499 | **1.80** | **16.77** |
+
+The KD arm is worse from early on and then diverges; the control keeps
+improving. The T4 smoke independently showed the same thing (KD loss 3,450 vs CE
+2.36 at step 2,000).
+
+**The reason, measured over 4,679 covered positions on a real dump:**
+
+| property of the MI target | value |
+|---|---:|
+| target entropy | **0.000000** nats (max −0.000000) |
+| fraction with entropy > 0.001 | **0.00 %** |
+| argmax == gold byte | **100.000000 %** |
+| top1 − top2 mass gap | 1.000000 (every position) |
+
+**The Marginalize-It byte target is a point mass at the gold byte. It is always
+one-hot, by construction, not by accident:**
+
+    S = { c : bytes(c)[:d+1] == gold[:d+1] and len(c) > d }
+    every c in S has bytes(c)[d] == gold[d]
+    => p_target[gold[d]] = sum_{c in S} p(c) / sum_{c in S} p(c) = 1
+
+Conditioning on the gold prefix forces every surviving token to agree on byte
+*d*. So the 256-way target is degenerate, the "soft label" is a hard label, and
+`α·KL + (1−α)·CE` reduces to **position-dependent CE reweighting**: weight 1.0
+on the ~52 % covered positions and 0.5 on the rest. That is not distillation,
+and it is presumably why the arm both underperforms and destabilizes.
+
+The earlier note in this file ("surviving targets are essentially one-hot, so the
+target carries the teacher's ranking, not its uncertainty") was recorded as a
+curiosity. It is the headline.
+
+### The fix, and it is small
+
+Depth 0 does **not** have to be degenerate. The paper's Case I builds the
+first-byte distribution by aggregating tokens that *start with* B1 — it does not
+condition on the gold byte. Measured on the same dump, unconditioned:
+
+| depth-0, unconditioned first-byte marginal | value |
+|---|---:|
+| entropy (nats) | mean **0.306**, p95 1.197 |
+| positions with entropy > 0.01 | **64.4 %** |
+| mean max marginal | 0.888 |
+
+So the teacher *does* carry a real soft byte distribution — and my implementation
+threw it away at depth 0 by applying the gold-prefix filter there. Corrected
+design: **depth 0 → unconditioned first-byte marginal (soft, real); depths ≥ 1 →
+drop from KD entirely** (one forward pass plus gold-prefix conditioning cannot
+represent byte uncertainty there; restoring it needs either the EoT channel or
+extra teacher passes). That is a real distillation signal on ~1 position in 4.1
+— about 24 % of bytes — and nothing anywhere else. Whether 24 % is enough to move
+the ruler is an empirical question, and the only honest next experiment.
+
+### What this does NOT retract
+
+The retained-mass table (91.2/47.3/36.7/31.6 % coverage) is still correct as a
+measure of **how often the gold prefix has any support in the top-k** — it just
+is not a measure of target *fidelity*, because the target carries no
+uncertainty to be faithful about. The gates, the dump format, the alignment
+contract, the α=0 bit-exactness guarantee, and the KD term's algebra all stand.
+The word "fidelity" in the earlier coverage text is what should have been
+questioned: fidelity to a distribution that does not exist in the target.

@@ -52,11 +52,29 @@ def load_teacher(repo, model, dtype, device):
 
 
 def tokenize_stream(tk, data, table, control, B):
-    """One stream -> ids + tok_len, with exact reconstruction asserted."""
+    """One stream -> ids + tok_len, with exact reconstruction asserted.
+
+    A control id in real text is a HARD ERROR with an actionable message, not a
+    skipped stream. The first version substituted an empty array and carried on:
+    the dump then exited 0, hit the 193 B/token storage target exactly (because
+    an all-padding dump has the same bytes-per-token), and contained NOTHING.
+    That is the worst failure shape available here, and it happened on the first
+    Colab run because `TinyStories-train.txt` separates stories with
+    `<|endoftext|>` (246 markers per 200 kB), which LFM2 tokenizes to control
+    id 2. `fetch_eval_data.py` strips these; every corpus must too.
+    """
     text = data.decode("utf-8", "ignore")
     ids = tk.encode(text).ids
-    if any(i in control for i in ids):
-        return None, None                      # a control id in real text: refuse
+    bad = sorted({i for i in ids if i in control})
+    if bad:
+        sample = bytes(table[bad[0]])[:24]
+        raise RuntimeError(
+            f"stream contains {len(bad)} control token id(s) (first: "
+            f"{bad[:3]} = {sample!r}). Control ids are literal control text, "
+            f"never corpus bytes, so they cannot be a distillation target. "
+            f"TinyStories ships '<|endoftext|>' between stories -- strip it (as "
+            f"fetch_eval_data.py does) before dumping. Refusing to write a dump "
+            f"that would be silently wrong at every position.")
     if tt.reconstruct(table, ids) != data:
         raise RuntimeError(
             "token->byte reconstruction is NOT exact for this stream; refusing to "
@@ -79,8 +97,6 @@ def dump_file(model, tk, table, control, path, out_dir, B, k, batch_tokens, devi
     ids_list, len_list = [], []
     for j, s in enumerate(streams):
         ids, tok_len = tokenize_stream(tk, s, table, control, B)
-        if ids is None or len(ids) < 2:
-            ids, tok_len = np.zeros(1, np.int64), np.zeros(1, np.uint8)
         ids_list.append(ids)
         len_list.append(tok_len)
     ntok_j = np.asarray([len(x) for x in ids_list], np.int64)
@@ -134,8 +150,18 @@ def dump_file(model, tk, table, control, path, out_dir, B, k, batch_tokens, devi
     paths = D.save_dump(out_dir, stem, ids_all, probs_all, len_all, meta)
     size = sum(os.path.getsize(paths[x]) for x in ("ids", "probs", "tok_len"))
     bpt = size / max(1, ntok_j.sum())
-    print(f"[dump] wrote {stem}: {ntok_j.sum():,} tokens, {size / 1e6:.1f} MB "
-          f"({bpt:.1f} B/token; frozen target 193)")
+    # COMPLETENESS GATE. An all-padding dump has the right bytes-per-token, so
+    # B/token cannot detect an empty dump. Token count can: 1.5-6 bytes per
+    # token covers every text corpus this will ever see.
+    n = int(ntok_j.sum())
+    per_token = len(data) / max(1, n)
+    if not (1.2 <= per_token <= 8.0):
+        raise RuntimeError(
+            f"dump is degenerate: {n:,} tokens for {len(data):,} bytes = "
+            f"{per_token:.2f} B/token. Expected 1.5-6. This is what an "
+            f"all-padding dump looks like, and it PASSES the B/token check.")
+    print(f"[dump] wrote {stem}: {n:,} tokens, {size / 1e6:.1f} MB "
+          f"({bpt:.1f} B/token; frozen target 193) | {per_token:.2f} B/token")
     return {"stem": stem, "file": path, "tokens": int(ntok_j.sum()),
             "bytes": size, "B": B, "Ltok": Ltok, "L_step": L_step,
             "bytes_per_token": round(bpt, 1),

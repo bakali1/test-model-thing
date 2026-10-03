@@ -165,6 +165,16 @@ on-policy amplifies existing modes (FS-N emitted 16 consecutive newlines).
 The paper's §6.6: at ~1.8e21 FLOPs all four byte models had *better* BPB and
 *much worse* benchmark performance. An arm that wins held-out CE has not won.
 
+**⚠ SUPERSEDED BY MEASUREMENT (2026-10-03):** the KD arm as specified cannot be
+judged this way, because the Marginalize-It byte target is **one-hot at the gold
+byte on 100.000000% of covered positions** (entropy exactly 0.000000 nats).
+Conditioning on the gold prefix forces every surviving token to agree on byte
+*d*, so `α·KL + (1−α)·CE` degenerates to position-dependent CE reweighting. The
+arm is worse than the control from early on and diverges by step ~2,200. See
+RESULTS.md, "Colab T4 smoke". The only real signal available in one teacher pass
+is the **unconditioned depth-0 first-byte marginal** (entropy mean 0.306 nats,
+64% of positions non-degenerate), which covers ~1 byte position in 4.1.
+
 **Gate for every KD arm:** ruler CE ≥ control **and** no regression in the
 6-seed degeneracy metrics (max newline run, unique bytes, entropy) **and** no
 `User:`/`Assistant:` leakage. A CE-only win is reported as a *partial* result
@@ -261,6 +271,11 @@ Two constraints make CPU-only worse than the hours suggest:
 frozen-config rate is 1,060 B/s rather than 889. A 2,000-step B=1024 smoke is
 **~68 min on CPU** (~35 min dump + ~33 min train). A 16 MB CE+KD A/B with one
 shared dump is **~13 h**, not ~16 h.
+
+**UPDATE (Colab, 2026-10-03):** KD is **+39.3 % on a T4** (39.8 vs 28.6 ms/step),
+not +1.5 %. The target build is single-threaded host numpy, serial with the step,
+so it stops amortizing when the device step is fast. Budget T4 KD arms at 1.4x
+the CE arm, not 1.015x.
 
 **Verdict: CPU-only is ~5 days for the full 64 MB plan and is dominated by
 teacher generation (37 h) plus the two CE control arms (40 h).** Use the T4 for
