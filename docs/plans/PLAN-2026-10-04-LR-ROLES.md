@@ -1,8 +1,9 @@
 # PLAN — the role-specific-LR factorial (2026-10-04)
 
 **Date:** 2026-10-04
-**Status:** engine support + gate + Colab bundle **built and rehearsed**; the
-Colab run has not been launched (blocked on one prerequisite, §6)
+**Status:** **EXECUTED 2026-10-04 — axis answered, no winner, closed.** All
+three arms ran on a T4 and landed on the hub as `arm_lrdecay{1x,4x,16x}_t919897.npz`.
+Numbers and verdict: `RESULTS.md` §"role-specific-LR factorial"; summary in §9.
 **Predecessors:** `PLAN-2026-10-03-DISTILL.md`, `PLAN-2026-09-23-GPU.md`,
 `../optimization/OPTIMIZATION_TEST_STATUS.md`, `../../RESULTS.md`
 (`RESULTS.md` §"Gradient SNR was ~0.05 for the entire run").
@@ -190,7 +191,38 @@ T4 steps. Local ruler cost is 3 × 11–22 min on the laptop CPU.
   build it.
 - No k-sweep, no α sweep, no extra seeds.
 
-## 9. Results
+## 9. Results — the axis is live, and it buys nothing
 
-_(to be appended when the arms land — decay telemetry first, then the ruler, with
-each arm's ruler setting stated next to its number)_
+Full tables, probe numbers and confounds are in `RESULTS.md`. The short version:
+
+**The falsifier in §4 did not fire, which is itself the finding.** σ_mean rises
+monotonically with the decay role's LR (1.82× the control's own movement at 4×,
+2.14× at 16×), so the decay role *is* LR-limited. But the response **saturates**:
+4×→16× is 4× more LR for only 40 % more movement. And none of it is worth
+anything —
+
+| arm | held-out CE | Δ vs control | σ_mean | hot dims | tail |
+|---|---:|---:|---:|---:|---:|
+| 1× | 1.2094 ± 0.0143 | — | 0.5191 | 172 | 180 MB |
+| 4× | 1.2174 ± 0.0138 | +0.0080 | 0.5226 | 204 | 214 MB |
+| 16× | 1.2191 ± 0.0149 | +0.0097 | 0.5240 | 221 | 232 MB |
+
+CE is **monotonically worse** with more decay LR (both deltas inside the 0.03
+bar, but the wrong way), cross-domain CE degrades most at 16×, and the
+generation probe shows **0/9 degenerate and 0/9 non-terminating in every arm** —
+i.e. no regression to explain, and no benefit either. The concrete cost is
+real: **+29 % hot tail for zero gain**.
+
+**Conclusion: the decay role is not the binding constraint.** More decay LR buys
+more memory length, and the credit path does not convert that into better
+prediction. That is consistent with the SNR blocker living upstream in the
+trunk, and it means the SGD axis should be judged on whether it moves trunk SNR
+at all — not on decay behaviour. **Do not extend this axis.**
+
+Two things went wrong that were *not* the experiment: the first VM was reclaimed
+when the laptop's DNS dropped and killed the keep-alive daemon, taking the
+control arm's telemetry with it (so per-arm SNR has no matched control — the
+σ/CE comparisons are unaffected, since those come from checkpoints that
+survived); and `Trainer.train(save=...)` takes a **boolean**, not a callback, so
+the first bundle's push-inside-callback never fired. Both are fixed and both are
+recorded in `RESULTS.md`.

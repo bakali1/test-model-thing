@@ -21,8 +21,11 @@ arm branches off the incumbent with AdamW's m/v carried over. An AdamW->SGD arm
 could not do that -- it changes what a checkpoint contains -- which is why the
 SGD row is a separate, more expensive experiment.
 
-Auth: for a private Hub repo supply a Colab secret named `TMT_TOKEN`. The
-generated bundle never embeds credentials.
+Auth: the bundle never embeds credentials. It resolves a token in this order --
+`$TMT_TOKEN`, a Colab secret named `TMT_TOKEN`, then a token file at
+`$TMT_TOKEN_FILE` (default `/content/.hf_token`) that you can stage with
+`colab upload ~/.cache/huggingface/token /content/.hf_token`. `huggingface_hub`
+is pip-installed on the VM if absent.
 
 Local rehearsal (CPU, a few steps, no hub):
     TMT_DEVICE=cpu TMT_STEPS=20 TMT_CKPT=tmt.npz \
@@ -53,7 +56,7 @@ laptop afterwards -- this script never declares a winner, because a training-set
 SNR move is not a held-out result.
 """
 import base64
-import glob, gzip, json, os, shutil, sys, time, urllib.request
+import glob, gzip, json, os, shutil, sys, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 if not os.path.isdir(HERE):
@@ -67,14 +70,35 @@ if not TMT_TOKEN:
         TMT_TOKEN = userdata.get("TMT_TOKEN") or ""
     except Exception:
         pass
+# Fallback for when no Colab secret exists: a token file staged on the VM by
+# `colab upload`. Kept last so a real secret always wins, and kept OUT of the
+# generated file so no credential is ever committed. checkpoint_hub._token()
+# reads TMT_TOKEN, so setting the env var here is all it takes.
+TOKEN_FILE = os.environ.get("TMT_TOKEN_FILE", "/content/.hf_token")
+if not TMT_TOKEN and os.path.exists(TOKEN_FILE):
+    with open(TOKEN_FILE) as _f:
+        TMT_TOKEN = _f.read().strip()
+    print(f"[auth] token read from {TOKEN_FILE}", flush=True)
 if TMT_TOKEN:
     os.environ["TMT_TOKEN"] = TMT_TOKEN
-    print("[auth] TMT_TOKEN supplied at runtime (value not shown)", flush=True)
+    print("[auth] token present (value not shown)", flush=True)
 
 for name, b64 in PAYLOAD.items():
     with open(os.path.join(HERE, name), "wb") as f:
         f.write(gzip.decompress(base64.b64decode(b64)))
 sys.path.insert(0, HERE)
+
+# huggingface_hub is NOT preinstalled on a Colab VM and checkpoint_hub imports
+# it lazily, so the pull/push below would die with ImportError at step 1. Install
+# it here rather than assuming, and print what happened either way.
+try:
+    import huggingface_hub  # noqa: F401
+    print("[deps] huggingface_hub present", flush=True)
+except ImportError:
+    import subprocess
+    print("[deps] installing huggingface_hub ...", flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "huggingface_hub"], check=True)
 
 import numpy as np
 import torch
@@ -85,7 +109,7 @@ import checkpoint_hub as hub
 # ----------------------------- configuration ------------------------------
 STEPS        = int(os.environ.get("TMT_STEPS", "30000"))
 BATCH        = int(os.environ.get("TMT_BATCH", "1024"))
-SAVE_EVERY   = int(os.environ.get("TMT_SAVE_EVERY", "20000"))
+SAVE_EVERY   = int(os.environ.get("TMT_SAVE_EVERY", "10000"))
 KEEP_K       = int(os.environ.get("TMT_KEEP_K", "2"))
 LR           = float(os.environ.get("TMT_LR", "5e-4"))
 # The axis under test. 1.0 is the CONTROL (identical to today's single-LR
@@ -97,7 +121,12 @@ DATA_URL     = os.environ.get(
     "TMT_DATA_URL",
     "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/"
     "TinyStories-train.txt")
-HUB_REPO     = (os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL") or __REPO__)
+HUB_REPO     = (os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_REPO_FALLBACK") or __REPO__)
+# checkpoint_hub resolves the repo from the environment when a call doesn't pass
+# one, so export it: otherwise pull() would use its own default while push() got
+# the embedded id, and the run would read and write two different repos.
+if HUB_REPO:
+    os.environ["TMT_HUB_REPO"] = HUB_REPO
 CKPT         = os.environ.get("TMT_CKPT", "tmt_incumbent.npz")
 DEVICE       = os.environ.get("TMT_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 TELEMETRY_EVERY = int(os.environ.get("TMT_TELEMETRY_EVERY", "2000"))
@@ -116,6 +145,48 @@ def result(name, ok, detail=""):
           + (f" ({detail})" if detail else ""), flush=True)
 
 
+# ---- durability thread ----------------------------------------------------
+# `Trainer.train(save=...)` takes a BOOLEAN, not a callback: it calls the
+# module-level save_checkpoint() itself (`if save:` at train_gpu.py:305). An
+# earlier draft of this bundle passed a lambda and tried to push from inside it,
+# which therefore never ran -- proven live, where three consecutive saves produced
+# zero pushes and only the end-of-arm sweep saved the arm. So durability is a
+# watchdog that notices new tag files and pushes them within POLL seconds, rather
+# than riding on a callback that is not called.
+POLL = int(os.environ.get("TMT_PUSH_POLL", "60"))
+_pushed, _push_lock = set(), threading.Lock()
+
+
+def _push_one(path, why):
+    try:
+        arm = os.path.basename(path).split("_t")[0].replace("arm_", "")
+        hub.push(path, repo_id=HUB_REPO, run_id=f"lrroles-{arm}")
+        with _push_lock:
+            _pushed.add(path)
+        print(f"  [push] {os.path.basename(path)} -> {HUB_REPO} ({why})",
+              flush=True)
+        return True
+    except Exception as exc:
+        print(f"  [push] FAILED {os.path.basename(path)}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
+def _push_watchdog(stop):
+    while not stop.wait(POLL):
+        for tp in sorted(glob.glob("arm_*_t*.npz")):
+            with _push_lock:
+                if tp in _pushed:
+                    continue
+            _push_one(tp, "watchdog")
+
+
+_stop_push = threading.Event()
+if PUSH:
+    threading.Thread(target=_push_watchdog, args=(_stop_push,),
+                     daemon=True).start()
+    print(f"[durability] push watchdog on: every {POLL}s", flush=True)
+
 # ---------------- A: device ----------------
 banner("A: device")
 info = torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu"
@@ -132,10 +203,23 @@ if os.path.exists(CKPT):
     print(f"  using local {CKPT}", flush=True)
 else:
     try:
-        hub.pull(CKPT, expect_t=None, require_digest=False)
-        print(f"  pulled {CKPT}", flush=True)
+        # Signature is pull(dest, repo_id=None, token=None, repo_type=None,
+        # force=False, expect_n=None, require_digest=True) -- there is no
+        # `expect_t`, and the first draft of this bundle passed one. That bug was
+        # invisible to the local rehearsal (a local TMT_CKPT skips pull
+        # entirely), which is exactly why it must be fixed against the real
+        # signature rather than from memory.
+        import inspect
+        kw = {}
+        sig = inspect.signature(hub.pull).parameters
+        if "require_digest" in sig:
+            kw["require_digest"] = False
+        st = hub.pull(CKPT, **kw)
+        print(f"  pulled {CKPT} (t={st})", flush=True)
     except Exception as exc:
-        print(f"  [FATAL] could not obtain a checkpoint: {exc}", flush=True)
+        print(f"  [FATAL] could not obtain a checkpoint: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        import traceback; traceback.print_exc()
         sys.exit(1)
 probe = np.load(CKPT)
 start_t = int(np.ravel(probe["t"])[0])
@@ -194,9 +278,9 @@ for mult in MULTIPLIERS:
         telemetry_every=TELEMETRY_EVERY, telemetry_path=tele_path,
         log_every=max(2000, STEPS // 8))
     t0 = time.time()
+    # `save=True` is a FLAG, not a callable -- see the watchdog note above.
     try:
-        trainer.train(save=lambda m: m.save(arm_path), dataset=data_path,
-                      hub_repo=None)
+        trainer.train(save=True, dataset=data_path, hub_repo=None)
         ok = True
     except Exception as exc:
         print(f"  [FATAL] arm {tag} raised {type(exc).__name__}: {exc}",
@@ -233,28 +317,19 @@ for mult in MULTIPLIERS:
                   if row["throughput_B_per_s"] else "", flush=True)
     summary.append(row)
     result(f"arm {tag} completed", ok, f"{dt/60:.1f} min")
-
-    # Push the arm's tagged checkpoint BEFORE moving on. `colab run` releases the
-    # VM when it returns, and a checkpoint that never left is lost -- that is
-    # exactly how the 2026-09-24 live leg lost its tags. Push by hand rather
-    # than through trainer.train(hub_repo=...): that path PULLs first, and each
-    # arm copy is deliberately older than the hub's newest tag, so the pull
-    # would overwrite this arm with somebody else's checkpoint.
+    # The watchdog should already have pushed every tag; this sweep only catches
+    # anything written in the last POLL seconds.
     if PUSH and os.path.exists(arm_path):
         for tp in (sorted(glob.glob(f"arm_{tag}_t*.npz")) or [arm_path]):
-            try:
-                st = hub.push(tp, repo_id=HUB_REPO, run_id=f"lrroles-{tag}")
-                print(f"  [push] {os.path.basename(tp)} -> {HUB_REPO} (t={st})",
-                      flush=True)
+            with _push_lock:
+                if tp in _pushed:
+                    continue
+            if _push_one(tp, "final sweep"):
                 row.setdefault("pushed", []).append(os.path.basename(tp))
-            except Exception as exc:
-                print(f"  [push] FAILED {os.path.basename(tp)}: "
-                      f"{type(exc).__name__}: {exc}", flush=True)
-                row["push_error"] = f"{type(exc).__name__}: {exc}"
-                result(f"arm {tag} pushed", False, str(exc)[:70])
-    elif not PUSH:
-        print(f"  [push] disabled (TMT_PUSH=0): arm {tag} will NOT survive the "
-              f"VM unless you download it", flush=True)
+    # Keep the telemetry on the VM readable for `colab download` before stop --
+    # it is the only record of the per-arm gradient SNR, which cannot be
+    # recomputed from a checkpoint after the fact.
+    print(f"  [keep] telemetry for download: {tele_path}", flush=True)
 
 banner("SUMMARY")
 print(json.dumps(summary, indent=2), flush=True)

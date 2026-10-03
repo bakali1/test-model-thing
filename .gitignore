@@ -28,3 +28,4 @@ __pycache__/
 
 # experiment output (756 MB); keep history readable for rig commits
 runs/
+runs/lrroles/*.npz

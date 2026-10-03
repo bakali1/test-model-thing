@@ -1237,3 +1237,73 @@ yields 1-byte streams, which fails loudly rather than silently misaligning.
 889 B/s and the inflated KD overhead): at the measured 1,060 B/s, one 16 MB arm
 is **4.2 h**, so CE control + KD arm + one shared dump = **≈ 13 h**, with
 ~32 % KD coverage. That is a genuine option, not just a fallback.
+
+---
+
+## 2026-10-04 — role-specific-LR factorial (PLAN-2026-10-04-LR-ROLES)
+
+Three arms, **30,000 steps each from the same t=889,897 checkpoint bytes**, same
+data seed 0, same B=1024, same 96 MB TinyStories slice, same T4
+(`ring_credit=auto`→compiled, ~22–24 kB/s). Only `--lr-decay` differs: the LR of
+the 16 per-layer `.decay` slices (8,192 of 4,481,793 params = **0.183 %**).
+Ruler: `--slices 3 --bytes 20000 --xd-bytes 8000 --xd-files 4`.
+
+| arm | `--lr-decay` | held-out CE (nats/byte, 6 slices) | shift CE | cross-domain CE |
+|---|---|---|---|---|
+| `arm_lrdecay1x_t919897` | unset (**control**) | **1.2094 ± 0.0143** | 1.1648 ± 0.0162 | 2.4176 ± 0.1372 |
+| `arm_lrdecay4x_t919897` | 2e-3 | 1.2174 ± 0.0138 (**+0.0080**) | 1.1734 ± 0.0161 | 2.4181 ± 0.1367 |
+| `arm_lrdecay16x_t919897` | 8e-3 | 1.2191 ± 0.0149 (**+0.0097**) | 1.1710 ± 0.0150 | 2.4441 ± 0.1411 |
+
+**Decay-role response** (static, computed identically from each checkpoint):
+
+| arm | σ_mean | moved vs start | × control | half-life | hot dims | tail @B=1024 | stop AUC |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| start (t=889,897) | 0.51479 | — | — | 1.138 B | 1669 | — | — |
+| 1x | 0.51911 | +0.00432 | 1.00 | 1.162 B | 1747 | 180.4 MB | 0.9496 |
+| 4x | 0.52264 | +0.00784 | 1.82 | 1.179 B | 1810 | 213.9 MB | 0.9426 |
+| 16x | 0.52404 | +0.00925 | 2.14 | 1.190 B | 1895 | 231.7 MB | 0.9597 |
+
+**Generation probe** (3 prompts × 3 seeds, `--n 400`, same prompt bytes and seeds
+per arm): **0/9 degenerate and 0/9 non-terminating in every arm.** u8 ratio
+0.906 / 0.888 / 0.950; rep8 0.85 % / 0.99 % / 0.93 %; max whitespace run 2 / 3 / 2.
+No generation-health difference. (`stop/kB` is not readable here: at `--n 400`
+the generations are too short for the 13–17/kB natural-prose baseline.)
+
+### Verdict: the axis is LIVE but buys nothing. No winner; axis closed.
+
+The plan's falsifier did **not** fire. It predicted that if σ_mean did not
+visibly rise from 1×→16×, the decay role would not be LR-limited and the axis
+would be dead. It does rise, monotonically, with a clean dose–response —
+**and it saturates hard**: 4× the LR moves σ 1.82× the control's own movement,
+but going 4×→16× (4× more LR again) adds only **40 % of the first jump**.
+
+So the decay role *is* LR-responsive, and pushing it harder is still not worth
+anything: CE is **monotonically worse** with more decay LR (+0.008 at 4×,
++0.0097 at 16× — both inside the 0.03 bar, but in the wrong direction), while the
+cost is concrete and not: hot dims 172→221 and the hot tail **180 → 232 MB
+(+29 %)** for zero gain. Cross-domain CE degrades most at 16× (2.4176 → 2.4441).
+
+The extra "memory" the decay role buys is not being used by the credit path to
+predict better. This is evidence that **the decay role is not the binding
+constraint on quality** — consistent with the SNR blocker sitting upstream of it
+in the trunk. The per-role-LR axis is answered; do not extend it.
+
+### Confounds and gaps, stated
+
+- **The control arm's gradient-SNR telemetry was lost.** The first live VM was
+  reclaimed mid-factorial (laptop DNS failure killed the keep-alive daemon; see
+  below), taking `telemetry_lrdecay1x.jsonl` with it. So per-arm SNR exists for
+  4× and 16× only, with **no matched 1× control**; the SNR readout of this
+  factorial is therefore unpaired. The σ / half-life / hot-dim / CE comparisons
+  above are unaffected — all four come from checkpoints that did survive, and the
+  16× arm was re-run from the *pinned* start file on a fresh VM.
+- Arms ran on three different VMs; only the pinned-start guarantee
+  (`tmt_mixed_long889897_t889897.npz`, data seed 0) makes them matched, and the
+  loss traces confirm it — 4× at step 891,772 read ce 1.259 vs the control's
+  1.258.
+- **Infrastructure, not quota, ended two runs.** `colab` history shows
+  `NameResolutionError` for `colab.research.google.com` → keep-alive daemon dead
+  → VM reassigned. Fixes now in the bundle: a push **watchdog** (every 60 s)
+  rather than pushing only at arm end, because `Trainer.train(save=...)` takes a
+  **boolean**, not a callback — the first draft's push-inside-callback never ran,
+  which cost two arms before it was caught live.
