@@ -835,7 +835,18 @@ class GpuModel:
         if ce_weight != 1.0:
             doutput *= ce_weight
         if p_t is not None:
-            doutput += self.distill_alpha * (p_s - p_t)
+            # The KD gradient must be masked exactly where the KD loss is.
+            # `covered` is False at declined positions (inside the token where
+            # top-k support fell under `floor`, or the stream's first byte),
+            # where p_t is all-zero and the loss above contributes exactly
+            # nothing. Without the mask the gradient still received
+            # alpha * (p_s - 0) = alpha * p_s there, so the optimiser descended
+            # something other than the loss being logged -- measured at ~8% of
+            # the decoder gradient at 24% coverage, and zero at 100% coverage,
+            # which is why check_kd.py never saw it: its synthetic target is
+            # non-zero on every row.
+            doutput += (self.distill_alpha * (p_s - p_t)
+                        * covered[:, None].to(p_s.dtype))
         dWd = doutput.t() @ x
         dbd = doutput.sum(dim=0)
         dx = doutput @ self.Wd

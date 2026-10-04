@@ -26,32 +26,56 @@ and writes one aligned array per stream, and asserts
 `reconstruct(table, ids) == stream_bytes` for every stream before saving. A
 mismatch is a hard failure, not a warning.
 
-The target, after the one-hot discovery (2026-10-03)
+The target: the paper's Marginalize-It, at EVERY depth
 ----------------------------------------------------
-The first implementation followed the paper's depth-loop literally: condition on
-the gold byte prefix, keep the tokens that match it, renormalize. That was
-measured to produce a **point mass at the gold byte on 100.000000% of covered
-positions, entropy exactly 0.000000 nats** -- because every token matching
-`bytes(c)[:d+1] == g[:d+1]` has `bytes(c)[d] == g[d]` by definition. The "soft
-label" was a hard label, so alpha*KL + (1-alpha)*CE degenerated to
-position-dependent CE reweighting, the arm lost to its control and diverged.
+Two bugs have lived here, and the second was a misdiagnosis of the first.
 
-What survives one teacher forward pass is depth 0 ONLY, and the paper's Case I
-constructs it WITHOUT conditioning on the gold byte:
+Bug 1 (found 2026-10-03, real): the depth loop conditioned on byte d and *then*
+aggregated byte d, so every surviving token sat on the gold byte and the target
+was a point mass -- entropy exactly 0.000000 nats, argmax == gold on 100% of
+positions. Every c with `bytes(c)[:d+1] == gold[:d+1]` has `bytes(c)[d] == gold[d]`
+by definition, so the "soft label" was a hard label and `alpha*KL + (1-alpha)*CE`
+became position-dependent CE reweighting.
 
-    p_target[x] = sum(prob[c] for c in top-k if first_byte(c) == x)   # then / sum
+The "fix" applied to it -- emit depth 0 only, decline every depth >= 1 -- was
+wrong, and it was justified by a claim the paper contradicts on the same page.
+"It takes more than one forward pass to represent byte uncertainty inside a
+token" is false: the paper's own worked example gives P(isu)=0.8 / P(isk)=0.2 at
+depth 2 from a single pass. The correct fix is to delete ONE TERM from the
+match, not to delete the depths.
 
-That is the teacher's genuine first-byte distribution -- measured entropy mean
-0.306 nats, 64.4% of positions non-degenerate. So:
+Bug 2 (fixed 2026-10-04): the paper (section 2.1, Figure 2) conditions on the
+bytes ALREADY EMITTED and aggregates over the NEXT one -- "we subset the
+vocabulary by the ground-truth byte `i` and aggregate the probabilities over
+B2". So at depth d, with `gold` the byte string of the token being predicted:
 
-    depth 0  (a byte that begins a token, ~1 position in 4.1): real soft target
-    depth >=1 (inside a token): NO TARGET. Declined and counted, because one
-             forward pass conditioned on the gold prefix cannot represent byte
-             uncertainty there; restoring it needs the EoT channel or extra
-             teacher passes.
+    S_d   = { c : bytes(c)[:d] == gold[:d]  and  len(c) > d }
+    p_tgt = sum_{c in S_d, bytes(c)[d] == x} p(c)  /  sum_{c in S_d} p(c)
 
-A declined position returns an all-zero row, which contributes no KD gradient
-(the CE-only fallback). Declines are counted, never averaged away.
+Depth 0 of this is exactly the paper's Case I (no gold byte is available yet,
+because the first byte of a token IS the byte being predicted). Depth >= 1 is
+soft whenever two candidates share the emitted prefix and diverge at byte d --
+which is the normal case, not an exception.
+
+Measured on real teacher text, k=32 (RESULTS.md 2026-10-04): coverage goes from
+23.1% (depth 0 only) to 89.0%, and the richest band is depth 1 -- 95.5% of its
+targets put mass on more than one byte, mean entropy 1.108 nats.
+
+WHAT IS STILL APPROXIMATE, AND IT IS NOT ABOUT FORWARD PASSES
+--------------------------------------------------------------
+Two real losses of fidelity, both inherent to top-k truncation, both reported:
+
+* Truncation. Under k=32 of a 64,402-token vocabulary a 4-byte gold prefix
+  matches ~1 candidate, so depth >= 4 degenerates toward one-hot. `floor` and
+  `backoff` exist for this and are counted, never averaged away.
+* MI's structural bias. `len(c) > d` drops every candidate that ENDS at byte
+  d-1, so the target is the teacher conditioned on "this token does not end
+  here". This is the paper's stated approximation, and it is large: top-1 agrees
+  with the gold byte at only 44.9% of depth-1 positions. It biases the student
+  toward long tokens, which is what the word-length-drift ruler measures, and it
+  is precisely what End-Of-Token's `<eot>` channel exists to recover.
+
+A declined position returns an all-zero row and contributes no KD gradient.
 """
 import hashlib
 import json
@@ -147,15 +171,15 @@ class MiReader:
     because per-step random reads of 1024 streams cost more than the MI itself.
 
     `streams` is REQUIRED: the MI prefix test compares a candidate token's
-    bytes against the gold token's bytes 0..d, and those gold bytes are not in
-    the dump — only the byte at depth d is. Handing the reader the exact
+    bytes against the gold token's bytes 0..d-1, and those gold bytes are not
+    in the dump -- only the byte at depth d is. Handing the reader the exact
     streams the dump was built from is what makes that test possible, and it
     doubles as the alignment gate: the byte count implied by `tok_len` must
     equal the stream length, or the targets are on the wrong bytes.
     """
 
     def __init__(self, out_dir, stem, vocab, streams=None, block=32,
-                 backoff="skip"):
+                 backoff="skip", floor=0.05):
         self.p = dump_paths(out_dir, stem)
         self.meta = json.load(open(self.p["meta"]))
         if self.meta.get("format") != "tmt-mi-dump/1":
@@ -171,6 +195,7 @@ class MiReader:
         self.vocab = vocab
         self.block_size = int(block)   # attribute; `block()` is the accessor
         self.backoff = backoff
+        self.floor = float(floor)
         if streams is None:
             raise ValueError("MiReader needs `streams`: the MI prefix test needs "
                              "the gold token's bytes 0..d, which the dump does "
@@ -195,7 +220,8 @@ class MiReader:
                     f"the dump was bucketed with a different B or a different "
                     f"file order and its targets are on the WRONG bytes")
         # +1 so a step whose predicted byte sits one past the end still indexes
-        # safely; that column is 0, so q=0 and `is_start` is false -> declined.
+        # safely; that column is 0, so q=0, `ok` is false and the position is
+        # declined rather than given a target from the wrong row.
         width = int(self.total_bytes.max()) + 1
         self.byte2tok = np.zeros((self.B, width), np.int32)
         self.tok_start = np.zeros((self.B, self.Ltok + 1), np.int32)
@@ -208,14 +234,21 @@ class MiReader:
         self.dmax = self.vocab.maxlen
         self._cache_t0 = None
         self._cache = None
-        # Statistics the trainer reports. Coverage is now "produced / positions",
-        # and `entropy` is the load-bearing number: a one-hot target means the
-        # KD term is not doing anything a reweighted CE could not.
+        # Statistics the trainer reports. Coverage is "produced / positions";
+        # `entropy` and `top1_gold_fraction` are the two that decide whether
+        # the KD term is doing anything a reweighted CE could not: entropy says
+        # the label is soft, and top1_gold_fraction says how much of that
+        # softness contradicts the corpus.
         self.positions = 0
         self.produced_n = 0
         self.declined = 0
         self.empty = 0
         self.entropy_sum = 0.0
+        self.depth_sum = 0.0
+        self.retained_sum = 0.0
+        self.retained_n = 0
+        self.retained_below_floor = 0
+        self.backoff_n = 0
         self.top1_gold = 0
         self.top1_n = 0
 
@@ -224,9 +257,16 @@ class MiReader:
         """Targets for steps [t0, t0+blk).
 
         Returns (targets (B, blk, 256) float32, produced (B, blk) float32).
-        `produced` is 1.0 where a target exists and 0.0 where the position was
-        declined (inside a token, so depth >= 1, where one forward pass cannot
-        represent byte uncertainty).
+        `produced` is 1.0 where a usable target exists and 0.0 where the
+        position was declined: the very first byte of a stream (no teacher row
+        predicts it), or a position whose surviving top-k mass fell under
+        `floor` while `backoff == "skip"`.
+
+        This is the paper's Marginalize-It at EVERY depth. `acc` carries the
+        gold-prefix test over the bytes ALREADY EMITTED (0..depth-1); the byte
+        being predicted, `depth`, is never conditioned on. That single omission
+        is what the 2026-10-03 implementation got wrong, and it is what makes
+        every target collapse onto the gold byte.
         """
         # steps are BYTE positions; the arrays are indexed by TOKEN
         p = np.minimum(t0 + 1 + np.arange(blk, dtype=np.int64), self.L_step)
@@ -236,10 +276,11 @@ class MiReader:
         qrow = q - 1
         ok = qrow >= 0
         qrow = np.maximum(qrow, 0)
-        # Only a byte that BEGINS a token gets a target; `starts == p` is that
-        # test. Everything inside a token is depth >= 1 and is declined.
+        # depth of the byte being predicted inside its own token, and where
+        # that token starts. A byte that BEGINS a token has d == 0, which is
+        # the paper's Case I: no gold byte exists yet to condition on.
         starts = np.take_along_axis(self.tok_start, q, axis=1)     # (B, blk)
-        is_start = (p[None, :] == starts) & ok                    # (B, blk)
+        d = (p[None, :] - starts).astype(np.int64)                 # (B, blk)
 
         qmin, qmax = int(qrow.min()), int(qrow.max())
         rel = (qrow - qmin)[:, :, None]
@@ -250,39 +291,77 @@ class MiReader:
         rows = self.vocab.take(cand)
         live = (rows >= 0) & self.vocab.has_byte[np.where(rows >= 0, rows, 0)]
         rows = np.where(live, rows, 0)
-        b0 = self.vocab.first[rows].astype(np.int64)            # (B, blk, k)
+        vl = self.vocab.len[rows].astype(np.int64)                # (B, blk, k)
+        vb = self.vocab.bytes[rows]                               # (B, blk, k, Lmax)
 
-        w = np.where(live, prob, F(0.0))
+        # Gold bytes of the token, from its start. The prefix test needs bytes
+        # 0..d-1, NOT the byte at d.
+        ar = np.arange(self.dmax, dtype=np.int64)
+        gidx = np.minimum(starts[:, :, None] + ar[None, None, :],
+                          self.sdata.shape[1] - 1)                 # (B, blk, dmax)
+        gold_win = np.take_along_axis(self.sdata[:, None, :], gidx,
+                                      axis=2).astype(np.int64)[:, :, :, None]
+
         out = np.zeros((self.B, blk, 256), F)
-        flat = (np.arange(self.B)[:, None, None] * (blk * 256)
-                + np.arange(blk)[None, :, None] * 256 + b0)
-        m3 = np.broadcast_to(is_start[:, :, None], w.shape)
-        np.add.at(out.reshape(-1), flat.reshape(-1)[m3.reshape(-1)],
-                  w.reshape(-1)[m3.reshape(-1)])
+        acc = np.ones(cand.shape, bool)   # AND_{j < depth} bytes(c)[j]==gold[j]
+        maxd = int(min(self.dmax, int(d.max()) + 1))
+        for depth in range(maxd):
+            # `acc` is the gold prefix EMITTED SO FAR; `vl > depth` keeps only
+            # candidates that extend past the byte being predicted (this is
+            # MI's structural approximation: candidates that END at depth-1
+            # are dropped, which is what End-Of-Token's <eot> recovers).
+            keep = acc & (vl > depth) & live & ok[:, :, None]
+            sel = d == depth
+            if sel.any():
+                wsel = np.where(keep, prob, F(0.0))
+                mask3 = np.broadcast_to(sel[:, :, None], wsel.shape)
+                nb = vb[:, :, :, depth].astype(np.int64)
+                flat = (np.arange(self.B)[:, None, None] * (blk * 256)
+                        + np.arange(blk)[None, :, None] * 256 + nb)
+                np.add.at(out.reshape(-1), flat.reshape(-1)[mask3.reshape(-1)],
+                          wsel.reshape(-1)[mask3.reshape(-1)])
+            # advance the emitted-prefix test for the NEXT depth. This runs
+            # AFTER the aggregation above, never before it.
+            acc = acc & (vb[:, :, :, depth] == gold_win[:, :, depth, :])
+
         tot = out.sum(axis=2)
-        produced = (tot > 0) & is_start
+        self.retained_sum += float(tot.sum())
+        self.retained_n += int(tot.size)
+        produced = (tot > 0) & ok
+        if self.backoff == "skip":
+            dead = tot <= self.floor
+            self.retained_below_floor += int(dead.sum())
+            self.backoff_n += int((dead & ok).sum())
+            produced = produced & ~dead
         # normalize only where a target was produced
-        nz = tot > 0
-        out[nz] /= tot[nz][:, None]
+        out[produced] /= tot[produced][:, None]
         out[~produced] = 0.0
 
-        self.positions += int(is_start.size)
+        self.positions += int(produced.size)   # (B, blk), not p.size which is (blk,)
         self.produced_n += int(produced.sum())
-        self.declined += int((~is_start).sum())
-        self.empty += int((is_start & (tot <= 0)).sum())
+        self.declined += int((~produced).sum())
+        self.empty += int((ok & (tot <= 0)).sum())
         with np.errstate(divide="ignore", invalid="ignore"):
             ent = -(out * np.log(out + 1e-12)).sum(axis=2)
-        self.entropy_sum += float(ent[produced].sum()) if produced.any() else 0.0
-        self.top1_gold += 0        # filled by the caller (needs the gold byte)
+        if produced.any():
+            self.entropy_sum += float(ent[produced].sum())
+            self.depth_sum += float(d[produced].sum())
+            # p can reach L_step, which a hand-built dump may set one past the
+            # stream; clip rather than index off the end.
+            gp = np.minimum(p, self.sdata.shape[1] - 1)
+            gold_p = self.sdata[np.arange(self.B)[:, None], gp[None, :]]
+            self.top1_gold += int((out.argmax(axis=2)[produced]
+                                   == gold_p[produced]).sum())
+            self.top1_n += int(produced.sum())
         return out, produced.astype(F)
 
     def block(self, t0):
-        """Whole cached block starting at t0: (targets (B,blk,256), retained (B,blk), blk)."""
+        """Whole cached block starting at t0: (targets (B,blk,256), produced (B,blk), blk)."""
         self.targets(t0)
         return self._cache, self._cache_ret, self._cache_blk
 
     def targets(self, t0):
-        """(targets (B,256), retained (B,)) for step t0. Block-served."""
+        """(targets (B,256), produced (B,)) for step t0. Block-served."""
         if self._cache_t0 is None or not (self._cache_t0 <= t0 <
                                           self._cache_t0 + self._cache_blk):
             blk = min(self.block_size, self.L_step - t0)
@@ -294,14 +373,27 @@ class MiReader:
 
     def stats(self):
         p = max(1, self.positions)
+        n = max(1, self.produced_n)
         return {
             "positions": self.positions,
             "produced": self.produced_n,
             "coverage": self.produced_n / p,
-            "declined_depth_ge_1": self.declined,
+            "declined": self.declined,
             "declined_fraction": self.declined / p,
-            "empty_at_token_start": self.empty,
-            "target_entropy_nats": (self.entropy_sum / self.produced_n
+            "no_surviving_candidate": self.empty,
+            "retained_mean": (self.retained_sum / max(1, self.retained_n)),
+            "retained_below_floor": self.retained_below_floor,
+            "backoff_skipped": self.backoff_n,
+            "floor": self.floor,
+            "target_entropy_nats": (self.entropy_sum / n
                                     if self.produced_n else None),
+            "target_mean_depth": (self.depth_sum / n
+                                  if self.produced_n else None),
+            # How often the teacher's argmax byte IS the corpus byte. The
+            # complement is real label conflict: at depth >= 1 it is MI's
+            # not-ending bias, and it is what the word-length-drift ruler is
+            # for.
+            "top1_gold_fraction": (self.top1_gold / self.top1_n
+                                   if self.top1_n else None),
             "B": self.B, "L_step": self.L_step, "Ltok": self.Ltok, "k": self.k,
         }

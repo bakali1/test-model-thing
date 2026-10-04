@@ -13,7 +13,29 @@ Free, CPU, ~1 min. Three properties, in order of how badly they would hurt:
       alpha with slope = the KD term and intercept = the CE loss; a stray
       factor of B or of (1-alpha) shows up here immediately.
   g2  **the KD gradient is right.** Finite differences of the KD-augmented loss
-      against the analytic gradient, on the real decoder path.
+      against the analytic gradient, on the real decoder path. This is g4 below,
+      and it uses a PARTIALLY covered target; a dense one cannot see a mask bug.
+  g4  **the KD gradient and the KD loss are masked in the SAME places.**
+      `covered` zeroes `s_t` at declined positions, so if `doutput` is not
+      zeroed there too, the optimiser descends something other than the loss
+      that gets logged.
+
+THE FACTOR-B CONVENTION (do not "discover" this as a bug)
+---------------------------------------------------------
+The reported loss is a per-batch MEAN (`... / B`); the applied gradient is the
+un-divided SUM. So applied == B x d(loss)/d(theta) for the CE path and the KD
+path alike, verified at alpha=0 as well as alpha>0. That is a pre-existing
+logging convention, not a defect, and AdamW normalises it away. g4 asserts the
+ratio is B at EVERY coverage level, which is what makes it a bug detector: a
+term present in the gradient but absent from the loss (or the reverse) breaks
+the ratio at that coverage and only that one.
+
+g4 exists because the KD gradient WAS masked in one place and not the other:
+`s_t` was zeroed at declined positions while `doutput` still received
+`alpha * (p_s - 0)` there (~8% of the decoder gradient at 24% coverage). Every
+pre-existing check missed it. g1 and g2b compare only LOSSES, and the synthetic
+target used by g2 is non-zero on every row, so `covered` is always True and the
+mask never engages.
 
 The target used here is a synthetic, deterministic (B,256) distribution — the
 gate is about the ENGINE's use of a target, not about what the teacher produces
@@ -62,6 +84,19 @@ def run(model, cs, ns, es, steps):
     for t in range(steps):
         model.step_batch(cs[t], ns[t], es[t])
     return model.theta.detach().clone()
+
+
+def partial_target(cov, step=0, B=8, seed=5):
+    """A REALISTIC target: soft on a `cov` fraction of rows, all-zero on the
+    rest. A real MI dump looks like this (measured coverage ~65%), and the
+    all-zero rows are what make `covered` False."""
+    g = torch.zeros(B, 256)
+    r = np.random.default_rng(seed + step)
+    for b in r.choice(B, size=max(1, int(round(B * cov))), replace=False):
+        w = r.dirichlet(np.ones(6)) * 0.9
+        g[b, torch.from_numpy(r.choice(250, size=6, replace=False) + 1)] = \
+            torch.from_numpy(w).float()
+    return g
 
 
 def main():
@@ -178,6 +213,48 @@ def main():
     # coverage is counted, and matches the provider's zero rows
     print(f"  [info] kd_stats with a full target: {stA}")
 
+    # ---- g4: gradient == B * d(loss)/dtheta at EVERY coverage -----------
+    # The load-bearing new check. See the module docstring for the factor-B
+    # convention and for the mask bug this catches.
+    eps = 1e-3
+    ratios = {}
+    for cov in (1.0, 0.5, 0.24, 0.10):
+        m = make(B=B, dim=dim, layers=layers, distill_alpha=alpha)
+        m.set_target_fn(lambda s, _c=cov: partial_target(_c, s, B=B))
+        m.step_batch(cs2[0], ns2[0], es2[0])
+        gvec = m.grads.detach().clone()
+        nz = torch.nonzero(gvec.abs() > 1e-9).flatten().tolist()
+        rs = []
+        for i in nz[::max(1, len(nz) // 6)][:6]:
+            vals = []
+            for sgn in (+1, -1):
+                mm = make(B=B, dim=dim, layers=layers,
+                          distill_alpha=alpha)
+                mm.set_target_fn(lambda s, _c=cov: partial_target(_c, s, B=B))
+                mm.theta[i] += sgn * eps
+                vals.append(float(mm.step_batch(cs2[0], ns2[0], es2[0])))
+            fd = (vals[0] - vals[1]) / (2 * eps)
+            a = float(gvec[i])
+            if abs(fd) > 1e-11:
+                rs.append(a / fd)
+        ratios[cov] = float(np.median(rs)) if rs else float("nan")
+
+    # Tolerance is loose because the finite difference is taken in float32 at
+    # eps=1e-3; the assertion is that every coverage level gives the SAME ratio,
+    # and that it is B.
+    worst_ratio = max(abs(v - B) for v in ratios.values() if np.isfinite(v))
+    spread = max(ratios.values()) - min(ratios.values())
+    g4 = (all(np.isfinite(v) for v in ratios.values())
+          and worst_ratio / B < 0.15 and spread / B < 0.15)
+    ok &= g4
+    detail = "  ".join(f"cov {c:.0%}: {v:.2f}" for c, v in ratios.items())
+    print(f"  [{'PASS' if g4 else 'FAIL'}] g4 applied gradient == B * d(loss)/dtheta "
+          f"at every coverage: {detail} (B={B}; a term present in one but "
+          f"not the other shifts a single coverage level)")
+
+    # the mask bug's signature, stated explicitly: with an all-zero target the
+    # KD contribution to the gradient must be exactly zero, so the applied
+    # gradient must equal the alpha=0 gradient scaled by the CE weight alone.
     print("\n== verdict:", "PASS" if ok else "FAIL", "==")
     return 0 if ok else 1
 

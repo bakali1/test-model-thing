@@ -106,18 +106,23 @@ class DistillTargets:
     handed. A mismatch is a hard error, because the alternative is a KD arm
     quietly training on targets belonging to other bytes.
 
-    Every KD arm prints coverage at the end. Coverage is NOT 1.0: MI resolves a
-    target at ~92% of first-byte positions and ~36-51% of positions inside a
-    token (measured, RESULTS.md 2026-10-03), and the rest fall back to CE-only.
+    Every KD arm prints coverage at the end. Coverage is NOT 1.0: the paper's
+    Marginalize-It is defined at EVERY byte depth, but two things remove
+    positions. (a) The first byte of a stream has no teacher row. (b) Under
+    top-k truncation the surviving mass at deeper positions falls under
+    `floor` and the position is declined rather than built from noise --
+    measured 64.6% coverage on real text (RESULTS.md 2026-10-04), against
+    23.1% for the depth-0-only target this replaced.
     """
 
     def __init__(self, dump_dir, corpus_file, batch, block=32,
-                 repo="LiquidAI/LFM2.5-230M-Base", verbose=True):
+                 repo="LiquidAI/LFM2.5-230M-Base", verbose=True, floor=0.05):
         self.path = dump_dir
         self.batch = batch
         self.block = block
         self.repo = repo
         self.verbose = verbose
+        self.floor = floor
         self.corpus_file = corpus_file
         self.stem = os.path.splitext(os.path.basename(corpus_file))[0]
         self.reader = None
@@ -136,7 +141,7 @@ class DistillTargets:
             data = fh.read()
         streams, _ends = np_.Runtime.make_streams(data, self.batch)
         r = _distill.MiReader(self.path, self.stem, vocab, streams=streams,
-                              block=self.block)
+                              block=self.block, floor=self.floor)
         if self.verbose:
             print(f"  [distill] {self.stem}: B={r.B} L_step={r.L_step} "
                   f"Ltok={r.Ltok} k={r.k}", flush=True)
@@ -173,7 +178,8 @@ class Trainer:
                  from_scratch=False, seed=0, log_every=0, warmup=0,
                  hub_save_every=0, telemetry_every=0, telemetry_path=None,
                  measure_after=0, verify_final=False, distill_dir=None,
-                 distill_alpha=0.0, distill_block=32, distill_repo=None, **model_kw):
+                 distill_alpha=0.0, distill_block=32, distill_repo=None,
+                 distill_null_target=False, distill_floor=0.05, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -188,11 +194,24 @@ class Trainer:
         self.distill_repo = distill_repo or os.environ.get(
             "TMT_TEACHER", "LiquidAI/LFM2.5-230M-Base")
         self.distill = None
+        self.distill_null_target = bool(distill_null_target)
+        self.distill_floor = float(distill_floor)
         if self.distill_alpha > 0.0:
-            if not distill_dir:
+            if self.distill_null_target:
+                # The half-CE control. alpha > 0 so ce_weight == 1-alpha and the
+                # CE gradient is down-weighted exactly as in a real KD arm; the
+                # target provider returns zeros so the KD term contributes no
+                # gradient. NO dump is read, so this arm cannot be confounded by
+                # target content -- only by the weighting.
+                model_kw["distill_alpha"] = self.distill_alpha
+                print(f"  [distill] NULL-TARGET CONTROL: alpha="
+                      f"{self.distill_alpha}, CE weight "
+                      f"{1.0 - self.distill_alpha}, KD contributes nothing")
+            elif not distill_dir:
                 raise SystemExit("--distill-alpha > 0 requires --distill-dir "
                                  "(the dump made by tools/mi_dump.py)")
-            model_kw["distill_alpha"] = self.distill_alpha
+            else:
+                model_kw["distill_alpha"] = self.distill_alpha
         self.model = GpuModel(device=str(device), seed=seed, **model_kw)
         self.path = path
         self.seed = int(seed)
@@ -224,8 +243,13 @@ class Trainer:
         """Fresh per-file provider, bound to the engine's step counter."""
         if self.distill_alpha <= 0.0:
             return None
+        if self.distill_null_target:
+            zero = torch.zeros(self.batch, 256)
+            m.set_target_fn(lambda step, _z=zero: _z)
+            return None
         p = DistillTargets(self.distill_dir, file, self.batch,
-                           self.distill_block, self.distill_repo)
+                           self.distill_block, self.distill_repo,
+                           floor=self.distill_floor)
         p.bind(m.t)
         prov = p
         m.set_target_fn(lambda step, _p=prov: _p.at(step))
@@ -235,10 +259,30 @@ class Trainer:
         if self.distill_alpha <= 0.0:
             return
         st = m.kd_stats()
+        if self.distill_null_target:
+            print(f"  [distill] NULL-TARGET CONTROL: alpha={st['alpha']}, "
+                  f"CE weight {1.0 - st['alpha']}, KD covered "
+                  f"{st['covered']}/{st['positions']} (expected 0)", flush=True)
+            return
+        rs = self.distill.stats() if self.distill is not None else {}
+        # Coverage is NOT a property of the target definition alone. It is
+        # (definition x floor), and over the plausible floor range it swings from
+        # 85.2% (floor=0) to 55.3% (floor=0.20) on one fixed 46k-token dump --
+        # a 30-point spread. Two runs on the same dump reported 64.38% and
+        # 60.50% and looked like a reproducibility failure; they were
+        # floor=0.05 and floor~=0.09 on identical bytes. So the floor is
+        # printed with the coverage, always. See RESULTS.md 2026-10-04.
+        extra = ""
+        if rs:
+            extra = (f" | floor={rs.get('floor')}"
+                     f" retained_mean={rs.get('retained_mean'):.3f}"
+                     f" entropy={rs['target_entropy_nats']:.3f} nats"
+                     f" mean_depth={rs['target_mean_depth']:.2f}"
+                     f" top1==gold={rs['top1_gold_fraction']:.1%}")
         print(f"  [distill] alpha={st['alpha']} | KD target supplied at "
               f"{st['covered']:,}/{st['positions']:,} positions "
-              f"({(st['coverage'] or 0) * 100:.2f}% coverage; the rest fell "
-              f"back to CE-only)", flush=True)
+              f"({(st['coverage'] or 0) * 100:.2f}% coverage at the floor "
+              f"above; the rest fell back to CE-only){extra}", flush=True)
 
     def train(self, save, dataset, hub_repo=None):
         m = self.model
@@ -303,7 +347,7 @@ class Trainer:
                     axis=1).astype(np.int64)).to(self.device)
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
-                self._kd_provider(file, m)
+                self.distill = self._kd_provider(file, m)
                 for t in range(L):
                     m.step_batch(mats[t], mats[t + 1], ets[t])
                     wsteps += 1
@@ -392,7 +436,7 @@ class Trainer:
                     axis=1).astype(np.int64)).to(self.device)
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
-                self._kd_provider(file, m)
+                self.distill = self._kd_provider(file, m)
                 for t in range(L):
                     loss = m.step_batch(mats[t], mats[t + 1], ets[t])
                     if self.telemetry is not None:
@@ -559,6 +603,20 @@ def main():
                          "(1-alpha)*CE.")
     ap.add_argument("--distill-block", type=int, default=32,
                     help="steps of targets computed per vectorized block")
+    ap.add_argument("--distill-floor", type=float, default=0.05,
+                    help="drop a target whose surviving top-k mass is <= this. "
+                         "QUOTE COVERAGE WITH IT: on one fixed 46k-token dump "
+                         "coverage runs 85.2%% (floor=0) / 64.4%% (0.05) / "
+                         "60.5%% (0.09) / 55.3%% (0.20). Coverage is "
+                         "(definition x floor), not a target statistic on its "
+                         "own.")
+    ap.add_argument("--distill-null-target", action="store_true",
+                    help="CONTROL ARM: run with alpha>0 but an all-zero target, "
+                         "so the CE term is down-weighted to (1-alpha) exactly "
+                         "as in a KD arm while the KD term contributes nothing. "
+                         "This is the arm that separates 'distillation hurts' "
+                         "from 'halving CE hurts': without it, a KD arm losing "
+                         "to a CE control is uninterpretable. Needs no dump.")
     ap.add_argument("--distill-repo", default=None,
                     help="HF repo for the teacher's tokenizer.json "
                          "(default $TMT_TEACHER)")
@@ -623,8 +681,10 @@ def main():
                 distill_dir=args.distill_dir,
                 distill_alpha=args.distill_alpha,
                 distill_block=args.distill_block,
-                distill_repo=args.distill_repo)
-    if args.distill_alpha > 0.0:
+                distill_repo=args.distill_repo,
+                distill_null_target=args.distill_null_target,
+                distill_floor=args.distill_floor)
+    if args.distill_alpha > 0.0 and not args.distill_null_target:
         if not args.distill_dir or not os.path.isdir(args.distill_dir):
             sys.exit(f"--distill-alpha {args.distill_alpha} but --distill-dir "
                      f"{args.distill_dir!r} is not a directory; run "

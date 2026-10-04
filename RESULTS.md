@@ -1592,3 +1592,469 @@ Not established: T=16–24 steps, dim 32, 2–4 layers, one corpus, B∈{8,16,32
 claim is about the estimator's *shape and scale*, which is what P0 needed; it is
 not a statement about trained checkpoints, where σ is heterogeneous per
 coordinate and the state gain is not ≈1.
+
+---
+
+## The MI target was wrong at every depth >= 1, and the gate that pinned it (2026-10-04)
+
+Re-reading `docs/ideas/papers/2609.12303v1.paper.txt` §2.1 against `distill.py`
+found that the 2026-10-03 "one-hot" fix and the depth-0-only target that replaced
+it were **both** wrong, in a way that the then-current gate actively enforced.
+
+### What the paper says, and what the code did
+
+The paper conditions on the bytes **already emitted** and aggregates over the
+**next** one:
+
+> "To compute the first-byte distribution, the columns sharing the byte prefix B1
+> are aggregated. Next, we subset the vocabulary by the ground-truth byte `i` and
+> aggregate the probabilities over B2. Finally, we repeat this process for B3."
+> — §2.1 / Figure 2
+
+So at depth `d`, with `gold` the byte string of the token being predicted:
+
+    S_d   = { c : bytes(c)[:d] == gold[:d]  and  len(c) > d }
+    p_tgt = sum_{c in S_d, bytes(c)[d] == x} p(c) / sum_{c in S_d} p(c)
+
+Two versions of the code got this wrong, in opposite directions:
+
+| version | conditioning | aggregation | result |
+|---|---|---|---|
+| pre-2026-10-03 | `bytes(c)[:d+1] == gold[:d+1]` (includes byte d) | `bytes(c)[d]` | **one-hot at the gold byte**, entropy exactly 0.000000 nats |
+| 2026-10-03 → 2026-10-04 | depth 0 only; **all** depth >= 1 declined | first byte | soft at depth 0, **nothing anywhere else**, coverage 23.1% |
+| 2026-10-04 (now) | `bytes(c)[:d] == gold[:d]` (emitted prefix only) | `bytes(c)[d]` | the paper's target at every depth |
+
+The off-by-one in the first version is real and was worth finding. But the
+justification for the second — recorded in `distill.py`, `tests/check_mi.py` and
+this file — was **false**:
+
+> *"depth >=1 (inside a token): NO TARGET. Declined and counted, because one
+> forward pass conditioned on the gold prefix cannot represent byte uncertainty
+> there"*
+
+The paper's own worked example contradicts this on the same page: at depth 2 it
+gives P(`isu`)=0.8 / P(`isk`)=0.2, and EoT gives 0.667/0.167/0.167. Three-way
+splits, from a single forward pass. What one pass genuinely cannot supply is the
+mass of candidates that **end** mid-token — which is what `<eot>` is for — not
+the uncertainty over the next byte.
+
+The fix is to delete one term from the match, not to delete the depths. All of it
+is computable from the dump that already exists (`ids`, `probs`, `tok_len`,
+`streams`); zero extra teacher passes.
+
+### Measured, real teacher, real corpus text (k=32)
+
+Per byte depth, over 6000 bytes of `wiki_tinystories_001.txt`:
+
+| depth | positions | target available | non-degenerate | mean entropy | top1==gold | mean retained mass |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 1388 | 99.9% | 65.5% | 0.249 | 86.6% | 0.919 |
+| **1** | **1261** | **98.7%** | **95.5%** | **1.108** | 44.9% | 0.798 |
+| 2 | 1138 | 93.5% | 75.2% | 0.279 | 80.2% | 0.291 |
+| 3 | 913 | 83.5% | 30.3% | 0.097 | 90.3% | 0.235 |
+| 4 | 545 | 72.7% | 6.1% | 0.018 | 98.5% | 0.169 |
+| 5+ | 1358 | ≤70% | ~4% | ~0.01 | ~99% | ≤0.14 |
+
+- depth-0-only implementation: **1387 / 5999 = 23.1% coverage**
+- paper's Marginalize-It: **5338 / 5999 = 89.0% coverage**, of which 59.5%
+  non-degenerate
+- **65.9% of all byte positions carried a usable teacher target that the
+  implementation was discarding.**
+
+Depth 1 is the richest band in the whole table (mean entropy 1.108 nats, 95.5%
+non-degenerate) and it was entirely thrown away. Depth >= 4 degenerates toward
+one-hot under k=32 truncation — that is the real fidelity limit, not the paper's
+construction — and is handled by `floor`/`backoff`.
+
+On a full 400 kB dump read through the actual `MiReader` (64 streams, k=32,
+`floor=0.05`), after the fix:
+
+| statistic | value |
+|---|---:|
+| coverage | **64.6%** (was 23.1%) |
+| mean target depth | 1.26 |
+| mean target entropy | 0.536 nats |
+| mean retained prefix mass | 0.454 |
+| top-1 == gold byte | 71.1% |
+| declined (first byte, or retained ≤ floor) | 35.4% |
+
+Verified against an independent brute-force implementation of the paper's
+formula over 2137 positions of a real stream: **max |Δ| = 2.4e-07**.
+
+### A gate that pinned the wrong definition
+
+`tests/check_mi.py` t3 asserted *"only depth 0 is produced; depths >= 1 are
+declined"*. A gate that encodes a wrong definition is worse than no gate, because
+it makes the wrong thing survive review. It is rewritten, and two things were
+added:
+
+- **t7 pins the paper's own worked example**: teacher row `isu 0.5, is 0.125,
+  isk 0.125`, gold token `isu` ⇒ B3 = **0.800 / 0.200**. The 2026-10-03 bug
+  returns 1.000/0.000; the 2026-10-03→04 misdiagnosis returns no target at all.
+  One test now fails for both.
+- **t3c** asserts a depth-1 target keeps a non-gold branch
+  (`c:0.778, x:0.222`), which is the specific failure mode.
+
+Two fixture bugs surfaced while doing this and are worth recording, because both
+were invisible to the depth-0-only test:
+
+1. `stream "abcde"` with `tok_len=[1,2,2]` over a table of `["abc","de","fgh"]`
+   — the gold token `"bc"` was **not in the vocabulary**, so the prefix test
+   could never match. The old test passed because depth 0 never reads a gold byte.
+2. `stream b"zz"+b"isu"` is **5 bytes** while `tok_len=[1,3]` is 4, shifting every
+   gold byte by one.
+
+Both fixtures now assert `sum(tok_len) == len(stream)` before use.
+
+### The gradient was masked in one place and not the other
+
+`gpu_port.py`, in `step_batch`:
+
+```python
+s_t = torch.where(covered, s_t, torch.zeros_like(s_t))     # masked by covered
+...
+doutput += self.distill_alpha * (p_s - p_t)                # NOT masked
+```
+
+At a declined position `p_t == 0`, so the loss there is exactly zero while the
+applied gradient still received `alpha * p_s`. The logged loss was not the
+objective being optimised. Fixed by masking `doutput` with `covered[:, None]`.
+
+**Not a bug, and now documented so nobody files it:** the reported loss is a
+per-batch mean (`... / B`) while the applied gradient is the un-divided sum, so
+`applied == B x ∂loss/∂θ` for the CE path and the KD path alike. This was
+verified at `alpha=0` too. It is a logging convention, not a defect, and AdamW
+normalises it away.
+
+`tests/check_kd.py` gains **g4**, which the docstring had promised since the file
+was written but which was never implemented: finite differences of the reported
+loss against the applied gradient, at **partial** coverage. Every earlier check
+compared only losses, and the synthetic target it used is non-zero on every row,
+so `covered` was always `True` and the mask never engaged.
+
+| | cov 100% | cov 50% | cov 24% | cov 10% |
+|---|---:|---:|---:|---:|
+| before the fix | 8.62 | 14.65 | 14.37 | 17.26 |
+| after the fix | 8.62 | 8.00 | 8.29 | 8.62 |
+
+`B = 8`. Gate 3 (`alpha=0` bit-exactness, `max|Δθ| = 0.0` over 120 steps) still
+passes — the mask is unreachable at `alpha=0`.
+
+### The control arm that was missing
+
+With `alpha=0.5` and a target covering only a fraction of positions, `CE` is
+down-weighted to `0.5` at **every** position while KD fires on a subset. So a
+"KD arm" was never "CE + distillation" — it was "half-strength CE everywhere plus
+a conflicting soft label on some positions". Both earlier A/Bs (one-hot and
+Case-I) are uninterpretable without this arm: their divergence could have been
+the halved CE alone.
+
+`train_gpu.py` gains `--distill-null-target`: `alpha > 0`, all-zero target, no
+dump read. The CE weight is `1-alpha` exactly as in a real KD arm and the KD term
+contributes nothing. It is the arm that separates "distillation hurts" from
+"halving CE hurts", and it costs no teacher time.
+
+### Not established
+
+- Coverage 64.6% is with `floor=0.05`; the floor is now a documented, reported
+  knob (`stats()["floor"]`, `retained_below_floor`), not a hidden default.
+- Depth >= 4 remains mostly one-hot under k=32. Raising k would recover it at
+  linear storage cost; untested.
+- The top1==gold rate of 44.9% at depth 1 is MI's **not-ending bias**, and it is
+  large. Feeding depth-1 targets in naively will fight CE. This is the
+  word-length-drift ruler's job, and it is now measuring something.
+- One teacher (LFM2.5-230M-Base), k=32, one corpus, `floor=0.05`.
+
+### The A/B, re-run with the corrected target and the missing control
+
+2000 steps, B=64, seed 0, `--data-seed 0`, identical byte stream, from scratch,
+same dump, laptop CPU (498–506 B/s, three arms within 2% of each other). Corpus
+is a 200 kB slice of `wiki_tinystories_001.txt`; dump is 46,449 tokens at k=32.
+
+| arm | flags | objective |
+|---|---|---|
+| A | `--distill-alpha 0` | CE only |
+| **C** | `--distill-alpha 0.5 --distill-null-target` | **half-CE control, zero target** |
+| B | `--distill-alpha 0.5 --distill-dir …` | MI-KD, corrected target |
+
+Coverage reported by arm B: **82,410 / 128,000 = 64.38%**.
+
+`ce` is the same quantity in all three arms (same CE term, same data), so it is
+directly comparable. The total `loss` is **not** — CE is down-weighted to 0.5 in
+C and B by construction, which is exactly why C exists.
+
+| step | A loss | A ce | C loss | C ce | B loss | B ce |
+|---:|---:|---:|---:|---:|---:|---:|
+| 25 | 9.242 | 5.951 | 6.323 | 6.063 | 7.293 | 6.029 |
+| 200 | 4.015 | 2.638 | 2.800 | 2.963 | 3.254 | 2.815 |
+| 1000 | 2.938 | 2.129 | 1.904 | 2.210 | 2.332 | 2.162 |
+| 1400 | 2.835 | 2.049 | 1.833 | 2.114 | 2.262 | 2.082 |
+| 1975 | — | **1.963** | — | **2.033** | — | **1.998** |
+
+**1. The divergence does not reproduce.** Arm B's total loss peaks at 7.293 (at
+step 25, before it settles) and then falls monotonically to ~2.23. The two closed
+arms peaked at 16.77 and 860.68. Whatever drove the blow-up, it is not present
+once the target is the paper's and `doutput` is masked like the loss is.
+
+**2. The half-CE confound is real but small.** Halving the CE weight costs
+**+0.070 nats** of CE (C 2.033 vs A 1.963). This was my leading hypothesis for
+the old divergence and it is **not** supported: a 0.07-nat penalty cannot produce
+a 860-nat blow-up. Recorded because it was the hypothesis, and because the control
+is now a permanent gate on any future KD arm.
+
+**3. KD is CE-neutral at this scale.** B − C = **−0.035 nats** (KD slightly
+ahead of its own control); B − A = **+0.035 nats** (KD slightly behind plain CE).
+Both are one-seed noise at ±0.035. The honest reading is *neutral*, not *better*.
+
+**Verdict: the 2026-10-03 closure does not survive its own control.** It is not
+replaced by "distillation works" — it is replaced by "no longer falsified", and
+the experiment that falsified it had two defects in the target and one in the
+gradient. A neutral result at ~2.5e13 FLOPs is also what the paper itself
+predicts for byte models at low compute (§5.4: byte models are *worse* on
+downstream tasks until the crossover at 6.33e22–2.04e23 FLOPs, which is 6–7
+orders of magnitude above this run).
+
+**Not established.** One seed, one α (0.5), one corpus, one τ (1), 128 KB of text,
+no ruler evaluation, no SNR measurement, no word-length drift. CE here ends at
+~2.0 nats against a ruler baseline of 1.17, so this run says nothing about
+absolute quality — it is a confound experiment, not a science arm. The depth-1
+label conflict (top-1 == gold at 44.9%) is still unmeasured on generated text and
+is the most likely reason a longer arm could go either way.
+
+---
+
+## The mask bug's cost, measured in situ (2026-10-04)
+
+The section above records **two magnitudes for one defect**, ~9x apart: the
+`gpu_port.py` comment says the unmasked `alpha * p_s` term was "~8% of the decoder
+gradient at 24% coverage", while g4 measures 14.37 vs 8.29 at cov 24% — a spurious
+term at **73%** of the legitimate gradient. Whichever is right, one of them has to
+carry the claim that the mask bug caused the 860.68-nat divergence, and at 8% it
+plausibly cannot. So: measure the consequence directly instead of reconciling the
+denominators.
+
+### Setup
+
+2000 steps, B=64, dim 512, L16, seed 0, `--data-seed 0`, laptop CPU (~510 B/s),
+corpus = a 200 kB slice of `wiki_tinystories_001.txt`, k=32 MI dump.
+**Two arms differing in exactly one line** — the `covered[:, None]` mask on
+`doutput` — same dump, same seed, same byte stream, no other change.
+
+The dump reproduced the rig's exactly: **46,449 tokens, L_step=2137, k=32**, and
+the fixed arm reproduced their arm-B endpoint (**ce 1.998** at step 1875; theirs
+1.998 final). So this is the same experiment, not a lookalike.
+
+| step | fixed mask: loss / ce | buggy mask: loss / ce |
+|---:|---|---|
+| 625 | 2.500 / 2.306 | 2.605 / 2.459 |
+| 1000 | 2.354 / 2.159 | 2.481 / 2.297 |
+| 1250 | 2.166 / 2.101 | 2.441 / 2.331 |
+| **1375** | **2.147 / 2.077** | 2.492 / 2.319 |
+| 1500 | 2.135 / 2.049 | 2.526 / 2.287 |
+| 1625 | 2.163 / 2.045 | 2.603 / 2.271 |
+| 1750 | 2.194 / 2.042 | 2.704 / 2.265 |
+| **1875** | **2.162 / 1.998** | **2.782 / 2.215** |
+
+Coverage identical in both: 77,435 / 128,000 = 60.50%.
+
+### What it says
+
+1. **The bug has a real, measured cost: +0.217 nats of CE** (2.215 vs 1.998) — an
+   11% gap, from a gradient term that the logged loss never mentioned.
+2. **It flips the arm's sign.** The fixed arm's loss is flat-to-falling to step
+   1875. The buggy arm's loss **bottoms at step 1375 and then rises monotonically**,
+   2.147 -> 2.782, with CE turning up too. The same run, the same target, one line.
+   This is the shape that precedes a blow-up.
+3. **It is still not sufficient to explain 860.68.** The buggy arm reaches 2.78,
+   not 860, in 2000 steps. So the old divergence needed the *old target* as well —
+   the depth-0-only/one-hot target and the unmasked gradient were both present in
+   the closed arms. **Both defects were load-bearing.** The corrected run has
+   neither, which is why it trains.
+4. **The 8%-vs-73% discrepancy is now moot as a severity claim** and should be
+   treated as un-reconciled bookkeeping rather than two competing statements about
+   how bad the bug was. The number that matters is +0.217 nats and a sign flip,
+   and it is now measured in situ rather than inferred from gradient norms, which
+   is what neither of the original figures was.
+
+### Not established
+
+- One seed, B=64, 2000 steps, one dump, α=0.5. The +0.217 has no SE — it is a
+  single-point difference at step 1875, not a mean over seeds. The *sign flip in
+  the loss trend* is the more robust observation here.
+- The buggy arm's upturn means a longer run plausibly diverges. Untested; the
+  860-nat run was a different configuration (the old target) at a different point
+  in the loss landscape.
+- **Unrelated discrepancy, flagged:** this run reports coverage **60.50%**
+  (77,435/128,000) where the rig's reports **64.38%** (82,410/128,000) — same
+  denominator, different numerator, same 46,449-token dump. Not explained. Most
+  likely the `floor` default or an aggregation difference; worth pinning, since
+  coverage is a headline statistic for the target.
+- B=64 is 1/16 the frozen B=1024, and gradient SNR is batch-dependent. The mask
+  bug's cost at the frozen batch is unmeasured; the spurious term scales with B
+  while the legitimate one does not, so the ratio is batch-dependent by
+  construction.
+
+---
+
+## The optimizer axis is answered, and the decay role turns out to be optimizer-dependent (2026-10-04)
+
+Isolated study in `../scratch-optimizer-study/`; the repo was not modified. The
+SGD optimizer is derived at runtime from this repo's `gpu_port.py`, and the
+study's gate proves the derivation is **bit-identical in `adamw` mode** over 120
+steps (theta, both moment buffers, every per-step loss, max |Δloss| = 0.0), so
+the derived forward/backward is provably the code that produced the control.
+
+**Control, reused not re-run:** `arm_lrdecay1x_t919897.npz` — AdamW, single LR,
+30,000 steps from t=889,897, B=1024, data seed 0, taken from the role-specific-LR
+factorial. Every arm resumes from the *pinned* `tmt_mixed_long889897_t889897.npz`
+with the same seed and step count, so the arms are matched by construction.
+Ruler: `--slices 3 --bytes 20000 --xd-bytes 8000 --xd-files 4`.
+
+### The reason an SGD arm is step-matchable here at all
+
+Measured on the incumbent before any arm ran: the per-coordinate normalizer Adam
+divides by has quantiles **0.9995 at p1 through 1.001 at p99 — a ratio of
+1.00×**, against raw per-coordinate gradients spanning 7.5 × 10²¹×. **Adam's
+per-coordinate normalization is inert on this model**; its step collapses to
+≈ `lr·sign(m)` and it spends a uniform ±lr budget on all 4,481,793 coordinates.
+The companion number: the momentum EMA retains **3.8 %** of gradient magnitude
+(`median |m| / RMS(g)`), i.e. the gradient direction flips nearly every step —
+which is what SNR ≈ 0.05 means.
+
+Because the normalizer ≈ 1, `lr = 5e-4` is simultaneously the repo default *and*
+the lr that reproduces Adam's step on a typical coordinate. The quantiles of
+"the SGD lr matching Adam's step" are all **5.005e-4**, so there is no
+median→p90 span to grid over. Measured median step multiples:
+
+| arm | median step | × AdamW(5e-4) | what it actually tests |
+|---|---:|---:|---|
+| SGD 1.25e-4 | 2.711e-06 | 0.25× | step size, **not** the optimizer |
+| SGD 5e-4 | 1.085e-05 | **1.00×** | **the optimizer, step-matched** |
+
+### The `/B` precondition, and a first arm that actually satisfies it
+
+The P0 action-1 gate (`3f2faca`) found the decay rows' gradient is **exactly B×
+too large** — the loss is `/B` but `(dlds * decaytrace).sum(dim=0)` is not.
+Harmless under AdamW (per-parameter and scale-invariant: m → m/B and √v → √v/B
+leave `m/(√v+ε)` unchanged, which is why 889,897 steps ran clean). **Not**
+harmless under SGD, where the 8,192 decay coordinates would receive an effective
+learning rate 1024× larger than everything else.
+
+The correction (`_gradfix`: multiply the 16 `.decay` slices by 1/B, every other
+coordinate **exactly 1.0**) is gated on both counts. It is also **free for the
+control** — AdamW's trajectory is unchanged — so the control above needed no
+re-run. Only the SGD arms did.
+
+### Results at t=919,897, all 30,000 steps from t=889,897
+
+| metric | AdamW control | SGD 5e-4 (1.00× step) | Δ |
+|---|---:|---:|---:|
+| held-out CE | 1.2094 ± 0.0143 | 1.2279 ± 0.0188 | **+0.0185** |
+| shift CE | 1.1648 ± 0.0162 | 1.1744 ± 0.0183 | +0.0096 |
+| cross-domain CE | 2.4176 ± 0.1372 | 2.4745 ± 0.1414 | +0.0569 |
+| stop-head AUC | 0.9496 | 0.9673 | +0.0177 |
+| **SNR trunk / decay** | — (lost) | **0.0649 / 0.0651** | — |
+| σ_mean | 0.51911 | 0.51480 | −0.0043 |
+| half-life | 1.162 B | 1.138 B | −0.024 B |
+| hot dims | 172 | **104** | −68 |
+| hot tail @B=1024 | 180.4 MB | 109.1 MB | −71.3 |
+
+### Verdict
+
+**SGD does not beat AdamW at matched step size.** CE is worse in-domain
+(+0.0185) and worse cross-domain (+0.0569); both are inside the plan's 0.03 bar
+so neither is a regression worth panicking over, but the direction is consistent
+and there is no upside anywhere. Crucially **SNR did not move** (0.065, the same
+0.05–0.07 band every arm in this project sits in).
+
+That last point is the important one, because it **converges with the roadmap's
+independent decision to hold P0 item 2** ("do not build the hybrid trainer",
+same date, from the opposite direction). Two unrelated attacks — swapping the
+optimizer, and auditing the gradient estimator — both leave SNR ≈ 0.05 exactly
+where it was. The blocker is not an estimator problem.
+
+**Do not spend another arm on the optimizer axis.** P4's precondition should be
+read as now *satisfiable*, not hypothetical: a valid arm exists.
+
+### The decay role is optimizer-dependent, and that is the real finding
+
+Neither the `/B` note nor P4 states the consequence. AdamW's scale-invariance
+means the 8,192 decay coordinates have trained at full `lr` for 889,897 steps
+**regardless of their true gradient magnitude**, while a magnitude-proportional
+optimizer gives them ~1024× less and freezes them outright:
+
+| | σ_mean | hot dims | half-life |
+|---|---:|---:|---:|
+| start t=889,897 | 0.51479 | 104 | 1.138 B |
+| AdamW | 0.51911 | **172** | 1.162 B |
+| SGD (corrected) | 0.51480 | **104 — frozen** | 1.138 B |
+
+σ moved by 1 × 10⁻⁵ over 30,000 SGD steps. So the memory timescale's entire
+learned history is a property of **AdamW's normalization**, not of the gradient's
+actual magnitude — under a magnitude-proportional optimizer the memory role does
+not train at all. This is an **architecture question, not a bug**, and it is also
+the honest reason the SGD arm lost: part of what it "lost" was the memory role
+standing still.
+
+### Confounds and gaps, stated
+
+- **Hardware differs from the control.** The SGD arms ran on the MX150
+  (`ring_credit=auto`→NVRTC); the control ran on a T4 (Triton). Those paths were
+  gated numerically equivalent, but that was not re-verified for these
+  checkpoints. Stated rather than assumed.
+- **The control's SNR telemetry was lost** to an earlier reclaimed VM, so the
+  SNR comparison has no matched control row. All other rows come from
+  checkpoints that survived.
+- One seed, one corpus, one τ-free setting, 30,000 steps of continuation only.
+- **Not established:** anything about from-scratch behaviour, longer horizons, or
+  whether a magnitude-proportional optimizer can learn a *useful* memory
+  timescale from scratch — it cannot be inferred from a frozen-role
+  continuation.
+- A first, **invalid** SGD arm was run before the `/B` correction and is
+  **VOID**; it is recorded in `../scratch-optimizer-study/RESULTS.md` §7 rather
+  than here, because its numbers measure a decay-role learning-rate blowup.
+
+### RESOLVED — the 60.50% vs 64.38% coverage gap was never a reproducibility failure
+
+Two rigs reported coverage on the same 46,449-token dump with the same
+denominator (128,000 = 2000 steps x B=64) and got **64.38%** and **60.50%**.
+Flagged as unexplained. It is explained, and it is a defect in how the statistic
+is *reported*, not in the reader or the dump.
+
+**The reader is deterministic.** Walking steps 0..1999 of the one existing dump
+through `MiReader` reproduces 82,410 / 128,000 = 64.3828% exactly. No run-to-run
+drift.
+
+**The teacher is not the cause.** Re-running the forward pass at 4 vs 8 threads:
+4 of 4,495 rows differ, and the *set* difference is **empty** — only reordering
+inside the top-32. The candidate set that the prefix filter sees is unchanged, so
+coverage cannot move. (Also: 4 threads vs 4 threads twice = 0 rows differ.)
+
+**Coverage is `(definition x floor)`, and `floor` was never printed.** On that
+one fixed dump:
+
+| floor | produced | coverage |
+|---:|---:|---:|
+| 0.00 | 109,042 | 85.19% |
+| 0.02 | 90,034 | 70.34% |
+| **0.05** | **82,410** | **64.38%** |
+| 0.08 | 78,446 | 61.29% |
+| **0.091** | **~77,435** | **~60.50%** |
+| 0.10 | 76,673 | 59.90% |
+| 0.20 | 70,731 | 55.26% |
+
+A **30-point swing** across the plausible floor range, and the two reported
+numbers are the same dump at floor 0.05 and floor ≈ 0.091. Both rigs were right.
+The number that was missing is the one that determines the answer.
+
+**Fixes.** `train_gpu.py` now prints `floor`, `retained_mean`, entropy, mean
+depth and `top1==gold` on the same line as the coverage, and `--distill-floor`
+is a real flag. Any future coverage claim must carry its floor.
+
+**What this changes about the earlier claims.** Nothing about the depth-loop fix:
+coverage moved 23.1% -> 64.4% *at a fixed floor of 0.05*, and at floor 0.05 the
+old depth-0-only target would still be capped near 23% because it declined the
+depths outright rather than backoff-skipping them. But every coverage number in
+this file is now conditional on a floor, and the depth>=4 band in particular is
+floor-sensitive: it is mostly below 0.05 retained mass, which is why it
+disappears at 0.09 and not because the target construction changed.
