@@ -1510,3 +1510,85 @@ distillation route, and the rig has just closed the role-specific-LR axis
 reading: the thing a better teacher supplies is a *better gradient*, and at
 4.5 M parameters with O(1) state there is a hard ceiling on how much of a
 full-context teacher is usable.
+
+---
+
+## P0 item 1 — the trace-quality gate: the eligibility trace is NOT biased (2026-10-03)
+
+`tests/check_trace_bptt.py`, free, CPU, seconds. Roadmap §4 action 1. The
+reference is **exact truncated BPTT** built from the engine's own forward
+functions (`TorchLayer.forward`, `_layer_norm`, `_sig`) with only one difference:
+the state stays in the autograd graph instead of being detached each step. No
+hand-written forward means no second implementation to disagree.
+
+**Forward agreement is asserted first and is exact (max |ΔLoss| = 0.000e+00)**
+— with the trace pass's LR set to 0 so the parameters are frozen for the window.
+Without that freeze the engine's parameters drift between steps while the
+reference holds them fixed, and the two forwards diverge by 1.4e-4 for reasons
+that have nothing to do with the trace.
+
+### Result
+
+| layer | rel err | cosine | scale (trace / exact) |
+|---|---:|---:|---:|
+| 0 | 22.7 | 1.000000 | 8.00× |
+| 1 | 17.8 | 1.000000 | 8.00× |
+| 2 | 27.0 | 1.000000 | 8.00× |
+| 3 | 15.0 | 1.000000 | 8.00× |
+
+Cosine is 1.000000 and the scale is exactly B. Two readings, which must not be
+conflated:
+
+**(a) On equal footing the trace is EXACT.** Removing the scale, the trace
+gradient matches the pathwise BPTT gradient to **3.7e-07 relative, cosine
+1.000000**, at every layer, in **both** decay regimes:
+
+| regime | σ | half-life | scale | equal-footing rel err |
+|---|---:|---:|---:|---:|
+| default init | 0.544 | 1.14 B | 8.00× | 2.5e-07 |
+| `--decay-init 3` | 0.953 | 14.27 B | 8.00× | same to 6 figures |
+
+**Issue #2's claimed bias (decay[0] rel 0.36 / cosine 0.934 at 4 layers) does
+NOT reproduce.** The apparent bias was the scale factor below.
+
+**(b) The real defect: the decay rows are not normalised by B.** The loss is
+`(...)/B`, so every parameter's gradient carries `1/B` — except the decay
+gradient, `(dlds * decaytrace).sum(axis=0)`, which does not. The ratio is
+exactly B, verified by sweeping it: **8.00× at B=8, 16.00× at B=16, 32.00× at
+B=32.** Direct confirmation: recomputing exact BPTT with the per-step loss *not*
+divided by B reproduces the engine's trace gradient to **rel 0.0000, cosine
+1.000000**.
+
+### Consequences
+
+- **Under AdamW: nothing.** Adam is per-parameter and scale-invariant, so a
+  constant factor on the 8,192 decay coordinates is absorbed. That is why
+  889,897 steps ran without incident and why nobody noticed.
+- **Under any non-scale-invariant optimizer: a live trap.** Roadmap P4 proposes
+  adding SGD as a factorial arm. Under SGD the decay rows would receive an
+  effective learning rate **B× larger** than every other parameter — at the
+  frozen B=1024, that is 1,024×. Any SGD arm must divide the decay gradient by
+  B, or the decay-timescale experiment is measuring a learning-rate blowup
+  rather than an optimizer effect.
+- **For P0's premise:** §4 action 2 (the hybrid window + exact-TBPTT trainer) was
+  conditional on *"if the gate shows the bias"*. It does not show a bias. The
+  estimator is not the leading suspect for gradient SNR ≈ 0.05 or for the
+  memory wall at this operating point, which converges with #3's own finding
+  that decays collapse to the 1-byte regime deterministically and reyvvon's
+  result that init + schedule fixed the probe without touching the estimator.
+  **Do not build the hybrid trainer on this evidence.**
+
+### Two methodology traps this gate had to clear first
+
+1. **Random bytes make the comparison vacuous.** With iid bytes the recurrent
+   states are effectively iid, every lag weighting collapses onto the same
+   direction, and cosine comes out a clean 1.0000 for every layer at every
+   setting — a confident false negative. Real line-bucketed corpus bytes are
+   required, and the gate now says why in its docstring.
+2. **Freeze the parameters for the window** (LR=0), or the comparison measures
+   AdamW drift instead of the trace.
+
+Not established: T=16–24 steps, dim 32, 2–4 layers, one corpus, B∈{8,16,32}. The
+claim is about the estimator's *shape and scale*, which is what P0 needed; it is
+not a statement about trained checkpoints, where σ is heterogeneous per
+coordinate and the state gain is not ≈1.
