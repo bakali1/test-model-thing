@@ -2058,3 +2058,182 @@ depths outright rather than backoff-skipping them. But every coverage number in
 this file is now conditional on a floor, and the depth>=4 band in particular is
 floor-sensitive: it is mostly below 0.05 retained mass, which is why it
 disappears at 0.09 and not because the target construction changed.
+
+---
+
+## The A/B on a T4 at the frozen B=1024 — and the result replicates (2026-10-04)
+
+`bundles/make_kd_ab_bundle.py` → `colab run --gpu T4 bundles/colab_kd_ab.py`.
+10,000 steps at **B=1024** (the frozen config), seed 0, `--data-seed 0`, one
+14.93 MB TinyStories slice, k=32, α=0.5, floor=0.05. 3,635,697-token dump.
+**OVERALL: PASS**, 1899 s wall.
+
+### Target coverage per depth, T4 / B=1024, floor 0.05
+
+| depth | produced | coverage |
+|---:|---:|---:|
+| 0 | 253,665 / 253,671 | 100.0% |
+| **1** | **207,576 / 225,559** | **92.0%** |
+| 2 | 93,060 / 201,219 | 46.3% |
+| 3 | 56,348 / 165,164 | 34.1% |
+| 4 | 18,912 / 96,486 | 19.6% |
+| 5+ | 11,252 / 96,099 | 11.7% |
+
+Reader: coverage **61.2%**, mean target depth **1.103**, top-1 == gold **66.2%**.
+Depth 1 was **0.0%** before the fix. Gate 3 on CUDA/CPU: `max|Δθ| = 0.0`.
+
+### The three arms
+
+`ce` is comparable across arms; total `loss` is not (CE is down-weighted by
+`1-α` in C and B by construction, which is why C exists).
+
+| arm | final loss | final ce | ms/step | B/s |
+|---|---:|---:|---:|---:|
+| A — CE only | 2.0593 | **1.3258** | 29.6 | 34,635 |
+| C — half-CE control (α=0.5, zero target) | 1.4158 | **1.3735** | 29.7 | 34,497 |
+| B — MI-KD, corrected target | 2.0480 (max) | **1.3469** | — | 24,306 |
+
+Arm B covered **67.47%** of positions. **No divergence**: max total loss 2.048.
+
+| | T4, B=1024, 10k steps | laptop, B=64, 2k steps |
+|---|---:|---:|
+| halved-CE penalty `C−A` | **+0.0477** | +0.070 |
+| KD vs its own control `B−C` | **−0.0266** | −0.035 |
+| KD vs plain CE `B−A` | **+0.0211** | +0.035 |
+
+**The same three signs and roughly the same magnitudes on a different device, a
+16× larger batch, 5× the steps and 75× the data.** That is what makes this a
+result rather than an anecdote:
+
+1. Halving the CE weight costs ~+0.05 nats. Reproducible.
+2. **KD recovers about half of what the CE discount costs.** B−C is negative in
+   both runs: the teacher target is worth roughly half the α=0.5 CE discount,
+   leaving ~+0.02 nats versus plain CE.
+3. The end state is **neutral, not better**, and the residual gap is the
+   undiscounted half of the CE loss, not a distillation deficit.
+
+This independently confirms the prediction recorded in the roadmap's P3: the
+objective is linear in `α/(1−α)`, so KD claws back part of what α costs, and at
+CE-only optimality (α=0) there is nothing to claw back. **An α sweep will confirm
+a negative unless something CE-invisible (word-length drift) shows a benefit
+first** — so the α sweep is not the next experiment; the ruler is.
+
+### Why this is not a distillation win, stated plainly
+
+Three independent reasons, all in this file: the arm is 10 MB of TinyStories at
+CE 1.35 against a 1.1741 ruler baseline, so it is under-trained and
+register-shifted; the paper's byte-model crossover is 6.33e22–2.04e23 FLOPs and
+this run is ~1e16; and the objective is linear in α/(1−α), which makes plain CE
+the optimum of this family. "Neutral" is the expected result at this scale and is
+recorded as such.
+
+### Operational notes (cost me two runs; recording so it costs one)
+
+- **The Colab VM is GC'd even with `--keep`.** The session went 404 while I was
+  retrying a download. Anything that must survive has to leave the VM during the
+  run — the bundle now pushes from inside the VM via `checkpoint_hub.push`, with
+  the token arriving as `script_args` so **no credential is in the bundle**.
+- **Large `colab download` is unreliable**: a 142 MB checkpoint failed with
+  `IncompleteRead`. Push in-VM instead of download-then-push.
+- The TinyStories marker literal arrived as `b""` (empty) in the first bundle:
+  `blob.count(b"")` returns `len(blob)+1` (it reported "stripped 16498690
+  markers" for a 16.5 MB corpus) and `replace(b"", b"")` is a no-op, so nothing
+  was stripped and `tools/mi_dump.py` refused the corpus. Now built from hex and
+  asserted: `MARKER len == 13` and `occurrences left == 0`.
+- `make_streams` splits by line round-robin, so the SHORTEST stream is 0.766×
+  the mean. A corpus sized to exactly `(steps+200)×B` runs ~23% short of the
+  requested steps; 1.45× clears it and the step count is clamped to the real
+  `L_step` rather than silently truncated.
+- `mi_report.py` wrote `by_depth[stem]` containing scalars plus a nested
+  `per_depth`; walking it as depth-keyed dies on `int("positions")` — after a
+  14-minute dump. Its closing message also still claimed *"depth 0 is the ONLY
+  depth that yields a target"*, i.e. the bug this file documents. Both fixed.
+
+### Addendum — the second SGD arm, and the complete picture (2026-10-04)
+
+`armsgdlr0.000125_t919897.npz` (0.25× AdamW's step) completed at 117.9 min.
+All three arms below are 30,000 steps from the same t=889,897, same data seed,
+same B=1024, all at t=919,897.
+
+| arm | held-out CE | shift CE | cross-domain CE | σ_mean | hot dims | tail | stop AUC | SNR trunk/decay |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **AdamW 5e-4 (control)** | 1.2094 ± 0.0143 | 1.1648 | 2.4176 ± 0.1372 | 0.51911 | 172 | 180.4 MB | 0.9496 | — (lost) |
+| SGD 5e-4 (**1.00× step**) | 1.2279 ± 0.0188 | 1.1744 | 2.4745 ± 0.1414 | 0.51480 | **104** | 109.1 MB | 0.9673 | 0.0649 / 0.0651 |
+| SGD 1.25e-4 (0.25× step) | 1.2049 ± 0.0182 | 1.1632 | 2.2630 ± 0.0952 | 0.51479 | **104** | 109.1 MB | 0.9763 | 0.0564 / 0.0677 |
+
+**Honest reading of the deltas — they are ~1 SE, not decisive.** Combined SEs are
+≈0.024 on held-out CE, so: step-matched SGD is **+0.0185 (~0.8σ)** worse
+in-domain and +0.0569 worse cross-domain; the 0.25× arm is **−0.0045 (~0.2σ)**
+in-domain, i.e. a tie, and **−0.155** cross-domain (~0.9σ on marginal SEs; the
+arms are paired on the same four novels, so the effective noise is lower, but
+one seed and one ruler setting cannot settle it). The claim that survives is
+directional, not significant: **step-matched SGD is not better, and the smaller
+step is not worse in-domain while being consistently better cross-domain.**
+
+**No arm moved SNR.** 0.0649 and 0.0564 trunk, 0.0651 and 0.0677 decay — all
+inside the 0.05–0.07 band that has now survived the optimizer swap, the
+decay-role LR sweep (1×/4×/16×), and the estimator audit. Three independent
+attacks, one unchanged number.
+
+**The decay-role result is now structural, not an LR effect.** Across *both* SGD
+arms spanning 0.25×–1.00× AdamW's step, σ_mean stayed at **0.51479–0.51480 and
+hot dims at 104 — the exact start values to 5 decimal places**, over 30,000
+steps. AdamW's control moved the same coordinates to 0.51911 / 172. A
+magnitude-proportional optimizer does not train the memory role *at any* step
+size in this range; it is not a tuning artifact.
+
+**What cannot be separated with two arms.** Both SGD arms have the decay role
+frozen *and* a smaller tail (109 MB vs 180 MB) *and* differ in step size. The
+cross-domain gain is therefore consistent with the repo's documented trend that
+continued training on this corpus raises in-domain CE — a less-over-trained model
+generalizes better — rather than with "SGD". Distinguishing "SGD" from "frozen
+decay role" from "smaller step" needs one more arm (SGD at 0.25× step with the
+decay role *unfrozen*, i.e. lr-decay scaled up to compensate), which is cheap on
+the MX150. **Not run.**
+
+**Not established:** significance of any delta above; from-scratch behaviour;
+whether a magnitude-proportional optimizer can learn a useful memory timescale
+at all from t=0. The frozen-role result is a statement about *continuation from
+an AdamW-trained checkpoint*, and a from-scratch run could differ in exactly the
+way that matters.
+
+### Checkpoints pushed to the hub, and the run that pushed them
+
+Pushed to **`bakali1/tmt-checkpoints` (private)** with `run_id kd-ab-2026-10-04`,
+via `checkpoint_hub.push` from inside the Colab VM (token passed as
+`script_args`; **no credential is in the bundle or in this file**).
+
+| file | sha256 (first 12) | final ce |
+|---|---|---:|
+| `armA_ce_t010000.npz` | `6b2e4be2e1a2` | 1.3258 |
+| `armC_halfce_t010000.npz` | `b4e12434c5a7` | 1.3735 |
+| `armB_kd_t010000.npz` | `37919b09a3e8` | 1.3469 |
+
+Each with a `.sha256` sidecar. Verified by pulling `armB_kd` back down:
+`checkpoint_hub.validate_npz` accepts it (internal `t` = 10000 = filename),
+107 keys / 75 parameter arrays, and the content hash matches the sidecar.
+
+**These are from-scratch 10,000-step experiment arms, not the incumbent
+checkpoint**, and their CE (1.33–1.37) is worse than the ruler baseline
+(1.1741). They are banked so the A/B/C comparison is reproducible and inspectable,
+not as a release. Do not quote arm B as TMT's best model.
+
+### The Colab run is bit-deterministic — and that is the strongest form of this result
+
+The T4 job was run twice end to end (once to measure, once to push). Both runs
+agree to every printed digit:
+
+| | run 1 (measure) | run 2 (push) |
+|---|---:|---:|
+| arm A loss / ce | 2.0593 / 1.3258 | 2.0593 / 1.3258 |
+| arm C loss / ce | 1.4158 / 1.3735 | 1.4158 / 1.3735 |
+| arm B ce | 1.3469 | 1.3469 |
+| `C−A` | +0.0477 | +0.0477 |
+| `B−C` | −0.0266 | −0.0266 |
+| `B−A` | +0.0211 | +0.0211 |
+
+So the conclusion — *halving CE costs ~0.05 nats, KD recovers about half of it,
+and the end state is neutral rather than better* — now rests on three
+independent agreements: this T4 run twice bit-for-bit, and the laptop B=64 run
+at the same signs and magnitudes. That is the level of evidence this repo
+should have had before the 2026-10-03 closure, and did not.

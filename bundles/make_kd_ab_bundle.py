@@ -89,6 +89,20 @@ DATA_URL = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
 # failure this comment exists to prevent.
 MARKER = b"\x3c\x7c" + b"endoftext" + b"\x7c\x3e"
 FAILS = []
+PUSH_REPO = None
+PUSH_TOKEN = None
+for _i, _a in enumerate(sys.argv):
+    if _a == "--push-repo" and _i + 1 < len(sys.argv):
+        PUSH_REPO = sys.argv[_i + 1]
+    if _a == "--push-token" and _i + 1 < len(sys.argv):
+        PUSH_TOKEN = sys.argv[_i + 1]
+PUSH_RUN = os.environ.get("TMT_RUN_ID", "kd-ab-2026-10-04")
+if PUSH_REPO:
+    os.environ["TMT_HUB_REPO"] = PUSH_REPO
+    os.environ["TMT_HUB_REPO_TYPE"] = "model"
+    os.environ["TMT_RUN_ID"] = PUSH_RUN
+    print(f"  push target {PUSH_REPO} run_id {PUSH_RUN} (token arrives as argv "
+          f"and is never written into this file)", flush=True)
 T0 = time.time()
 SUMMARY = {"steps": STEPS, "batch": BATCH, "k": K, "alpha": ALPHA,
            "floor": FLOOR, "teacher": TEACHER, "arms": {}}
@@ -235,25 +249,32 @@ rep = {}
 p = os.path.join(HERE, "mi_report.json")
 if rc == 0 and os.path.exists(p):
     rep = json.load(open(p))
-    for stem, rows in rep.get("by_depth", {}).items():
-        for d, row in rows.items():
-            key = int(d)
-            ent = row.get("entropy_nats")
-            print(f"  depth {key}: coverage={row.get('coverage_floor_0.05')} "
-                  f"entropy={ent}", flush=True)
-            SUMMARY.setdefault("by_depth", {})[str(key)] = {
-                "coverage": row.get("coverage_floor_0.05"),
-                "entropy_nats": ent}
-    rs = list(rep.get("reader_stats", {}).values())
-    if rs:
-        SUMMARY["reader_stats"] = rs[0]
-        print(f"  reader: coverage={rs[0].get('coverage')} "
-              f"floor={rs[0].get('floor')} "
-              f"mean_depth={rs[0].get('target_mean_depth')} "
-              f"top1_gold={rs[0].get('top1_gold_fraction')}", flush=True)
+    # mi_report writes by_depth[stem] = {..., "per_depth": {"0": {...}, ...}},
+    # not by_depth[stem] keyed by depth. Walking it as the latter is a TypeError
+    # on int("positions") -- which is how the first attempt at this bundle died
+    # after a 14-minute dump.
+    for stem, row in rep.get("by_depth", {}).items():
+        SUMMARY.setdefault("by_depth", {})[stem] = {
+            "overall_coverage": row.get("coverage"),
+            "entropy_nats": row.get("target_entropy_nats"),
+            "top1_equals_gold": row.get("top1_equals_gold")}
+        for d, pd_ in sorted(row.get("per_depth", {}).items()):
+            print(f"  depth {d}: coverage={pd_.get('coverage')} "
+                  f"({pd_.get('produced')}/{pd_.get('positions')})", flush=True)
+            SUMMARY["by_depth"][stem][f"d{d}"] = pd_.get("coverage")
+        rs = rep.get("reader_stats", {}).get(stem)
+        if rs:
+            SUMMARY["reader_stats"] = rs
+            print(f"  reader: coverage={rs.get('coverage')} "
+                  f"floor={rs.get('floor')} "
+                  f"mean_depth={rs.get('target_mean_depth')} "
+                  f"top1_gold={rs.get('top1_gold_fraction')}", flush=True)
+    d1 = None
+    for stem, row in SUMMARY.get("by_depth", {}).items():
+        if "d1" in row:
+            d1 = row["d1"] if d1 is None else min(d1, row["d1"])
 # depths >= 1 must now be PRODUCED. This is the regression that the depth-0-only
 # target made impossible and that t3 in tests/check_mi.py pins on CPU.
-d1 = SUMMARY.get("by_depth", {}).get("1", {}).get("coverage")
 result("depth1-covered", d1 is not None and d1 > 0.3,
        f"depth-1 coverage {d1} (the depth-0-only target gave 0.0 here)")
 
@@ -395,12 +416,33 @@ result("throughput", min(A["B_per_s"], C["B_per_s"], B["B_per_s"]) > 5000,
 
 with open(os.path.join(HERE, "kd_ab_summary.json"), "w") as f:
     json.dump(SUMMARY, f, indent=2)
+
+# ---------------- push from inside the VM ----------------
+if PUSH_REPO:
+    banner("I: push checkpoints to the hub from the VM")
+    import checkpoint_hub
+    for nm, rec in (("armCE", A), ("armHalfCE", C), ("armKD", B)):
+        src = os.path.join(CKPT_DIR, rec["checkpoint"])
+        try:
+            t = checkpoint_hub.push(src, repo_id=PUSH_REPO, token=PUSH_TOKEN,
+                                    repo_type="model", run_id=PUSH_RUN)
+            rec["pushed"] = {"repo": PUSH_REPO, "t": t, "name": rec["checkpoint"]}
+            print(f"  pushed {nm} t={t}", flush=True)
+        except Exception as exc:
+            print(f"  push FAILED for {nm}: {type(exc).__name__} {exc}", flush=True)
+            FAILS.append("push-" + nm)
+    with open(os.path.join(HERE, "kd_ab_summary.json"), "w") as f:
+        json.dump(SUMMARY, f, indent=2)
+else:
+    print("\n  (no --push-repo given; checkpoints stay on the VM)", flush=True)
+
 print(f"\n  total wall: {time.time() - T0:.0f}s", flush=True)
 print(f"[RESULT] OVERALL: {'PASS' if not FAILS else 'FAIL - ' + ', '.join(FAILS)}",
       flush=True)
-print("[RESULT] checkpoints in ./ckpts — push them with checkpoint_hub.push "
-      "from a machine that holds the hub token; nothing was pushed from here.",
-      flush=True)
+if PUSH_REPO:
+    print(f"[RESULT] pushed to {PUSH_REPO} with run_id {PUSH_RUN}. These are "
+          f"from-scratch {STEPS}-step EXPERIMENT arms, not the incumbent "
+          f"checkpoint, and their CE is worse than the ruler baseline.", flush=True)
 '''
 
 REPO = os.environ.get("TMT_HUB_REPO", "")

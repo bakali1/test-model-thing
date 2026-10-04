@@ -100,7 +100,7 @@ def main():
             if pr.any():
                 ents.append(ent[pr])
                 firsts.append(tgt.max(axis=2)[pr])
-            for d in range(4):
+            for d in range(8):
                 m = dep == d
                 if not m.any():
                     continue
@@ -139,9 +139,14 @@ def main():
     with open(out, "w") as fh:
         json.dump(report, fh, indent=2)
     print(f"\n[report] wrote {out}")
-    print("depth 0 is the ONLY depth that yields a target (the paper's Case I,")
-    print("unconditioned); depths >= 1 are declined because one teacher forward")
-    print("pass conditioned on the gold prefix cannot represent byte uncertainty.")
+    print("depth 0 is the paper's Case I (the unconditioned first-byte")
+    print("marginal). depths >= 1 are the prefix-conditioned case: condition on")
+    print("the bytes already emitted, aggregate over the NEXT one. Both are")
+    print("produced. An earlier version of this tool printed 'depth 0 is the")
+    print("ONLY depth that yields a target', which was the depth-0-only bug, not")
+    print("a property of the paper.")
+    print("Quote coverage WITH its floor: coverage is (definition x floor), and")
+    print(f"the reader's floor was {r.stats().get('floor')}.")
 
 
 if __name__ == "__main__":
