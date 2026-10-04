@@ -11,12 +11,12 @@ from-scratch experiment).
 | `../README.md` | project entry point, how to run | **current** |
 | `../RESULTS.md` | the ruler and all measured results | **current — append-only** |
 | `plans/PLAN-2026-09-23-GPU.md` | the GPU port plan: engine, hub, correctness gate, week-1 order | **current** |
-| `plans/PLAN-2026-09-25.md` | next-day execution plan | **current** (written by the other model) |
-| `plans/PLAN-2026-09-22.md` | the original phase plan | superseded by the GPU plan |
+| ~~`plans/PLAN-2026-09-25.md`~~ | next-day execution plan | **archived** → `plans/superseded/` |
+| ~~`plans/PLAN-2026-09-22.md`~~ | the original phase plan | **archived** → `plans/superseded/` |
 | `plans/PLAN-2026-10-04-LR-ROLES.md` | role-specific-LR factorial (the cheap half of the SNR blocker's two-axis plan); gate + Colab bundle built, run not launched | **current** |
 | `plans/PLAN-2026-10-03-DISTILL.md` | distil an open model into TMT (teacher `LFM2.5-230M-Base`, Marginalize-It, teacher-generated corpus); gate 0 cleared | **current — read before optimizing** |
-| `plans/PLAN-2026-10-04-ROADMAP.md` | roadmap v2 — credit → SSM → memory ruler; synthesis of YT/issues/Karpathy-1506.02078v2/video decisions; ranked queue + rejected ideas | **current — read before new experiments** |
-| `plans/PLAN-2026-10-04-ROUTER.md` | 4.5M intent→JSON tool router (SFT, short-horizon, teacher-as-labeler); the two pilot gates that decide it | **design — pilot costed, nothing measured yet** |
+| `plans/PLAN-2026-10-04-ROADMAP.md` | **roadmap v3** — ruler → step size → memory → SSM. v3 reorders v2 after the SNR blocker was found to be ~12.6× pessimistic; v2's evidence chains and rejected-ideas table are retained below the v3 header | **current — read before new experiments** |
+| `ideas/ROUTER-4.5M-INTENT-JSON.md` | 4.5M intent→JSON tool router (SFT, short-horizon, teacher-as-labeler) | **design — nothing measured.** moved out of `plans/`: it was never a plan |
 | `optimization/OPTIMIZATION_TEST_STATUS.md` | what was measured, what was **not**, what to try next | **current — read before optimizing** |
 | `optimization/GPU_OPTIMIZATION_PLAN.md` | the optimization plan and its measured outcome (§0) | historical + measured |
 | `optimization/GPU_OPTIMIZATION_PLAN-REVIEW.md` | review of that plan | review, closed |
@@ -35,6 +35,14 @@ from-scratch experiment).
    were already measured and lost.
 4. **`plans/PLAN-2026-09-23-GPU.md` §7** — the live status and next steps.
 
+## Archived
+
+`docs/plans/superseded/` holds plans that were executed or superseded. Nothing is
+deleted — `RESULTS.md` is append-only for a reason, and so is this:
+
+- `superseded/PLAN-2026-09-22.md` — the original phase plan (superseded by the GPU plan)
+- `superseded/PLAN-2026-09-25.md` — next-day execution plan (executed)
+
 ## Conventions that matter
 
 - **`RESULTS.md` is append-only.** Corrections are added as new sections that
@@ -46,6 +54,15 @@ from-scratch experiment).
 - **`OPTIMIZATION_TEST_STATUS.md` has a "NOT tested" section.** Listing only
   successes is how a plan ends up shipping predictions that measurement
   already refuted.
+- **Every gradient-quality number prints its estimator convention.** `SNR` is
+  not one quantity: `||EMA_b(g)||² / EMA_b(||g||²)` measured *while θ moves* reads
+  0.05, and the same estimator at *frozen* θ reads 0.633. An unlabelled SNR is
+  not a result.
+- **Gradient gates assert real corpus bytes.** On uniform random bytes the states
+  are iid and every lag weighting collapses to one direction, so the gate passes
+  confidently for free. Measured: `ρ(1)` flips `+0.534 → −0.171` on that one
+  variable. Scripts: `tools/random_vs_real.py`, `tools/reconcile_snr.py`,
+  `tools/rho_probe.py`.
 
 ## Repo layout
 

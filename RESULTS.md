@@ -3,6 +3,48 @@
 Run id / data / seed / bytes / per-slice CE / histogram / chat verdict.
 One row per checkpoint that a decision was based on. Never edit a row; append.
 
+## Read this first — current state, 2026-10-04
+
+**The ruler** (below) is unchanged and is the only thing a CE number should be
+quoted against. Everything below is append-only history.
+
+### The three standing blockers, as currently understood
+
+| # | blocker | status | where |
+|---|---|---|---|
+| 1 | gradient SNR ≈ 0.05 | **largely a measurement artifact.** The same estimator at a **frozen** θ reads **0.633** — a **12.6× gap** caused by the iterate moving every byte. Diagnosis is now **over-large step**, not a noise floor. The direct lever (global `--lr`) has **never been swept**. | end of file |
+| 2 | memory formation is real but small (mean half-life 1.14 B; 7 of 8192 dims > 8 B) | **unchanged — and now the thing to measure rather than to fix.** The gradient side looks materially healthier than believed. | §ruler, `tools/memory_report.py` |
+| 3 | distance-curve / retrieval ruler | **being built** (Karpathy 2015 Fig. 5 cell in `tools/eval.py`) | in progress |
+
+### Claims that have been retracted or corrected
+
+Read these before quoting anything older:
+
+- **Adam does not degenerate to `sign(m)`** — it is normalized SGD with a constant
+  normalizer (`|update|/|m|` spread 1.0020×, `|m|` spread 763×). AdamW ≡ SGD here.
+- **`ρ(1) = +0.52` and SNR `0.96` are retracted** — they came from **uniform random
+  bytes**, a trap this repo had already written down for the trace gate. Real text
+  gives `ρ(1) = −0.171` and SNR 0.633.
+- **The variance hinge is a floor, not a penalty** — `max(0, 1-√var)` pushes latent
+  variance **up**; it is anti-collapse.
+- **The eligibility trace is NOT biased** — confirmed at production depth (16
+  layers, dim 512, both decay regimes): cosine 1.000000, rel err ≤1.05e-06. The
+  hybrid-window trainer stays HELD.
+- **Gradient accumulation is a weak lever** — efficiency 0.138 at k=64, not the
+  1/k the literature framing assumes.
+
+### The three optimizer/LR attacks, merged
+
+All three returned *SNR did not move*. One merged table, three rows, every number
+retained in its own section above:
+
+| attack | what moved | CE verdict |
+|---|---|---|
+| per-role LR (1×/4×/16× on decay) | σ_mean rose 1.82×/2.14× then **saturated**; CE monotonically worse | null, +29% hot tail for zero gain |
+| step-matched SGD | decay role **froze outright** (hot dims 104 vs 172; σ moves 1e-5 over 30k) | +0.0185 (~0.8σ) — now attributed to noise + kernel confound |
+| distillation KD (A/B/C, 3 runs) | coverage 0%→92%, no divergence (2.048 vs 860.68) | KD recovers ½ its CE discount, **end state neutral** |
+
+
 ## Ruler
 
     .venv/bin/python eval.py <checkpoint.npz> [--slices 3] [--bytes 20000]
@@ -1242,6 +1284,16 @@ is **4.2 h**, so CE control + KD arm + one shared dump = **≈ 13 h**, with
 
 ## 2026-10-04 — role-specific-LR factorial (PLAN-2026-10-04-LR-ROLES)
 
+
+> **SUPERSEDED / CONSOLIDATED 2026-10-04.** This section is retained
+> verbatim and is **not** the current summary. Three separate optimizer and
+> learning-rate attacks all returned the same verdict -- *SNR did not move* --
+> and are now merged into one table in **"The standing SNR blocker was a
+> measurement artifact"** at the end of this file, which also records the
+> two corrections that change how they must be read (Adam is not sign-like;
+> the ~0.05 figure is ~12.6x pessimistic because theta moves every byte).
+> Keep this section for its numbers; read the merge for the conclusion.
+
 Three arms, **30,000 steps each from the same t=889,897 checkpoint bytes**, same
 data seed 0, same B=1024, same 96 MB TinyStories slice, same T4
 (`ring_credit=auto`→compiled, ~22–24 kB/s). Only `--lr-decay` differs: the LR of
@@ -1898,6 +1950,16 @@ Coverage identical in both: 77,435 / 128,000 = 60.50%.
 
 ## The optimizer axis is answered, and the decay role turns out to be optimizer-dependent (2026-10-04)
 
+
+> **SUPERSEDED / CONSOLIDATED 2026-10-04.** This section is retained
+> verbatim and is **not** the current summary. Three separate optimizer and
+> learning-rate attacks all returned the same verdict -- *SNR did not move* --
+> and are now merged into one table in **"The standing SNR blocker was a
+> measurement artifact"** at the end of this file, which also records the
+> two corrections that change how they must be read (Adam is not sign-like;
+> the ~0.05 figure is ~12.6x pessimistic because theta moves every byte).
+> Keep this section for its numbers; read the merge for the conclusion.
+
 Isolated study in `../scratch-optimizer-study/`; the repo was not modified. The
 SGD optimizer is derived at runtime from this repo's `gpu_port.py`, and the
 study's gate proves the derivation is **bit-identical in `adamw` mode** over 120
@@ -2151,6 +2213,16 @@ recorded as such.
 
 ### Addendum — the second SGD arm, and the complete picture (2026-10-04)
 
+
+> **SUPERSEDED / CONSOLIDATED 2026-10-04.** This section is retained
+> verbatim and is **not** the current summary. Three separate optimizer and
+> learning-rate attacks all returned the same verdict -- *SNR did not move* --
+> and are now merged into one table in **"The standing SNR blocker was a
+> measurement artifact"** at the end of this file, which also records the
+> two corrections that change how they must be read (Adam is not sign-like;
+> the ~0.05 figure is ~12.6x pessimistic because theta moves every byte).
+> Keep this section for its numbers; read the merge for the conclusion.
+
 `armsgdlr0.000125_t919897.npz` (0.25× AdamW's step) completed at 117.9 min.
 All three arms below are 30,000 steps from the same t=889,897, same data seed,
 same B=1024, all at t=919,897.
@@ -2237,3 +2309,131 @@ and the end state is neutral rather than better* — now rests on three
 independent agreements: this T4 run twice bit-for-bit, and the laptop B=64 run
 at the same signs and magnitudes. That is the level of evidence this repo
 should have had before the 2026-10-03 closure, and did not.
+
+---
+
+## The standing SNR blocker was a measurement artifact — and the optimizer framing was wrong (2026-10-04)
+
+This section supersedes three earlier claims. It is appended, not edited in
+place, per the file's convention. Scripts: `tools/rho_probe.py`,
+`tools/reconcile_snr.py`, `tools/random_vs_real.py`.
+
+### CORRECTION 1 — "Adam collapses to `lr·sign(m)`" was wrong
+
+`RESULTS.md:1919` reads:
+
+> its step collapses to ≈ `lr·sign(m)` and it spends a **uniform ±lr budget** on
+> all 4,481,793 coordinates.
+
+Both halves are wrong. With `√v ≈ 1` uniformly, Adam is
+
+```
+Δθ = -lr · m / (√v + eps) ≈ -lr · m
+```
+
+i.e. **normalized SGD with a constant normalizer**, not `sign(m)`. Sign-like
+behaviour needs `√v ∝ |m|`, which is not the case here. Measured on the
+incumbent: the ratio `|update| / |m|` has a p10→p99 spread of **1.0020×** while
+`|m|` itself spreads **763.66×** over the same range.
+
+The magnitude claim is refuted by this file's own table two paragraphs below it:
+AdamW's measured median step at `lr=5e-4` is **1.085e-05**, i.e. **0.0217 × lr**,
+not ±lr.
+
+**What survives, and is now better supported:** AdamW and step-matched SGD are
+effectively the *same algorithm* at this operating point, which is *why* the arms
+tracked to 0.8σ (1.2279 vs 1.2094). The `+0.0185` should be attributed to noise
+plus the NVRTC/Triton hardware confound — **not** to the optimizer. "SGD does not
+beat AdamW" stands; "SGD is a different optimizer here" does not.
+
+### CORRECTION 2 — the ~0.05 SNR is mostly parameter motion, not gradient noise
+
+`telemetry.py:27-40` measures `||EMA_b(g)||² / EMA_b(||g||²)` during training,
+where **θ moves on every single byte**. Measuring the same estimator at a
+**frozen** θ on the same checkpoint and the same B:
+
+| condition | telemetry-EMA SNR | plain k-average, k=96 |
+|---|---:|---:|
+| θ **frozen** (`lr=0`), real TinyStories, B=1024, t=919,897 | **0.6330** | 0.0994 |
+| θ **moving** (real training, same metric) | **0.05** | — |
+
+**A 12.6× gap on the same metric, same checkpoint, same batch size.** At a fixed
+point the gradient is ~63% self-consistent; in training it reads 5%. The
+difference is that the iterate moves further between updates than the gradient's
+spatial consistency length.
+
+This is the **over-large-step regime**, and it is the best-supported explanation
+in this file for the SNR blocker. It also retro-explains three results that were
+previously attributed elsewhere:
+
+- SGD 0.25× step tied in-domain and won cross-domain — less jitter.
+- 16× decay-role LR was mildly worse — more jitter, in the memory role.
+- SGD ≡ AdamW — same algorithm, so the delta was noise.
+
+**Caveats, stated:** frozen θ makes the field stationary by construction, so 0.633
+is an upper bound; consecutive steps read overlapping bytes, which inflates
+agreement; and averaging during training will not fully recover it because the
+iterate still drifts within the window.
+
+### CORRECTION 3 — random bytes manufacture a confident result. ρ(1) flips sign.
+
+An external check reported `ρ(1) = +0.52` and SNR 0.9637 at frozen θ. Its batch
+was built as `torch.randint(1, 250, (STEPS+1, B))` — **uniform random bytes**.
+Re-running that exact script (same checkpoint, B=1024, 96 steps, same telemetry
+call) changing only the data:
+
+| | random bytes | **real TinyStories** |
+|---|---:|---:|
+| telemetry-EMA SNR, k=96 | 0.9637 | **0.6330** |
+| plain k-average, k=96 | 0.8525 | **0.0994** |
+| ρ(1), per-coordinate | **+0.534** | **−0.171** |
+| ρ(32), per-coordinate | +0.099 | −0.017 |
+
+ρ(1) **changes sign**. On uniform random bytes there is nothing local to model,
+so the response collapses onto one constant direction and every step agrees —
+confidence manufactured by the data, not found in the gradient. The plain-average
+SNR differs 8.6× between the two arms.
+
+**This is the trap `PLAN-2026-10-04-ROADMAP.md` P0 item 1 already wrote down** for
+the trace gate: *"with random bytes the states are iid and every lag weighting
+collapses to the same direction, giving a confident cosine 1.0000 for free."* Same
+trap, different measurement. **Every future gradient-quality gate must assert
+real corpus bytes**, not synthetic ones.
+
+The negative ρ(1) on real text is itself worth recording: consecutive real-text
+gradients partially **cancel**, which is the opposite of the random-byte result.
+
+### The accumulation ladder, measured on real text rather than guessed
+
+Efficiency = achieved ÷ ideal `1/k` noise reduction, frozen θ, real bytes:
+
+| k | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| efficiency | 0.589 | 0.357 | 0.242 | 0.185 | 0.154 | **0.138** |
+
+k=64 buys ~8.8 effective samples, not 64. Accumulation is **real but ~7× weaker
+than the independent-sample prediction**, and the plain k-average on real text is
+non-monotonic (0.144 at k=8, 0.056 at k=32, 0.099 at k=96). So "just accumulate"
+is not the lever the literature framing implies — **the direct lever on step size
+is the learning rate**, and it has never been swept on the global axis.
+
+### What is now established, in one table
+
+| claim | status |
+|---|---|
+| the eligibility trace is exact at production depth (16 layers, dim 512, both decay regimes, cosine 1.000000, rel err ≤1.05e-06) | **established today** |
+| AdamW ≈ SGD at this operating point; "sign(m)" was wrong | **established today** |
+| SNR 0.05 is ~12.6× pessimistic; the cause is parameter motion | **established today** |
+| ρ(1) = +0.52, SNR = 0.96 at frozen θ | **RETRACTED — random-byte artifact** |
+| gradient accumulation is a strong lever | **not supported**; efficiency 0.138 at k=64 |
+| the variance hinge penalizes latent variance | **RETRACTED** — `max(0, 1-√var)` is a floor, not a penalty |
+| global learning rate above 5e-4 | **never tested** — the only LR factorial was decay-role |
+
+### The one experiment this points at
+
+The over-large-step diagnosis has a direct, cheap, never-run test: **sweep the
+global learning rate.** Every LR factorial in this repo moved `--lr-decay`, the
+decay role's rate, never `--lr`. Given that the measured step is already
+0.0217 × lr, the nominal lr and the effective step are not the same quantity, and
+nobody has established where the effective step should sit. This is ranked ahead
+of accumulation because accumulation costs k× the updates and this costs none.

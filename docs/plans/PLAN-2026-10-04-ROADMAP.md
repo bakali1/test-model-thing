@@ -4,6 +4,90 @@
 **Status:** synthesis, not execution. Every item below is ranked against the
 measured blockers in `../RESULTS.md` and `../ideas/ARCHITECTURE_IDEAS2.md`.
 
+> ## ROADMAP v3 — 2026-10-04, supersedes the v2 ordering below
+>
+> v3 is a **reordering**, driven by two measurements taken after v2 was written.
+> The v2 body is retained below for its evidence chains, its rejected-ideas
+> table, and its sources map. **Where the two disagree, v3 wins.**
+>
+> ### What changed the order
+>
+> **1. The SNR blocker is largely a measurement artifact.** The standing
+> "SNR ≈ 0.05" is read by `telemetry.py` while θ moves every byte. The *same
+> estimator* at a **frozen** θ on the same checkpoint and batch reads **0.633** —
+> a **12.6× gap**. The diagnosis is therefore **over-large step**, not a noise
+> floor. This removes "fix the gradients" from first place and *adds* an axis
+> nobody has run: the **global** learning rate. See `RESULTS.md`, end of file.
+>
+> **2. The ruler is now genuinely missing, not merely unbuilt.** Both blockers
+> left standing — memory formation, and whether step size is the cause — are
+> **undecidable without a measurement that can distinguish them**. v2 ordered
+> credit work first because it was assumed measurable. It turns out it wasn't
+> measured correctly. So v3 starts by making the goal measurable.
+>
+> ### v3 priority queue
+>
+> **P0 — Make the goal measurable.** *Do first; everything else is undecidable
+> without it.*
+> 1. **Distance-curve cell** (Karpathy 2015 §4.2/Fig. 5) in `tools/eval.py`.
+>    Already in progress. Must ship with its two confounds stated in the output:
+>    same-byte delimiter classes (quote/apostrophe) are satisfiable by parity
+>    counting alone, and the two-byte classes have ~0 events in this corpus.
+> 2. **State-probe ruler** — the part v2 never had. Freeze a checkpoint, plant a
+>    *random* cue byte, let `d` bytes of distractors pass, then decode the cue
+>    from the recurrent state with a tiny offline linear probe (chance 1/256).
+>    No TMT weight updates, no surface-form shortcut. This is what separates
+>    *"no memory"* from *"no surface-form-dependent retrieval"*, which the #23
+>    needle probe structurally cannot do.
+> 3. **Definition discipline, enforced in `tests/`.** Every gradient-quality
+>    number prints its estimator convention and its ruler setting beside it, and
+>    every such gate asserts **real corpus bytes**. Random bytes manufacture a
+>    confident result — measured: `ρ(1)` flips `+0.534 → −0.171` and the SNR
+>    moves 8.6× on one variable. v2 already wrote this warning down for the
+>    trace gate and it was re-triggered anyway, so it is now a test, not a note.
+>
+> **P1 — Step size.** *Cheapest decisive experiment left; never run.*
+> Sweep the **global** `--lr`. Every prior LR factorial moved `--lr-decay`, the
+> decay role's rate; `--lr` itself was never swept, and the measured AdamW step
+> is **0.0217 × lr**, so nominal and effective step are not the same quantity.
+> This is the direct test of the over-large-step diagnosis and costs no extra
+> updates, which is why it is ranked above accumulation (measured efficiency
+> 0.138 at k=64 — accumulation is ~7× weaker than the 1/k framing assumes).
+> Judge at **equal wall-clock**, arms paired on the same seed and byte stream.
+>
+> **P2 — Memory formation.** SSM design iteration (was v2's P1), now *downstream
+> of a ruler that can see it*. Unchanged contents: input-dependent gates,
+> multi-slot RTU + read routing, log-spaced half-life init, bounded recurrence.
+>
+> **P3 — Distillation.** **Closed as specified, infrastructure retained.** After
+> the off-by-one fix and the added control arm, KD recovers ~half of what its CE
+> discount costs and the end state is **neutral** — three independent runs agree,
+> two of them bit-identical. Plain CE is the optimum of this family, so the α
+> sweep is **not** the next experiment. Do not reopen without new evidence.
+>
+> **P4 — Optimizer.** **Answered 2026-10-04; folded into P1.** AdamW and
+> step-matched SGD are the same algorithm at this operating point
+> (`|update|/|m|` spread 1.0020×). The earlier `+0.0185` is noise plus a kernel
+> confound. *Further optimizer search is a closed axis.*
+>
+> **P5 — Throughput.** Mamba parallel scan / ParaRNN. Unchanged, still later.
+>
+> **P6 — Community.** CLI first (onboarding, issue #21), then AMD/ROCm, then a
+> public HF release. Note the release wants the **incumbent** checkpoint, not the
+> banked A/B/C distillation arms (CE 1.33–1.37 vs the 1.1741 ruler).
+>
+> ### Two questions this plan can no longer ask
+>
+> - *"Is the eligibility trace biased?"* — **settled, no.** Confirmed at
+>   production depth today: 16 layers, dim 512, both decay regimes, cosine
+>   1.000000, rel err ≤1.05e-06. v2's P0 item 2 stays **HELD**; its conditional
+>   ("if the gate shows the bias") did not fire.
+> - *"Does the variance hinge suppress memory?"* — **the premise was false.**
+>   `max(0, 1-√var)` penalises variance **below** a floor and pushes it up.
+>   It is anti-collapse. Ask instead whether it is *active at all* at the learned
+>   residual-stream scale, and whether its decay-coordinate gradient aligns with
+>   or opposes CE's.
+
 > **CORRECTION 2026-10-04 (P0's premise, measured).** P0 action 1 was built and run:
 > `tests/check_trace_bptt.py`. **The eligibility trace is NOT a biased estimator.**
 > Against exact truncated BPTT, built from the engine's own forward functions, at 4
