@@ -7,14 +7,25 @@ isolated atomic micro-benchmark) in ONE session, so the whole board costs
 ~5 minutes instead of one 25-minute leg per idea.
 
     .venv/bin/python make_bench_bundle.py
-    colab run --gpu T4 --timeout 1800 colab_bench.py
+    colab run --gpu T4 --timeout 1800 colab_bench.py -- \\
+        --push-repo bakali1/tmt-checkpoints --push-token "$TMT_TOKEN"
 
-Everything `colab run` needs is embedded (token, repo id), because it forwards
-no environment variables and no HF login.
+NO CREDENTIAL IS EVER EMBEDDED IN THE GENERATED FILE. The hub repo id is
+embedded (it is not a secret); the token is not. The token is resolved at
+RUNTIME, in this order: `--push-token` in script_args/argv, then $TMT_TOKEN,
+then a Colab secret named `TMT_TOKEN`, then the file $TMT_TOKEN_FILE. It is
+placed in $TMT_TOKEN for the hub API call and written nowhere else.
+
+This is the same contract make_p0_gate_bundle.py and make_lrladder_bundle.py
+already use. The 2026-10-05 version of this generator embedded the laptop's
+~/.cache/huggingface/token into the output file as a literal, which put a live
+credential in plaintext on disk on every machine that generated a bundle. That
+read is gone; do not reintroduce it.
 """
 import base64
 import gzip
 import os
+import re
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 OUT = os.path.dirname(os.path.abspath(__file__))                   # bundles/
@@ -35,10 +46,44 @@ for name, b64 in PAYLOAD.items():
         f.write(gzip.decompress(base64.b64decode(b64)))
 sys.path.insert(0, HERE)
 
-TMT_TOKEN = __TOKEN__
+# ---- auth: resolved at RUNTIME, never embedded ---------------------------
+# `colab run` forwards no laptop environment variables and no HF login, so the
+# token has to be handed to the VM. It arrives as script_args/argv (--push-token,
+# the contract make_p0_gate_bundle.py uses), or from the environment, or from a
+# Colab secret named TMT_TOKEN, or from a file staged with `colab upload`.
+# It is placed in $TMT_TOKEN for the hub API call and written nowhere else.
+def _arg(flag):
+    for _i, _a in enumerate(sys.argv):
+        if _a == flag and _i + 1 < len(sys.argv):
+            return sys.argv[_i + 1]
+    return ""
+
+PUSH_TOKEN = _arg("--push-token")
+TMT_TOKEN = PUSH_TOKEN or os.environ.get("TMT_TOKEN", "")
+if not TMT_TOKEN:
+    try:
+        from google.colab import userdata  # type: ignore
+        TMT_TOKEN = userdata.get("TMT_TOKEN") or ""
+    except Exception:
+        pass
+if not TMT_TOKEN:
+    _tf = os.environ.get("TMT_TOKEN_FILE", "/content/.hf_token")
+    try:
+        with open(_tf) as _f:
+            TMT_TOKEN = _f.read().strip()
+    except OSError:
+        pass
 if TMT_TOKEN:
     os.environ["TMT_TOKEN"] = TMT_TOKEN
-HUB_REPO = os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL") or __REPO__
+    print("[auth] TMT_TOKEN supplied at runtime (value not shown)", flush=True)
+else:
+    print("[auth] no TMT_TOKEN. If a pull is needed the run will fail loudly "
+          "rather than silently benchmark a stale checkpoint. Pass "
+          "--push-token <tok> as script_args, add a Colab secret named "
+          "TMT_TOKEN, or stage a token file at /content/.hf_token.", flush=True)
+
+HUB_REPO = (_arg("--push-repo") or os.environ.get("TMT_HUB_REPO")
+            or os.environ.get("TMT_HUB_URL") or __REPO__)
 
 import numpy as np
 import torch
@@ -71,6 +116,13 @@ print(f"gpu {torch.cuda.get_device_name(0)} "
 
 # ---- live checkpoint (hub, digest-verified) ----
 if not (os.path.exists(CKPT) and os.path.getsize(CKPT) > 0):
+    # Loud failure beats a silent wrong answer: without a token the private-repo
+    # pull cannot succeed, and benchmarking a stale/absent checkpoint would
+    # produce a verdict that looks real and is not.
+    if not TMT_TOKEN:
+        print("[RESULT] OVERALL = FAIL (no TMT_TOKEN and no local checkpoint; "
+              "refusing to benchmark without a verified live checkpoint)")
+        sys.exit(1)
     t = hub.pull(CKPT, repo_id=HUB_REPO)
     result("ckpt-pulled", t is not None, f"t={t} from {HUB_REPO}")
     if t is None:
@@ -98,20 +150,6 @@ sys.exit(1 if FAILS else 0)
 '''
 
 
-def _token():
-    t = os.environ.get("TMT_TOKEN")
-    if t:
-        return t.strip()
-    for p in (os.path.expanduser("~/.cache/huggingface/token"),
-              os.path.expanduser("~/.huggingface/token")):
-        try:
-            with open(p) as f:
-                return f.read().strip()
-        except OSError:
-            continue
-    return ""
-
-
 def _repo():
     raw = (os.environ.get("TMT_HUB_REPO") or os.environ.get("TMT_HUB_URL")
            or "").strip().rstrip("/")
@@ -136,13 +174,17 @@ def main():
                 gzip.compress(f.read(), 9)).decode()
     out = DRIVER.replace("__PAYLOAD__", "{" + ", ".join(
         f"{k!r}: {v!r}" for k, v in payload.items()) + "}")
-    out = out.replace("__TOKEN__", repr(_token()))
     out = out.replace("__REPO__", repr(_repo()))
     path = os.path.join(OUT, "colab_bench.py")
+    # Belt and braces: if a future edit reintroduces a placeholder or a
+    # credential read, refuse to write the file rather than land a live secret
+    # on disk. Cheap, and the failure is loud.
+    if "__TOKEN__" in out or re.search(r"hf_[A-Za-z0-9_.-]{30,}", out):
+        raise SystemExit("refusing to write: generated bundle contains a token")
     with open(path, "w") as f:
         f.write(out)
     print(f"wrote {path} ({os.path.getsize(path)/1024:.0f} KB)"
-          f"{'  [CONTAINS AN HF TOKEN - keep it local]' if _token() else ''}")
+          f"  [no credential embedded; supply TMT_TOKEN at runtime]")
 
 
 if __name__ == "__main__":

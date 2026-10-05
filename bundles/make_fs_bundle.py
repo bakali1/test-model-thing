@@ -30,6 +30,7 @@ from a measured in-session rate, not guessed, so the budget is respected on
 whatever hardware Colab hands us.
 """
 import os
+import re
 import stat
 import sys
 
@@ -98,6 +99,7 @@ final tag (colab run releases the VM, so anything unpushed is lost).
 import base64
 import gzip
 import os
+import sys
 import subprocess
 import sys
 import time
@@ -168,12 +170,32 @@ def left():
 
 
 # ---------------- auth: a Colab secret, never an embedded credential -------
-TMT_TOKEN = os.environ.get("TMT_TOKEN", "") or "{token}"
+# Resolved at RUNTIME, in this order: `--push-token` in script_args/argv, then
+# $TMT_TOKEN, then a Colab secret named TMT_TOKEN, then a file at
+# $TMT_TOKEN_FILE (default /content/.hf_token) staged with
+# `colab upload ~/.cache/huggingface/token /content/.hf_token`. The token is
+# placed in $TMT_TOKEN for the API call and written nowhere else. This generator
+# no longer reads the laptop's cached login; it used to, and that wrote a live
+# credential into every generated bundle in plaintext.
+def _arg(flag):
+    for _i, _a in enumerate(sys.argv):
+        if _a == flag and _i + 1 < len(sys.argv):
+            return sys.argv[_i + 1]
+    return ""
+
+
+TMT_TOKEN = _arg("--push-token") or os.environ.get("TMT_TOKEN", "") or ""
 if not TMT_TOKEN:
     try:
         from google.colab import userdata
         TMT_TOKEN = userdata.get("TMT_TOKEN") or ""
     except Exception:
+        pass
+if not TMT_TOKEN:
+    try:
+        with open(os.environ.get("TMT_TOKEN_FILE", "/content/.hf_token")) as _f:
+            TMT_TOKEN = _f.read().strip()
+    except OSError:
         pass
 if TMT_TOKEN:
     os.environ["TMT_TOKEN"] = TMT_TOKEN
@@ -443,18 +465,19 @@ print("=" * 68)
 
 
 def local_token():
-    """The HF login cached on this laptop, for the generated bundle.
+    """RETURNS "" ALWAYS.
 
-    `colab run` forwards neither env vars nor logins, and the Colab secret was
-    not present on the session that pushed the first arms, so the token has to
-    travel inside the script. The generated colab_fs_*.py files are gitignored
-    and must never be committed.
+    The 2026-10-05 version of this generator called `huggingface_hub.get_token()`
+    and substituted it into the generated colab_fs_*.py, which wrote the laptop's
+    live HF credential into every bundle in plaintext. The repo id is embedded
+    because it is not a secret; the token never was. It is resolved at RUNTIME by
+    the generated driver (script_args/argv, $TMT_TOKEN, a Colab secret, or
+    $TMT_TOKEN_FILE), placed in $TMT_TOKEN for the API call, written nowhere.
+
+    Kept as a function so the call site stays readable, but it is deliberately
+    inert. Do not reintroduce a token read here.
     """
-    try:
-        import huggingface_hub as _h
-        return _h.get_token() or ""
-    except Exception:
-        return ""
+    return ""
 
 
 def build(arm, cfg):
@@ -478,6 +501,10 @@ def build(arm, cfg):
         "__PAYLOAD__",
         "{" + ", ".join(f'"{k}": "{v}"' for k, v in payload.items()) + "}")
     path = os.path.join(OUT, f"colab_fs_{arm}.py")
+    # Belt and braces: refuse to write a bundle that embeds a credential.
+    if re.search(r"hf_[A-Za-z0-9_.-]{30,}", body):
+        raise SystemExit(
+            f"refusing to write {path}: generated bundle contains a token")
     with open(path, "w") as f:
         f.write(body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
