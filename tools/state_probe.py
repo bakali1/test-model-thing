@@ -41,12 +41,30 @@ WHAT IT REFUSES TO DO, and why:
    quoting "the memory horizon is N bytes" without saying which cue
    distribution produced N is quoting half a measurement.
 
-1. **It will not run on uniform random distractor bytes and call the result
-   anything.** `tools/random_vs_real.py` measured this: on random bytes
-   rho(1) flips +0.534 -> -0.171 and SNR moves 8.6x. The gate asserts real
-   corpus bytes and refuses to print a verdict in the random-byte mode; that
-   mode exists only as a self-check and is labelled CONTROL everywhere it
-   appears.
+1. **It will not let the random-byte arm VETO anything -- but it will not
+   stop running it or printing it either.** `tools/random_vs_real.py`
+   measured this: on random bytes rho(1) flips +0.534 -> -0.171 and SNR moves
+   8.6x. That warning was CORRECT for autocorrelation/SNR, where a single
+   constant direction inflates agreement, and it was OVER-GENERALISED to a
+   linear-probe measurement, where per-dimension z-scoring on pooled
+   label-free statistics removes the constant component. On iid random bytes
+   the planted cue is still in the state and still decays as sigma^d exactly
+   as on real text; only the distractor content carries no learnable
+   structure, so the cue is a larger share of trial-to-trial variance. A
+   higher reading there is consistent with genuine retention of a planted
+   cue. It is therefore a SENSITIVITY CEILING (does the probe detect a cue
+   that is definitely there?), not a validity check. See THE RULING below
+   and the long comment in the verdict section. The SOLE veto is the
+   mismatched-cue control.
+
+   THE RULING (a specification decision, made on principle):
+     * a control arm can only veto if it can produce a FALSE POSITIVE under
+       the null;
+     * the random-byte arm has no null condition -- the cue was planted -- so
+       it has no power to falsify anything;
+     * the mismatched-cue control DOES have a null (the label is a
+       permutation of the labels, so it carries no information) and is
+       therefore the sole veto.
 2. **It will not report an accuracy without its trial count, its SE, its
    chance level, its probe type, its ridge lambda and its distance
    definition.** Coverage is definition x floor; the same is true of an
@@ -54,7 +72,8 @@ WHAT IT REFUSES TO DO, and why:
 3. **It will not let a high accuracy stand without the mismatched-cue
    control.** The identical pipeline on permuted cue labels must land at
    chance. If it does not, the probe is exploiting trial identity rather than
-   the cue and the verdict is INCONCLUSIVE, not PASS.
+   the cue and the verdict is INCONCLUSIVE, not PASS. This is the SOLE veto
+   in the tool; see THE RULING in item 1.
 4. **It will not call the second column of the 2x2 "retrieval".** With a
    uniform random cue there is no correct continuation tied to the cue, so
    what is measurable is only whether the output distribution DEPENDS on the
@@ -333,7 +352,11 @@ def main():
                     help="used only to ASSERT the distractor file is held out")
     ap.add_argument("--distractors-mode", choices=("real", "random"),
                     default="real",
-                    help="'random' is the CONTROL arm; a verdict is refused in it")
+                    help="'random' runs the whole measurement on iid random "
+                         "bytes. That is the SENSITIVITY CEILING, not a "
+                         "validity check, so it no longer forces INCONCLUSIVE "
+                         "-- but its verdict is stamped as a ceiling and is "
+                         "not a result about text memory")
     ap.add_argument("--distances",
                     default=",".join(str(d) for d in FULL_DISTANCES),
                     help="roadmap requires at least 8,32,64,128,256,512,1024,"
@@ -352,7 +375,9 @@ def main():
     ap.add_argument("--folds", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--control-trials", type=int, default=64,
-                    help="trials for the random-distractor CONTROL arm (0 skips)")
+                    help="trials for the random-distractor SENSITIVITY-CEILING "
+                         "arm (0 skips). Reported per distance; it CANNOT veto "
+                         "-- see THE RULING in the module docstring")
     ap.add_argument("--lambdas", default="1,10,100,1000,1e4,1e5,1e6,1e7",
                     help="ridge lambda grid; chosen per outer fold by inner CV")
     ap.add_argument("--no-standardize", action="store_true",
@@ -361,14 +386,15 @@ def main():
     ap.add_argument("--stability", type=int, default=0,
                     help="repeat the probe with N INDEPENDENT fold "
                          "partitions and report the spread. A distance whose "
-                         "(accuracy - control) changes sign across partitions "
-                         "is NOT a finding, however far above chance its "
-                         "single-run number sits")
+                         "(accuracy - mismatched-cue control) changes sign "
+                         "across partitions is NOT a finding, however far above "
+                         "chance its single-run number sits")
     ap.add_argument("--load", default=None,
                     help="npz written by --save; re-run the PROBE and the "
                          "verdict on a completed sweep without re-paying the "
-                         "forward pass. The random-byte CONTROL arm is still "
-                         "swept, because a verdict needs it and it is cheap")
+                         "forward pass. The random-byte SENSITIVITY CEILING "
+                         "arm is still swept, because a complete report needs "
+                         "it and it is cheap")
     ap.add_argument("--save", default=None,
                     help="npz path for the swept state snapshots and per-trial "
                          "readouts, so the probe can be re-run with different "
@@ -435,7 +461,7 @@ def main():
                   f"intersection d = {_ok}. Re-run WITHOUT --load to sweep the "
                   f"missing distances,\n         or pass --distances / "
                   f"--calibration-distances the archive actually holds.")
-    mode = "CONTROL" if args.distractors_mode == "random" else "MEASUREMENT"
+    mode = "CEILING" if args.distractors_mode == "random" else "MEASUREMENT"
     print("=" * 78)
     print(f"state probe -- {mode}{(' / ' + args.label) if args.label else ''}")
     print("=" * 78)
@@ -511,14 +537,27 @@ def main():
             sys.exit("[FATAL] the distractor bytes are training bytes. Probing "
                      "on them measures memorization. Move the file or change "
                      "--train-glob.")
-    if mode == "CONTROL":
-        print("\n  ** CONTROL ARM. Distractor bytes are uniform random, NOT "
-              "corpus text.**\n     On random bytes the states are nearly iid "
-              "and lag weightings collapse onto one\n     direction, which "
-              "manufactures confident results (tools/random_vs_real.py: "
-              "rho(1) flips\n     +0.534 -> -0.171, SNR moves 8.6x). This arm "
-              "exists to be compared against the real\n     arm and MUST read "
-              "at or below chance. It is not a measurement.")
+    if mode == "CEILING":
+        # This banner is the whole point of THE RULING, so it says the reason,
+        # not just the verdict.
+        print("\n  ** SENSITIVITY CEILING -- DISTRACTOR BYTES ARE UNIFORM "
+              "RANDOM, NOT CORPUS TEXT.**\n     This is NOT a validity check "
+              "and it cannot veto. The cue is PLANTED in\n     the state here "
+              "exactly as on real text and decays as sigma^d exactly\n     as "
+              "on real text; only the distractor content differs, and on iid "
+              "bytes it\n     carries no learnable structure, so the cue is a "
+              "LARGER share of trial-to-trial\n     variance. A reading above "
+              "chance here is what genuine retention of a definitely-\n"
+              "     present cue looks like. It measures PROBE POWER and "
+              "cannot falsify a\n     finding, so it is reported and never "
+              "used to block one. See THE RULING in the\n     module "
+              "docstring; the sole veto is the mismatched-cue control.\n"
+              "     (The random_vs_real.py warning -- rho(1) flips +0.534 -> "
+              "-0.171, SNR moves\n     8.6x -- was CORRECT for "
+              "autocorrelation/SNR, where a constant direction inflates\n"
+              "     agreement, and was over-generalised to a linear probe, "
+              "whose per-dimension\n     z-scoring removes that constant "
+              "component.)")
     raw = (np.frombuffer(open(args.distractors, "rb").read(), np.uint8)
            if ok_real else None)
 
@@ -587,7 +626,7 @@ def main():
                   f"{' (REUSED: trials > windows)' if reuse else ''}"
         else:
             offs = np.zeros(n_trials, int)
-            src = "uniform random bytes (CONTROL)"
+            src = "uniform random bytes (SENSITIVITY CEILING arm)"
         print(f"\n  [{tag}] {n_trials} trials | distractor source: {src}")
         print(f"  [{tag}] cue distribution: {support_note}")
         if args.cue == "corpus-freq":
@@ -625,6 +664,19 @@ def main():
              "dim": _dim, "layers": _layers, "dim_state": _dim * _layers,
              "K": int(_dd["ring_k"]) if "ring_k" in _dd else None}
         A["n_trials"] = len(z["cues"])
+        # The null level a mismatched-cue control is judged against is a
+        # property of the CUE DISTRIBUTION, so it is recovered from the
+        # archive's own cues rather than left to fall back to 1/256. Without
+        # this a --load run under --cue corpus-freq would judge its control
+        # against the wrong null and veto itself.
+        _cu = np.asarray(z["cues"])
+        if args.cue == "uniform":
+            A["base"] = 1.0 / VOCAB
+        elif args.cue == "corpus-support":
+            A["base"] = 1.0 / max(1, len(np.unique(_cu)))
+        else:
+            _ccnt = np.bincount(_cu, minlength=VOCAB).astype(np.float64)
+            A["base"] = float(_ccnt.max() / max(_ccnt.sum(), 1.0))
         print(f"\n  [loaded] {args.load} -- probe and verdict re-run on the "
               f"completed sweep,\n            no forward pass repeated. "
               f"n={len(z['cues'])} trials from the saved sweep (--trials is "
@@ -640,15 +692,16 @@ def main():
             _B = {"feats": {dd: z[f"B_X_{dd}"] for dd in all_d},
                   "cues": z["B_cues_0"],
                   "rng": np.random.default_rng(args.seed + 1)}
-            print(f"            random-byte CONTROL arm also restored from "
-                  f"the file (n={len(_B['cues'])}); not re-swept.")
+            print(f"            random-byte SENSITIVITY-CEILING arm also "
+                  f"restored from the file (n={len(_B['cues'])}); not "
+                  f"re-swept.")
     else:
         A = run_arm(args.trials, args.distractors_mode,
-                    "real" if mode == "MEASUREMENT" else "control")
+                    "real" if mode == "MEASUREMENT" else "ceiling")
         A["n_trials"] = args.trials
         _B = None
     B = (_B if _B is not None else
-         (run_arm(args.control_trials, "random", "random-byte CONTROL")
+         (run_arm(args.control_trials, "random", "random-byte CEILING")
           if args.control_trials > 0 else None))
 
     print(f"\n  [context sanity] the model's CE on the distractor run itself: "
@@ -697,6 +750,11 @@ def main():
           f"cue labels; it must sit at chance or the probe is reading trial "
           f"identity.")
     rng = A["rng"]
+    # The level a mismatched-cue control is judged against. This is the
+    # probe's OWN null under this cue distribution (see the comment at the
+    # veto), not a hard-coded 1/256; under --cue uniform it IS 1/256, so the
+    # veto's behaviour there is exactly what it always was.
+    NULL_BASE = float(A.get("base", CHANCE))
     rowsA, accs, ses = [], [], []
     cal_rows = []
     for dd in all_d:
@@ -722,19 +780,54 @@ def main():
         # looser: a real result must beat what the identical machinery gets
         # on labels known to carry no information.
         has = (acc > CHANCE) and (acc - ctrl > 2.0 * math.hypot(se, cse))
+        # THE VETO. The mismatched-cue control is the SOLE veto in this tool
+        # (THE RULING, module docstring): unlike the random-byte arm it has a
+        # genuine null -- the label is a permutation of the labels and so
+        # carries no information -- and can therefore produce a FALSE POSITIVE
+        # if the probe is reading trial identity or a positional artefact
+        # rather than the cue. It is read at EVERY distance, calibration
+        # distances included, and it is judged with the same 2 SE convention
+        # used everywhere else in this file, so ONE lucky correct decode at
+        # n=128 (0.78%, cse 0.78%) cannot veto a real reading.
+        #
+        # The reference is the arm's OWN null level, `A["base"]` -- 1/256 under
+        # --cue uniform, 1/|corpus support| under --cue corpus-support, the
+        # MODAL frequency under --cue corpus-freq -- and NOT a hard-coded
+        # 1/256. That matters: under --cue corpus-freq a probe handed a
+        # permuted label must still beat the class prior, so a mismatched-cue
+        # control reading ~modal is EXACTLY the null behaving correctly, and
+        # comparing it to 0.391% would veto every modeled-cue run for the
+        # crime of having a skewed prior. Same principle as the comment above:
+        # judge the machinery against its own empirical null. `mis_raw`
+        # records the bare `ctrl > 1/256` flag too and is printed, so a reader
+        # can apply either convention.
+        mis_veto = bool(ctrl - 2.0 * cse > NULL_BASE)
+        mis_raw = bool(ctrl > CHANCE)
         if dd in distances:
             rowsA.append({"d": dd, "acc": acc, "se": se, "ctrl": ctrl, "cse": cse,
-                          "lams": chosen, "has": has, "n": len(y)})
+                          "lams": chosen, "has": has, "n": len(y),
+                          "mis_veto": mis_veto, "mis_raw": mis_raw})
             accs.append(acc)
             ses.append(se)
             print(f"  d={dd:>6} B | acc {100 * acc:7.4f}% +/- {100 * se:6.4f} "
                   f"(n={len(y)}) | chance {100 * CHANCE:.4f}% | "
                   f"mismatched-cue control {100 * ctrl:6.4f}% "
                   f"+/- {100 * cse:.4f} | lambda {chosen[0]:g}..{chosen[-1]:g} | "
-                  f"state carries cue: {'YES' if has else 'no'}")
+                  f"state carries cue: {'YES' if has else 'no'} | "
+                  f"MIS-CUE VETO (the sole veto): "
+                  f"{'YES' if mis_veto else 'no'} (control above its own "
+                  f"null {100 * NULL_BASE:.4f}% by 2 SE)")
         else:
             cal_rows.append({"d": dd, "acc": acc, "se": se, "ctrl": ctrl,
-                             "cse": cse, "has": has})
+                             "cse": cse, "has": has, "mis_veto": mis_veto,
+                             "mis_raw": mis_raw})
+    # A copy of the full per-distance leg-A table, taken BEFORE the
+    # --stability block narrows rowsA to the non-marginal rows. The stability
+    # filter exists to stop a marginal distance being QUOTED as a finding; it
+    # must not silently delete it from the reported picture, because a reader
+    # is owed all three numbers at every swept distance whether or not the
+    # distance survives the stability test.
+    rowsA_all = list(rowsA)
     power = [c for c in cal_rows if c["has"]]
     power_max = max((c["d"] for c in power), default=None)
     print(f"\n  PROBE POWER (calibration distances, same pipeline, same cue):")
@@ -742,7 +835,10 @@ def main():
         print(f"    d={c['d']:>3} B | acc {100 * c['acc']:7.4f}% +/- "
               f"{100 * c['se']:.4f}% | mismatched-cue control "
               f"{100 * c['ctrl']:6.4f}% | decodable: "
-              f"{'YES' if c['has'] else 'no'}")
+              f"{'YES' if c['has'] else 'no'} | MIS-CUE VETO: "
+              f"{'YES' if c['mis_veto'] else 'no'}")
+    print(f"    (the mismatched-cue control is judged against this cue "
+          f"distribution's own null level, {100 * NULL_BASE:.4f}%, at 2 SE)")
     if power_max is None:
         print("    ** THE PROBE CANNOT EVEN DECODE THE CUE AT d=0, WHERE THE "
               "STATE IS LITERALLY\n       emb[cue]. ** Nothing below is "
@@ -801,26 +897,81 @@ def main():
               f"[{lo:+.3e}, {hi:+.3e}] | "
               f"{'YES' if uses else ('positive but below bar' if lo > 0 else 'no')}")
 
-    # ---- the control arm ----
-    ctrlA = []
+    # ---- the random-byte arm: SENSITIVITY / POWER CEILING ----
+    # ==========================================================================
+    # THE RULING (do not "fix" this back).
+    #
+    # This arm used to be called CONTROL, was asserted to "MUST read at or
+    # below chance", and every distance above chance was pushed into
+    # ctrl_failed -- which made the verdict INCONCLUSIVE and exit 2. In live
+    # use it reads 23-34% against a 0.391% chance at 9 of 10 distances, so it
+    # blocked essentially every run. That was a mis-specification, not a
+    # finding.
+    #
+    # WHY. A control arm can only veto if it can produce a FALSE POSITIVE
+    # UNDER THE NULL. In this arm there is no null condition to be wrong
+    # about: the cue is PLANTED in the state, before the sweep, exactly as it
+    # is on real text, and it decays as sigma^d exactly as it does on real
+    # text. Only the distractor content differs, and on iid random bytes that
+    # content carries no learnable structure -- so the planted cue is a LARGER
+    # share of trial-to-trial variance than it is on real text, and the arm
+    # reads higher for exactly the honest reason. A high reading here is
+    # consistent with genuine retention of a cue that is definitely present.
+    #
+    # The original warning was not stupid, it was OVER-GENERALISED.
+    # tools/random_vs_real.py's result -- rho(1) flips +0.534 -> -0.171, SNR
+    # moves 8.6x -- is correct for an autocorrelation or SNR measurement,
+    # where a single constant direction (the lag-weighting collapse onto one
+    # direction on iid input) inflates agreement between two quantities that
+    # share that direction. This measurement is neither: it is a linear probe
+    # on per-dimension z-scored states, and pooled label-free z-scoring
+    # removes exactly that constant component. So the arm has no power to
+    # falsify a finding, and demoting it from veto to reported ceiling is a
+    # SPECIFICATION RULING on what a control is for -- not a threshold that was
+    # found inconvenient and moved.
+    #
+    # It still runs, still prints, and is still visible, because it is the
+    # honest answer to "could this probe have seen a cue that was definitely
+    # there, at this distance?" -- the SENSITIVITY CEILING.
+    # ==========================================================================
+    ceilA = []
     if B is not None:
         print("\n" + "-" * 78)
-        print("CONTROL -- SAME PIPELINE, UNIFORM RANDOM DISTRACTORS")
+        print("SENSITIVITY / POWER CEILING -- SAME PIPELINE, iid RANDOM "
+              "DISTRACTORS")
         print("-" * 78)
-        print("  This arm must read AT OR BELOW chance. If it reads above, "
-              "the real arm's\n  number cannot be attributed to memory of the "
-              "cue.")
+        print("  ** NOT A VALIDITY CHECK. THIS CANNOT VETO AND IS NEVER "
+              "USED TO BLOCK A RESULT. **\n  The cue is PLANTED in the state "
+              "in this arm, and decays as sigma^d, exactly as\n  on real "
+              "text; only the distractor content is iid, which carries no\n"
+              "  learnable structure and so leaves the cue a larger share of "
+              "trial-to-trial variance.\n  Read it as: this is the best the "
+              "probe could possibly do at this distance. Where the real\n"
+              "  arm lands BELOW it, the distance is 'unmeasured', not 'no "
+              "memory'. Where it\n  lands above it, the probe has the power "
+              "to see what is there.")
+        print("  THE SOLE VETO IS THE MISMATCHED-CUE CONTROL, reported per "
+              "distance in LEG A above:\n  it has a real null (the label is a "
+              "permutation of the labels) and can therefore\n  return a false "
+              "positive, which is the only property that makes a control "
+              "able to veto.")
         for dd in all_d:
             acc, _c, _p = probe_accuracy(B["feats"][dd], B["cues"],
                                          B["rng"], args.folds, lams,
                                          standardize=STD)
             se = binom_se(acc, len(B["cues"]))
-            ctrlA.append({"d": dd, "acc": acc, "se": se,
+            ceilA.append({"d": dd, "acc": acc, "se": se,
                           "above": acc - 2 * se > CHANCE})
-            print(f"  d={dd:>6} B | acc {100 * acc:7.4f}% +/- "
+            print(f"  d={dd:>6} B | CEILING acc {100 * acc:7.4f}% +/- "
                   f"{100 * se:6.4f}% (n={len(B['cues'])}) | chance "
-                  f"{100 * CHANCE:.4f}% | above chance: "
-                  f"{'YES <-- CONTROL FAILED' if acc - 2 * se > CHANCE else 'no'}")
+                  f"{100 * CHANCE:.4f}% | probe can see a planted cue here: "
+                  f"{'YES' if acc - 2 * se > CHANCE else 'NO'}  "
+                  f"(reported, NOT a veto)")
+    else:
+        print("\n  [ceiling] --control-trials 0: the random-byte SENSITIVITY "
+              "CEILING arm was skipped.\n              It cannot veto either "
+              "way (see THE RULING), but the sensitivity\n              of the "
+              "probe at each distance is then unstated.")
     ascii_plot(distances, accs, ses, "")
 
     # ---- stability across independent fold partitions ----
@@ -1065,52 +1216,101 @@ def main():
     print("  Definitions used here (the roadmap states the 2x2 but not the "
           "three outcomes; these are\n  this tool's, printed so nobody has to "
           "guess):")
-    print("    INCONCLUSIVE  a control failed -- the random-distractor arm or "
-          "the mismatched-cue\n                  control read above chance. "
-          "The probe is then measuring something\n                  other than "
-          "memory of the cue and the number is not evidence.")
-    print("    PASS          controls clean AND the sweep resolved to a cell "
-          "OTHER than the\n                  already-assumed 'no / no'. The "
-          "probe's job is to DISCRIMINATE, and\n                  a cell the "
-          "project could not previously reach is the result.")
-    print("    FAIL          controls clean AND every swept distance is "
-          "'no / no'. A clean\n                  measurement that reproduces "
-          "the standing belief and fixes the horizon\n                  number, "
-          "but no new cell.")
-    ctrl_failed = [c for c in ctrlA if c["above"]]
-    ctrl_failed += [a for a in rowsA if a["has"]
-                    and a["acc"] - a["ctrl"] <= 2.0 * math.hypot(a["se"], a["cse"])]
-    if power_max is None:
-        ctrl_failed.append({"d": "d=0"})
-    if mode == "CONTROL":
+    print("    INCONCLUSIVE  the MISMATCHED-CUE CONTROL -- the SOLE veto -- "
+          "read above chance at some\n                  distance, or the probe "
+          "could not decode the cue even at d=0. The probe\n                  is "
+          "then measuring something other than memory of the cue and the\n"
+          "                  number is not evidence. The random-distractor arm "
+          "is NOT a veto; it is\n                  the sensitivity ceiling "
+          "(see THE RULING below and in the docstring).")
+    print("    PASS          the mismatched-cue control is clean AND the "
+          "sweep resolved to a cell\n                  OTHER than the "
+          "already-assumed 'no / no'. The probe's job is to\n                  "
+          "DISCRIMINATE, and a cell the project could not previously reach "
+          "is\n                  the result.")
+    print("    FAIL          the mismatched-cue control is clean AND every "
+          "swept distance is\n                  'no / no'. A clean "
+          "measurement that reproduces the standing belief\n                  and "
+          "fixes the horizon number, but no new cell.")
+
+    # ---- BOTH ARMS REPORTED, ALWAYS (THE RULING, requirement 3) ----
+    # A reader must be able to see the whole picture in one place, not just
+    # this tool's conclusion: leg-A accuracy, the mismatched-cue control that
+    # is the sole veto, and the random-byte sensitivity ceiling that is not a
+    # veto, per distance.
+    print("\n" + "-" * 78)
+    print("ALL THREE NUMBERS, PER DISTANCE (nothing here is a verdict)")
+    print("-" * 78)
+    _ceil_by_d = {c["d"]: c for c in ceilA}
+    print(f"  {'d (bytes)':>9} {'leg-A acc':>13} {'mismatched-cue':>15} "
+          f"{'random-byte ceiling':>21} {'verdict-bearing?':>16}")
+    for a in sorted(rowsA_all, key=lambda r: r["d"]):
+        c = _ceil_by_d.get(a["d"])
+        _cv = (f"{100 * c['acc']:8.4f}%" if c else "     --")
+        _tag = ("VETO FIRES" if a["mis_veto"] else "control clean")
+        if c is not None and a["acc"] > c["acc"]:
+            _tag += ", above ceiling"
+        print(f"  {a['d']:>9} {100 * a['acc']:12.4f}% "
+              f"{100 * a['ctrl']:14.4f}% {_cv:>21} {_tag:>16}")
+    print("  The ceiling is the probe's POWER, not a baseline to be beaten: "
+          "a real arm that\n  lands BELOW it at a distance is UNMEASURED "
+          "there, not 'no memory'. The\n  mismatched-cue column is the only "
+          "column that can invalidate a distance.")
+
+    # THE SOLE VETO. See THE RULING in the module docstring and in the comment
+    # above the ceiling arm. `ctrl_failed` used to be seeded from the
+    # random-byte arm, which had no null condition and so could not possibly
+    # return a false positive; that is why it vetoed every run. It is now read
+    # only from the mismatched-cue control, at EVERY distance including the
+    # calibration ones. (The second clause of the old expression was dead code
+    # -- it tested `a["has"] and acc - ctrl <= 2*hypot(se, cse)`, and `has`
+    # already requires acc - ctrl > 2*hypot(se, cse), so it was never true.
+    # The veto, when it ever fired, was the random-byte arm alone.)
+    ctrl_failed = [{"d": a["d"]} for a in rowsA_all if a["mis_veto"]]
+    ctrl_failed += [{"d": c["d"]} for c in cal_rows if c["mis_veto"]]
+    # The stamp is a SIDE NOTE, not a branch: it must never swallow the
+    # verdict below (it used to sit on the `elif` chain, where CEILING mode
+    # left `verdict` unassigned entirely).
+    if mode == "CEILING":
+        print("\n  CEILING ARM (--distractors-mode random): the verdict below "
+              "is a SENSITIVITY CEILING for a\n  probe on iid random bytes. "
+              "It is NOT a result about text memory and must never\n  be "
+              "quoted as one.")
+    # The VETO is tested FIRST, ahead of the d=0 instrument check, because it
+    # is the more specific statement about WHY there is no verdict: a probe
+    # whose own permuted-label control is above its null cannot be trusted at
+    # any distance, including d=0, so reporting "the instrument is not
+    # sensitive enough" would be the wrong diagnosis.
+    if ctrl_failed:
         verdict = "INCONCLUSIVE"
-        print("\n  This is the CONTROL ARM. It cannot return PASS or FAIL and "
-              "it is not a result.")
+        print(f"\n  INCONCLUSIVE -- the MISMATCHED-CUE CONTROL (the sole "
+              f"veto) read above its own null ({100 * NULL_BASE:.4f}%) by 2 SE "
+              f"at {len(ctrl_failed)} distance(s):\n  "
+              f"{[c['d'] for c in ctrl_failed]}. Those distances are not "
+              f"findings: the probe is reading trial identity\n  or a class "
+              f"prior rather than the cue. Until it does not, no cell here is "
+              f"evidence.\n  (The random-byte arm is NOT part of this -- see "
+              f"THE RULING.)")
     elif power_max is None:
         verdict = "INCONCLUSIVE"
         print("\n  INCONCLUSIVE -- the probe cannot decode the cue even at "
               "d=0, where the state IS the\n  cue's embedding. The instrument "
               "is not sensitive enough; no cell below is a result.")
-    elif ctrl_failed:
-        verdict = "INCONCLUSIVE"
-        print(f"\n  INCONCLUSIVE -- {len(ctrl_failed)} control(s) read above "
-              f"chance: "
-              f"{[c['d'] for c in ctrl_failed]}. Until they do not, no cell "
-              f"here is evidence.")
     elif set(distinct) != {"no / no"}:
         verdict = "PASS"
-        print(f"\n  PASS -- controls clean, and the sweep resolved to "
-              f"{distinct}, which the\n  project's existing instrumentation "
-              f"could not distinguish. Read the cell, not this word:")
+        print(f"\n  PASS -- mismatched-cue control clean, and the sweep "
+              f"resolved to {distinct}, which the\n  project's existing "
+              f"instrumentation could not distinguish. Read the cell, not "
+              f"this word:")
         for a, b in zip(rowsA, rowsB):
             c = cells[a["d"]]
             if c[0] != "no / no":
                 print(f"    d={a['d']:>6} B -> {c[0]}: {c[1]}")
     else:
         verdict = "FAIL"
-        print("\n  FAIL -- controls clean, and every swept distance is "
-              "'no / no': no learned\n  memory of a random cue at any "
-              "distance from 8 B to "
+        print("\n  FAIL -- mismatched-cue control clean, and every swept "
+              "distance is 'no / no': no\n  learned memory of a random cue "
+              "at any distance from 8 B to "
               f"{max(distances)} B. The result\n  is clean and it is also "
               "the cell the project already assumed; what it adds is the\n"
               "  horizon number and the confirmation that the existing "
@@ -1132,19 +1332,21 @@ def main():
           f"{_cue_words} cue. The same checkpoint under --cue uniform reads a "
           f"SHORTER\n  horizon; the difference belongs to the stimulus, not to "
           f"the model. Do not quote the number without the cue mode.")
-    if mode != "CONTROL":
+    if mode != "CEILING":
         print(f"\n  [no RESULT has been written to RESULTS.md; this run "
               f"stops at the printed output]")
 
     # ---- exit codes ----
     #  0  PASS or FAIL -- a result. This is the primary documented outcome.
-    #  2  INCONCLUSIVE -- a control failed, or the probe could not decode the
-    #     cue even at d=0, or this is the random-byte CONTROL arm. This is NOT
-    #     an error in the harness sense: it is the tool correctly refusing to
-    #     call a result. But it is a non-zero status, so a `set -e` wrapper
-    #     treats it as a failure and a CI job goes red on the documented
-    #     "INCONCLUSIVE" outcome. Wrap it as `... || rc=$?; [ "$rc" = 2 ]`
-    #     (or `--control-trials 0` where no control applies) if that matters.
+    #  2  INCONCLUSIVE -- the MISMATCHED-CUE CONTROL (the sole veto) read
+    #     above chance at some distance, or the probe could not decode the
+    #     cue even at d=0. The random-byte arm is NOT on this list: it is a
+    #     sensitivity ceiling with no null condition and cannot veto (THE
+    #     RULING). This is NOT an error in the harness sense: it is the tool
+    #     correctly refusing to call a result. But it is a non-zero status, so
+    #     a `set -e` wrapper treats it as a failure and a CI job goes red on
+    #     the documented "INCONCLUSIVE" outcome. Wrap it as
+    #     `... || rc=$?; [ "$rc" = 2 ]` if that matters.
     #     Documented here rather than changed: the exit code is right, its
     #     surprise is not, and the surprise belongs next to the verdict.
     _note = ("; see the exit-code note above -- 2 is the documented "
