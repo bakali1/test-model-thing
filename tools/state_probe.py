@@ -468,16 +468,33 @@ def main():
             support_note = ("WARNING proportional to corpus frequency; compare "
                             "against the MODAL baseline, not against chance")
             modal = float(p.max())
-        # A derangement: trial j is probed against trial j-1's cue. This is
-        # leg B's control -- without it, any position-dependent or byte-value
+        # A derangement: trial j is probed against some OTHER trial's cue. This
+        # is leg B's control -- without it, any position-dependent or byte-value
         # dependent artefact in the output distribution reads as "the head
         # uses the cue".
-        mis = np.roll(cues, 1)
-        bad = mis == cues
-        if bad.any():
-            cues[bad] = (cues[bad] + 1 + (bad.sum() % 200)) % VOCAB
-            mis = np.roll(cues, 1)
+        #
+        # The original construction was `mis = np.roll(cues, 1)` plus a single
+        # pass of collision repair. That is correct only when the cues are
+        # near-uniform: with --cue corpus-freq the modal byte takes ~19% of the
+        # mass, the one-pass repair creates new collisions, and the assertion
+        # fires. The guard worked -- it refused to emit a result rather than a
+        # wrong one -- but the construction is wrong, so here is the correct one.
+        #
+        # Feasibility: a derangement of a multiset exists iff no value occupies
+        # more than half the positions. Checked, not assumed.
+        vals, counts = np.unique(cues, return_counts=True)
+        if counts.max() > len(cues) // 2:
+            raise SystemExit(
+                f"--cue {args.cue}: the modal cue appears {counts.max()} times in "
+                f"{len(cues)} trials, so no derangement exists. Raise --trials "
+                f"or use --cue corpus-support.")
+        order = np.argsort(cues, kind="stable")          # grouped by cue value
+        shift = int(counts.max())                       # >= max multiplicity
+        mis = np.empty_like(cues)
+        mis[order] = cues[order[(np.arange(len(cues)) + shift) % len(cues)]]
         assert (mis != cues).all(), "mismatched-cue control is not a derangement"
+        assert np.array_equal(np.sort(mis), np.sort(cues)), \
+            "the derangement must reuse the same cue multiset"
         Dmax = max(all_d)
         if distractors_mode == "real":
             need = Dmax
