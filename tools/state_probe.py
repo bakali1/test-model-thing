@@ -32,6 +32,15 @@ PROTOCOL (ROADMAP v3, P0 item 2), per trial:
 
 WHAT IT REFUSES TO DO, and why:
 
+0. **It will not quote the horizon without the cue distribution.** The
+   horizon this tool reports is a property of the STIMULUS as much as of the
+   model. The default `--cue uniform` draws the cue over all 256 byte symbols,
+   most of which never occur in the distractor text; under `--cue
+   corpus-support` (uniform over the byte values the corpus actually contains)
+   the same tool on the same checkpoint decodes the cue FURTHER out. Anyone
+   quoting "the memory horizon is N bytes" without saying which cue
+   distribution produced N is quoting half a measurement.
+
 1. **It will not run on uniform random distractor bytes and call the result
    anything.** `tools/random_vs_real.py` measured this: on random bytes
    rho(1) flips +0.534 -> -0.171 and SNR moves 8.6x. The gate asserts real
@@ -233,6 +242,7 @@ def sweep(ckpt, raw, cues, mis, offsets, distances, batch):
         acc_m = np.zeros(nb)
         acc_ce = np.zeros(nb)
         cnt = 0
+        cnt_ce = 0
         ar = np.arange(nb)
         for t in range(Dmax + 1):
             enc = m.embed[seq[:, t]]
@@ -265,8 +275,16 @@ def sweep(ckpt, raw, cues, mis, offsets, distances, batch):
             # "0.0030 nats/byte" for a stream whose real CE is ~1.17 -- an
             # absurd number that the sanity check was there to catch, and that
             # this very check was hiding.
-            nxt = seq[:, min(t + 1, Dmax)]
-            acc_ce += -np.log(np.maximum(p[ar, nxt], 1e-30))
+            #
+            # OFF-BY-ONE, also fixed. The clamp `min(t + 1, Dmax)` made the
+            # LAST step score p[seq[:, Dmax]] -- the byte the model had just
+            # consumed, which is a trivially high-probability token and drags
+            # the mean DOWN. There is no next byte after the final position, so
+            # that step is skipped and the divisor counts SCORED positions only.
+            if t < Dmax:
+                nxt = seq[:, t + 1]
+                acc_ce += -np.log(np.maximum(p[ar, nxt], 1e-30))
+                cnt_ce += 1
             if t >= 1:
                 # floors: this trial's own mean probability on its own cue byte
                 # and on the mismatched one, over the same positions.
@@ -275,7 +293,7 @@ def sweep(ckpt, raw, cues, mis, offsets, distances, batch):
             cnt += 1
         floor_cue[sl] = acc_c / max(1, cnt - 1)
         floor_mis[sl] = acc_m / max(1, cnt - 1)
-        ctx_ce[sl] = acc_ce / max(1, cnt)
+        ctx_ce[sl] = acc_ce / max(1, cnt_ce)
         print(f"    ... {sl.stop}/{n} trials", flush=True)
     return {"feats": feats, "p_cue": p_cue, "p_mis": p_mis,
             "floor_cue": floor_cue, "floor_mis": floor_mis,
@@ -384,16 +402,79 @@ def main():
     calib = [int(x) for x in args.calibration_distances.split(",") if x.strip()]
     all_d = sorted(set(distances) | set(calib))
     lams = [float(x) for x in args.lambdas.split(",")]
+    # --distances (and --calibration-distances) are free-form, so they can ask
+    # for distances the archive never held. The old code indexed z[f"X_{dd}"]
+    # straight away and died with a bare KeyError, after the run had already
+    # printed a header. Intersect the request with the archive's keys, report
+    # exactly what was dropped, and continue on what is actually there. This
+    # runs BEFORE the header so the header prints the distances that will
+    # really be swept.
+    if args.load and os.path.exists(args.load):
+        _z0 = np.load(args.load)
+        _arch = sorted({int(k[2:]) for k in _z0.files
+                        if k.startswith("X_") and k[2:].isdigit()})
+        if not _arch:
+            sys.exit(f"[FATAL] {args.load} holds no X_<d> state snapshots; it "
+                     f"is not a --save archive from this tool.")
+        _ok = [dd for dd in all_d
+               if all(f"{p}_{dd}" in _z0.files
+                      for p in ("X", "p_cue", "p_mis"))]
+        _drop = [dd for dd in all_d if dd not in _ok]
+        if _drop:
+            distances = [dd for dd in distances if dd in _ok]
+            calib = [dd for dd in calib if dd in _ok]
+            all_d = _ok
+            if not distances:
+                sys.exit(f"[FATAL] none of the requested main --distances are "
+                         f"in {args.load}; the archive holds d = {_arch}. "
+                         f"Refusing to print a horizon from an archive that "
+                         f"cannot answer the question.")
+            print(f"  [load] ** {args.load} does not hold every requested "
+                  f"distance.**\n         archive holds  d = {_arch}\n         "
+                  f"requested but ABSENT: {_drop}\n         continuing on the "
+                  f"intersection d = {_ok}. Re-run WITHOUT --load to sweep the "
+                  f"missing distances,\n         or pass --distances / "
+                  f"--calibration-distances the archive actually holds.")
     mode = "CONTROL" if args.distractors_mode == "random" else "MEASUREMENT"
     print("=" * 78)
     print(f"state probe -- {mode}{(' / ' + args.label) if args.label else ''}")
     print("=" * 78)
     print(f"  checkpoint     : {args.ckpt}")
-    print(f"  CUE            : ONE byte, UNIFORM over all 256 symbols "
-          f"(rng.integers(0, 256), seed={args.seed}).")
-    print(f"                   Not a word, not a corpus-common byte. A "
-          f"surface-form cue would\n                   reproduce the #23 "
-          f"confound (literal-cue induction only).")
+    # The cue distribution is NOT decoration: it is the load-bearing variable in
+    # every conclusion this tool draws. The same tool on the same checkpoint
+    # reads a very different horizon under --cue uniform than under
+    # --cue corpus-support, because the cue's amplitude in the state depends on
+    # how in-distribution the cue byte is. Printing "UNIFORM over all 256
+    # symbols" unconditionally made the header lie by 18 lines about the actual
+    # run under --cue corpus-support / --cue corpus-freq.
+    CUE_BANNER = {
+        "uniform": ("ONE byte, UNIFORM over all 256 symbols "
+                    "(rng.integers(0, 256), seed=%d)." % args.seed,
+                    "Out of distribution: ~154 of the 256 byte symbols never "
+                    "occur in the\n                   distractor text at all. "
+                    "A HORIZON MEASURED UNDER THIS CUE IS A PROPERTY OF THIS "
+                    "STIMULUS."),
+        "corpus-support": ("ONE byte, UNIFORM over the byte values that occur "
+                           "in the distractor file\n                   "
+                           "(rng.choice over the present symbol set, "
+                           "seed=%d) -- IN-DISTRIBUTION cue." % args.seed,
+                           "Every cue is a byte the corpus actually contains. "
+                           "The horizon under this cue\n                   is "
+                           "LONGER than under --cue uniform; the difference "
+                           "is a property of the CUE, not of the model."),
+        "corpus-freq": ("ONE byte, drawn PROPORTIONAL TO CORPUS FREQUENCY "
+                        "(seed=%d)." % args.seed,
+                        "MODELED. A constant 'always answer the modal byte' "
+                        "predictor scores ~its frequency with\n                   "
+                        "ZERO memory. Judge this run by EXCESS OVER THE "
+                        "MISMATCHED-CUE CONTROL, never against chance."),
+    }
+    _cue_line, _cue_note = CUE_BANNER[args.cue]
+    print(f"  CUE MODE       : --cue {args.cue}")
+    print(f"  CUE            : {_cue_line}")
+    print(f"                   {_cue_note}")
+    print(f"                   A surface-form cue would\n                   "
+          f"reproduce the #23 confound (literal-cue induction only).")
     print(f"  DISTRACTORS    : {args.distractors_mode.upper()} bytes from "
           f"{args.distractors}")
     print(f"  distance d     : bytes of distractor fed AFTER the cue; the "
@@ -578,6 +659,31 @@ def main():
     print(f"  [probe input] state dimension {A['dim_state']} = "
           f"{A['layers']} layers x {A['dim']} dims | ring K={A['K']}")
 
+    # ---- --save, BEFORE any reporting ----
+    # A sweep is multi-minute of forward pass. It used to be written AFTER the
+    # 2x2, the horizon, the amplitude table and the consistency section, so any
+    # exception or exit in those -- and there was a live ValueError in the
+    # --stability block, fixed below -- destroyed a completed sweep with nothing
+    # on disk to salvage. Saving is the first thing that happens once both arms
+    # exist. Nothing below this point can now cost you the sweep.
+    if args.save:
+        blob = {"cues": A["cues"], "mis": A["mis"],
+                "floor_cue": A["floor_cue"], "floor_mis": A["floor_mis"],
+                "ctx_ce": A["ctx_ce"],
+                **{f"p_cue_{dd}": A["p_cue"][dd] for dd in all_d},
+                **{f"p_mis_{dd}": A["p_mis"][dd] for dd in all_d},
+                **{f"X_{dd}": A["feats"][dd] for dd in all_d}}
+        np.savez_compressed(args.save, **blob,
+                            **{f"B_X_{dd}": B["feats"][dd]
+                               for dd in all_d if B is not None},
+                            **{f"B_cues_{dd}": B["cues"]
+                               for dd in [0] if B is not None})
+        print(f"\n  [saved] {args.save} -- swept states and readouts (main arm "
+              f"+ random-byte control), so the\n            probe can be "
+              f"re-fitted without re-running either sweep. Written BEFORE the "
+              f"analysis\n            below on purpose: nothing printed after "
+              f"this line can destroy it.")
+
     # ---- the probe, per distance ----
     print("\n" + "-" * 78)
     print("LEG A -- DOES THE STATE CARRY THE CUE?  (linear probe, held-out)")
@@ -728,7 +834,7 @@ def main():
         print(f"STABILITY -- {args.stability} independent fold partitions per "
               f"distance")
         print("-" * 78)
-        stable, marginal = [], []
+        stable, marginal, consistent_null = [], [], []
         for a in rowsA:
             X, y = A["feats"][a["d"]], A["cues"]
             accs_r, ctrl_r = [], []
@@ -742,36 +848,53 @@ def main():
                 accs_r.append(ac)
                 ctrl_r.append(co)
             d_r = np.array(accs_r) - np.array(ctrl_r)
+            mean_r = float(d_r.mean())
             flips = bool((d_r > 0).any() and (d_r <= 0).any())
+            # "above control" means the differential is POSITIVE on the
+            # aggregate. The old test was `flips` alone, which classified a row
+            # that read -0.195 pts on every partition as "stable, above
+            # control". The aggregate is over the differentials, not over the
+            # accuracies, because the control is what is being subtracted.
+            above = bool((not flips) and mean_r > 0)
             call = ("SIGN FLIPS ACROSS PARTITIONS -- NOT A FINDING" if flips
-                    else ("stable" if d_r.mean() > 0 else "consistently null"))
-            (marginal if flips else stable).append(a["d"])
+                    else ("stable, above control" if above
+                          else "consistently null"))
+            if flips:
+                marginal.append(a["d"])
+            elif above:
+                stable.append(a["d"])
+            else:
+                consistent_null.append(a["d"])
+            a["agg_diff"], a["agg_above"] = mean_r, above
             print(f"  d={a['d']:>6} B | acc {100 * np.mean(accs_r):6.3f}% "
                   f"+/- {100 * np.std(accs_r):.3f} | control "
                   f"{100 * np.mean(ctrl_r):6.3f}% +/- {100 * np.std(ctrl_r):.3f}"
                   f" | diff {100 * d_r.mean():+.3f} pts, min "
                   f"{100 * d_r.min():+.3f} max {100 * d_r.max():+.3f} | {call}")
         print(f"\n  stable, above control: {stable}")
+        print(f"  consistently null (every partition at or below the "
+              f"control): {consistent_null}")
         print(f"  flips across partitions: {marginal} "
               f"-- these are NOT findings and must not be quoted as a horizon")
+        # Two bugs fixed here. (a) The append was gated on `flips` alone, so a
+        # row whose differential was NEGATIVE or exactly zero on EVERY
+        # partition -- a row the tool had itself just labelled "consistently
+        # null" -- was announced in the same list as "stable, above control".
+        # (b) The horizon below used the SINGLE-partition `has`, which is one of
+        # the partitions, i.e. the very quantity --stability exists to show is
+        # not trustworthy at a 1-2% accuracy. It now uses the
+        # partition-AGGREGATED decision.
         rowsA = [a for a in rowsA if a["d"] not in marginal]
-        if rowsA:
-            print(f"  horizon recomputed on stable rows only: "
-                  f"{max(a['d'] for a in rowsA if a['has'])} B")
-
-    if args.save:
-        blob = {"cues": A["cues"], "mis": A["mis"],
-                "floor_cue": A["floor_cue"], "floor_mis": A["floor_mis"],
-                "ctx_ce": A["ctx_ce"],
-                **{f"p_cue_{dd}": A["p_cue"][dd] for dd in all_d},
-                **{f"p_mis_{dd}": A["p_mis"][dd] for dd in all_d},
-                **{f"X_{dd}": A["feats"][dd] for dd in all_d}}
-        np.savez_compressed(args.save, **blob,
-                            **{f"B_X_{dd}": B["feats"][dd] for dd in all_d},
-                            **{f"B_cues_{dd}": B["cues"] for dd in [0]})
-        print(f"\n  [saved] {args.save} -- swept states and readouts (main arm "
-              f"+ random-byte control), so the\n            probe can be "
-              f"re-fitted without re-running either sweep")
+        for a in rowsA:
+            a["has"] = bool(a["has"] and a.get("agg_above", True))
+        _hz = [a["d"] for a in rowsA if a["has"]]
+        if _hz:
+            print(f"  horizon recomputed on stable, above-control rows only: "
+                  f"{max(_hz)} B")
+        else:
+            print("  horizon recomputed on stable, above-control rows only: "
+                  "NONE --\n    every stable row reads at or below its control. "
+                  "That is a real null, not a crash.")
 
     # ---- the 2x2 ----
     print("\n" + "=" * 78)
@@ -894,11 +1017,22 @@ def main():
         print(f"  {dd:>10} {sig.max() ** dd:>14.3e} {sig.mean() ** dd:>14.3e} "
               f"{int((sig ** dd > 1e-7).sum()):>26}")
     surv = [dd for dd in distances if sig.max() ** dd > 1e-7]
+    best_tail = max(surv) if surv else 0
+    n_tail = int((sig ** best_tail > 1e-7).sum()) if best_tail else 0
     print(f"  The BEST single decay coordinate keeps >1e-7 of a cue up to "
-          f"d = {max(surv) if surv else 0} B.")
+          f"d = {best_tail} B (by {n_tail} of {sig.size} coordinates).")
     print(f"  Probe horizon (decodable) = {horizon_state if horizon_state else 'none'} B"
-          f" | decay-histogram prediction = {max(surv) if surv else 0} B.")
-    if horizon_state and max(surv) and horizon_state > max(surv):
+          f" | decay-histogram tail = {best_tail} B.")
+    # The old string here said "CONSISTENT: the probe's horizon is at or below
+    # what the decay parameters permit, and the decay histogram PREDICTS the
+    # probe's answer." That is false on both clauses: the tail reaches 1024 B
+    # against a measured 8-16 B, and a per-coordinate upper bound that is 128x
+    # too high predicts nothing. RESULTS.md filed the opposite as a retraction.
+    # The honest reading, and it is a DIFFERENT question from disagreement: the
+    # tail is not a prediction of the horizon, it is a per-coordinate upper
+    # bound on amplitude, and a bound 128x above the measured horizon carries
+    # no information about where the horizon is.
+    if horizon_state and best_tail and horizon_state > best_tail:
         print("  ** CONTRADICTION: the state is measurably decodable FARTHER "
               "than its own decay\n     parameters allow. That is a real "
               "disagreement between two results and it is worth\n     more "
@@ -906,9 +1040,19 @@ def main():
               "something other than memory\n     of the cue, or the decay "
               "histogram is not the whole story. **")
     elif horizon_state:
-        print("  CONSISTENT: the probe's horizon is at or below what the "
-              "decay parameters permit, and\n  the decay histogram predicts "
-              "the probe's answer.")
+        ratio = (best_tail / horizon_state) if horizon_state else float("nan")
+        print(f"  NO CONTRADICTION, BUT THE DECAY HISTOGRAM DOES NOT PREDICT THE "
+              f"PROBE.\n     The measured horizon ({horizon_state} B) is "
+              f"{ratio:.0f}x BELOW the per-coordinate tail ({best_tail} B). "
+              f"The tail is an\n     UPPER BOUND ON A SINGLE COORDINATE'S "
+              f"AMPLITUDE, not a prediction: `sigma_max^d > 1e-7` asks only "
+              f"whether the\n     hottest of {sig.size} coordinates keeps "
+              f"{1e-7:.0e} of the cue, and the probe reads the 8192-dim "
+              f"concatenation in which that\n     surviving amplitude is "
+              f"diluted across every dimension. A bound {ratio:.0f}x above "
+              f"the measurement cannot locate the measurement,\n     so this "
+              f"is NOT the histogram confirming the probe -- it is the "
+              f"histogram declining to make a prediction.")
     else:
         print("  CONSISTENT (and unsurprising): the state does not carry a "
               "random cue even at the\n  SHORTEST swept distance, which is "
@@ -973,16 +1117,41 @@ def main():
               "instrumentation could not have\n  told 'no memory' from 'memory "
               "unused' -- this probe does, and the answer is 'no memory'.")
 
+    _cue_words = {"uniform": "UNIFORM-RANDOM-OVER-256",
+                  "corpus-support": "IN-DISTRIBUTION (uniform over corpus "
+                                    "support)",
+                  "corpus-freq": "CORPUS-FREQUENCY-WEIGHTED"}[args.cue]
     print("\n  Reminders. This probe says NOTHING about: literal-cue "
           "induction (#23's domain),\n  obfuscated or parallel-tracking "
           "retrieval (never tested by anything in this\n  repo), language-"
           "modelling quality, or the distillation path. A 'no / no' here is "
-          "a statement\n  about a UNIFORM RANDOM CUE under a LINEAR readout, "
-          "and a linear readout can miss\n  information that is present but "
-          "not linearly available.")
+          "a statement\n  about a " + _cue_words + " cue under a LINEAR "
+          "readout, and a linear readout can miss\n  information that is "
+          "present but not linearly available.")
+    print(f"  Any horizon quoted from this run is a horizon for the "
+          f"{_cue_words} cue. The same checkpoint under --cue uniform reads a "
+          f"SHORTER\n  horizon; the difference belongs to the stimulus, not to "
+          f"the model. Do not quote the number without the cue mode.")
     if mode != "CONTROL":
         print(f"\n  [no RESULT has been written to RESULTS.md; this run "
               f"stops at the printed output]")
+
+    # ---- exit codes ----
+    #  0  PASS or FAIL -- a result. This is the primary documented outcome.
+    #  2  INCONCLUSIVE -- a control failed, or the probe could not decode the
+    #     cue even at d=0, or this is the random-byte CONTROL arm. This is NOT
+    #     an error in the harness sense: it is the tool correctly refusing to
+    #     call a result. But it is a non-zero status, so a `set -e` wrapper
+    #     treats it as a failure and a CI job goes red on the documented
+    #     "INCONCLUSIVE" outcome. Wrap it as `... || rc=$?; [ "$rc" = 2 ]`
+    #     (or `--control-trials 0` where no control applies) if that matters.
+    #     Documented here rather than changed: the exit code is right, its
+    #     surprise is not, and the surprise belongs next to the verdict.
+    _note = ("; see the exit-code note above -- 2 is the documented "
+             "INCONCLUSIVE status, not a crash"
+             if verdict == "INCONCLUSIVE" else "")
+    print(f"\n  EXIT CODE: {0 if verdict in ('PASS', 'FAIL') else 2}"
+          f"  ({verdict}{_note})")
     return 0 if verdict in ("PASS", "FAIL") else 2
 
 

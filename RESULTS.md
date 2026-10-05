@@ -13,8 +13,8 @@ quoted against. Everything below is append-only history.
 | # | blocker | status | where |
 |---|---|---|---|
 | 1 | gradient SNR ≈ 0.05 | **largely a measurement artifact.** The same estimator at a **frozen** θ reads **0.633** — a **12.6× gap** caused by the iterate moving every byte. Diagnosis is now **over-large step**, not a noise floor. The direct lever (global `--lr`) has **never been swept**. | end of file |
-| 2 | memory formation is real but small (mean half-life 1.14 B; 7 of 8192 dims > 8 B) | **unchanged — and now the thing to measure rather than to fix.** The gradient side looks materially healthier than believed. | §ruler, `tools/memory_report.py` |
-| 3 | distance-curve / retrieval ruler | **being built** (Karpathy 2015 Fig. 5 cell in `tools/eval.py`) | in progress |
+| 2 | memory formation is real but small (mean half-life 1.14 B; 7 of 8192 dims > 8 B) | **unchanged — and now measured rather than assumed.** The state probe puts the memory horizon at **8 B under a uniform-over-256 cue** (`--cue uniform`: cue drawn over all 256 byte symbols, most of which never occur in TinyStories) and at **≥16 B under an in-distribution cue** (`--cue corpus-support`: uniform over the 102 byte values the corpus actually contains; d=16 reads 9.31% against a 0.94% mismatched-cue control). **The horizon is cue-distribution-dependent — it moves with the stimulus, not only with the model.** Against the mean half-life both are several-fold beyond it; against the `max σ^d > 1e-7` per-coordinate tail they are ~128× / ~16× short (that tail is an amplitude bound, not a prediction — see the retraction below). Gate verdict: **INCONCLUSIVE** (random-byte control veto) — the gate definition is an open decision. | end of file, `tools/state_probe.py` |
+| 3 | distance-curve / retrieval ruler | **built** (Karpathy 2015 Fig. 5 cell in `tools/eval.py`) and the state-probe half is measured (row 2). | `tools/eval.py`, `tools/state_probe.py` |
 
 ### Claims that have been retracted or corrected
 
@@ -27,6 +27,17 @@ Read these before quoting anything older:
   gives `ρ(1) = −0.171` and SNR 0.633.
 - **The variance hinge is a floor, not a penalty** — `max(0, 1-√var)` pushes latent
   variance **up**; it is anti-collapse.
+- **The decay histogram does not predict memory** — the mean half-life *understates*
+  the measured horizon several-fold, and the `max σ^d > 1e-7` tail *overstates* it
+  (~128× against the 8 B uniform-cue horizon, ~16× against the 16 B
+  corpus-support horizon). The tail figure is a **per-coordinate amplitude bound**
+  diluted across the 8192-dim state, so it locates nothing; it is not a
+  prediction that failed, it is not a prediction. **CORRECTED 2026-10-05:**
+  `tools/state_probe.py` used to print "CONSISTENT: … the decay histogram
+  predicts the probe's answer", which is false on both clauses and contradicted
+  this retraction. It now prints that the histogram makes **no** prediction, and
+  why. The horizon itself is also cue-distribution-dependent — see
+  "The state-probe ruler" at the end of file.
 - **The eligibility trace is NOT biased** — confirmed at production depth (16
   layers, dim 512, both decay regimes): cosine 1.000000, rel err ≤1.05e-06. The
   hybrid-window trainer stays HELD.
@@ -2437,3 +2448,470 @@ decay role's rate, never `--lr`. Given that the measured step is already
 0.0217 × lr, the nominal lr and the effective step are not the same quantity, and
 nobody has established where the effective step should sit. This is ranked ahead
 of accumulation because accumulation costs k× the updates and this costs none.
+
+---
+
+## The state-probe ruler: the memory horizon is 8 B under a uniform-over-256 cue and ≥16 B under an in-distribution cue — the number is cue-distribution-dependent, i.e. partly a property of the stimulus (2026-10-05)
+
+`tools/state_probe.py`, CPU only, numpy_port, 8.4 MB of forward pass.
+Roadmap v3 P0 item 2. Artifacts: `runs/state_probe/probe_final.log` (246 lines,
+the original 16384-B sweep + 12 fold partitions), swept states in
+`runs/state_probe/sweep_512b.npz` (**248 MB**, re-fits the probe without
+re-paying the sweep), and the cue-distribution runs re-derived on 2026-10-05
+under `/tmp/state_probe_verify/` (six logs: `uniform_seed{0..4}.log`,
+`corpus_support_seed0.log` — `runs/` and `*.log` are gitignored, so copy them
+into `runs/state_probe/` if you want them to outlive this machine).
+**The gate returns INCONCLUSIVE and this section records it as such; it does not
+close blocker 2.**
+
+> **CORRECTED 2026-10-05 — the headline used to be unqualified and it was
+> wrong.** The section title, the header index row and the `**8 bytes, firm.**`
+> line all said "the memory horizon is 8 bytes", with no mention of the cue
+> distribution. `grep -i corpus-support RESULTS.md` returned **zero hits**: the
+> cue distribution was disclosed once, deep in the protocol, and never again.
+> The 8 B number is specific to `--cue uniform`, in which the cue is drawn over
+> all 256 byte symbols — **most of which never occur in TinyStories at all**.
+> Under `--cue corpus-support` (uniform over the 102 byte values the corpus
+> actually contains) the same tool on the same checkpoint decodes the cue
+> **further** out. **8 B is therefore partly a property of the STIMULUS, not of
+> the model**, and quoting it without the cue mode quotes half a measurement.
+> Both numbers are now given, each attributed to its cue mode, below.
+
+### The protocol, with its conventions, because an accuracy without these is not a result
+
+Per trial: zero the recurrent state; feed **one cue byte drawn uniformly over all
+256 symbols** (`rng.integers(0, 256)`, seed 0) — never a word, never a
+corpus-common byte, because a surface-form cue reproduces #23's confound; feed
+`d` bytes of **real held-out distractors**; snapshot the state after the model
+has consumed cue + exactly `d` distractor bytes. Then fit a tiny **offline
+closed-form ridge probe** (ridge onto one-hot targets, solved in the dual from an
+n×n Gram — never an 8192×8192 system, no SGD, no TMT updates) and decode the cue.
+**Chance = 1/256 = 0.390625%.**
+
+**The cue distribution is the load-bearing variable, and it is a `--cue` flag.**
+`--cue uniform` (the protocol as written above), `--cue corpus-support`
+(uniform over the byte values the distractor file actually contains — 102 of them
+for TinyStories), or `--cue corpus-freq` (∝ corpus frequency; reported with a
+warning, because a constant "always answer the modal byte" predictor scores 19.1%
+with zero memory). **The horizon this tool reports is a function of that flag**,
+and the two measurements below differ by a factor of two in horizon on the same
+checkpoint with everything else held fixed. A prior version of the header printed
+`CUE : ONE byte, UNIFORM over all 256 symbols` **unconditionally**, so
+`--cue corpus-support` and `--cue corpus-freq` runs printed a false banner 18
+lines before the truth; the banner is now conditional on `--cue`.
+
+| convention | value |
+|---|---|
+| checkpoint | `runs/lrroles/arm_lrdecay1x_t919897.npz` (t=919,897, dim 512, L16) |
+| state read out | concatenated layer states, 16 × 512 = **8192 dims** |
+| trials | **512** (random-byte control arm: 64) |
+| CV | 4-fold, every trial tested exactly once |
+| λ grid | 1 … 1e7, chosen per outer fold by inner 3-fold CV on training folds only |
+| preprocessing | per-dimension z-scoring on pooled, label-free statistics |
+| distractors | 1146 disjoint 16384-B windows of `data/eval/tinystories_valid.txt`, asserted outside the training glob |
+| distances | 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 |
+| calibration | 0, 1, 2, 4 B (probe power) |
+| context CE on the probe's own streams | **not recoverable from the shipped run** — see the correction below |
+| SE | binomial at n=512; stability = **12 independent fold partitions** |
+| resolution | smallest detectable effect at 2σ = **0.778 points** |
+
+**REMOVED 2026-10-05 — `1.1893 nats/byte`.** This table row carried a
+context-CE that appears in **no log in the repo** (`grep -rn 1.1893` outside this
+file: nothing). The shipped artifact `runs/state_probe/probe_final.log` carries
+`0.0030 nats/byte`, which is the *broken* accumulator — it sat inside the
+snapshot branch, summed ~13 values and divided by all 16385. Re-derived fresh
+runs read **1.2214–1.2540 nats/byte** at the settings used for the cue
+comparisons below (n=512, 256-B distractor windows); short windows read higher
+still (1.65 at 32-B windows), and the ruler's ≈1.17 is a 1024-B-slice number, so
+none of these are directly comparable to it. The correct statement is the
+**measured re-derivation**, not the unsourced 1.1893.
+
+### Decoding accuracy vs distance (single 4-fold partition, n=512)
+
+| d (B) | accuracy | chance | mismatched-cue control | carried? |
+|---:|---:|---:|---:|---|
+| 0 * | 77.3438% | 0.3906% | 0.5859% | probe live |
+| 1 * | 58.3984% | 0.3906% | — | probe live |
+| 2 * | 46.2891% | 0.3906% | — | probe live |
+| 4 * | 27.3438% | 0.3906% | — | probe live |
+| **8** | **12.8906% ± 1.4809** | 0.3906% | **0.0000%** | **YES** |
+| 16 | 0.7812% ± 0.3891 | 0.3906% | 0.7812% | no |
+| 32 | 0.5859% ± 0.3373 | 0.3906% | 0.5859% | no |
+| 64 | 0.5859% ± 0.3373 | 0.3906% | 0.1953% | no |
+| 128 | 0.5859% ± 0.3373 | 0.3906% | 0.1953% | no |
+| 256 | 0.3906% ± 0.2757 | 0.3906% | 1.3672% | no |
+| 512 | 0.1953% ± 0.1951 | 0.3906% | 0.5859% | no |
+| 1024 | 0.1953% ± 0.1951 | 0.3906% | 0.0000% | no |
+| 2048 | 0.3906% ± 0.2757 | 0.3906% | 0.3906% | no |
+| 4096 | 0.1953% ± 0.1951 | 0.3906% | 0.1953% | no |
+| 8192 | 0.3906% ± 0.2757 | 0.3906% | 0.0000% | no |
+| 16384 | 0.3906% ± 0.2757 | 0.3906% | 0.1953% | no |
+
+\* calibration rows. "mismatched-cue control" = the identical pipeline on
+permuted cue labels; it is the specificity test that the probe is reading the
+cue and not trial identity.
+
+### The same table under 12 independent fold partitions — which rows survive
+
+A single 4-fold partition at a 1–2% accuracy is 4–8 correct decodes out of 512
+and the control is 2–5 hits out of 512; whether the difference is 4 hits or 2 is
+decided by the partition, not by the model. So every row was re-probed 12 times
+with fresh partitions:
+
+**The `±` in this table is WITHIN-SWEEP partition noise over ONE fixed set of 512
+states — it is NOT a confidence interval on anything.** Five independent sweeps
+of the same checkpoint (new cue draws, new corpus windows, fresh partitions) put
+the d=8 mean at 12.73–15.43%, a **2.70-point spread, ~1.8× wider than the ±0.940
+printed here**. Read the table as "this state set, this partition family", and
+read the between-sweep table further down as the uncertainty. The line at the end
+of this section that says "the horizon number does not have a CI" is correct and
+this table must not be read against it.
+
+| d (B) | accuracy (SD over 12 partitions) | control | acc − control | range over partitions | verdict |
+|---:|---:|---:|---:|---:|---|
+| **8** | 12.467% ± 0.940 | 0.407% ± 0.333 | **+12.061 pts** | min **+10.352** | **stable, above control** |
+| 16 | 1.953% ± 0.529 | 0.472% ± 0.232 | +1.481 pts | min +0.781 | stable, above control **here** — marginal across sweeps (below) |
+| 32 | 0.521% ± 0.351 | 0.374% ± 0.232 | +0.146 pts | −0.781 … +1.172 | sign flips — null |
+| 64 | 0.407% ± 0.232 | 0.358% ± 0.262 | +0.049 pts | −0.586 … +0.586 | sign flips — null |
+| 128 – 16384 | 0.130–0.505% | 0.260–0.342% | −0.212 … +0.228 pts | all cross 0 | null |
+
+**d=8 is the only robust decoding result in this sweep. d=16 is ~8 excess decodes
+out of 512 and is MARGINAL, not absent: it is `stable, above control` on this
+sweep's 12 partitions, and on the five fresh sweeps below it is stable above
+control in **4 of 5** and sign-flips in **1 of 5**. The honest sentence is
+therefore: *at the shipped `--cue uniform` settings, d=16 is marginally but
+inconsistently above control.* It is NOT established as a horizon, and it is NOT
+honest to write it up as a null either.
+
+**REMOVED 2026-10-05 — the sentence that used to close this paragraph.** It read
+"changing which corpus windows are drawn moves its control from 0.47% to 0.98% and
+flips its classification, so d=16 is NOT established." That run has **no artifact
+anywhere in the repo** (`grep -rn` for the values finds nothing outside this
+file), and it was the *sole* stated basis for excluding d=16. It is removed rather
+than kept, because the five logged sweeps above give the same conclusion with
+artifacts behind it — without pretending to a corpus-window run that was never
+recorded.
+
+### MEMORY HORIZON — it depends on the cue distribution
+
+**The horizon is 8 B under a uniform-over-256 cue and ≥16 B under an
+in-distribution cue. The number is cue-distribution-dependent, and that
+dependence belongs to the STIMULUS.**
+
+This number did not exist before 2026-10-05, and the first version of it was
+wrong by omission. It was written as **"8 bytes, firm"**, unqualified, in the
+section title, in the header index row and here — while the cue distribution
+behind it was disclosed once, deep in the protocol, and never again
+(`grep -i corpus-support RESULTS.md` returned **zero hits**). A reader landing on
+any of those three places got a property of the model's memory and, in fact, got
+a property of the byte sampler.
+
+The two measurements, same checkpoint, same probe, same folds, 512 trials:
+
+| `--cue` | cue is drawn | d=8 | d=16 | d=32 | horizon |
+|---|---|---|---|---|---|
+| `uniform` | over all **256** byte symbols; ~154 of them never occur in TinyStories | 12.73–15.43% (5 sweeps) vs 0.26–0.42% control | 1.0–2.7%, stable above control in **4 of 5** sweeps, sign-flips in 1 | sign-flips / null in all 5 | **8 B** |
+| `corpus-support` | uniformly over the **102** byte values the corpus actually contains | **52.31% ± 1.63** vs **0.879% ± 0.293** control, diff **+51.43 pts**, stable on 6/6 partitions | **9.31% ± 0.72** vs **0.944% ± 0.175** control, diff **+8.37 pts**, stable on 6/6 partitions | diff +1.30 pts, min 0.000 — **sign flips**, not a finding | **≥16 B** |
+
+That is a factor of two in horizon on the same weights, from the cue sampler
+alone. The uniform-cue reading is *not wrong* — it is a clean, reproducible
+result (d=8 decoding at 12.7–15.4% against a 0.3–0.4% mismatched-cue control,
+margins **+12.3 to +15.2 points**, five sweeps, every one of them `stable, above
+control`). It is a measurement of **how long a cue the model has essentially
+never seen survives**, which is the harder case and was the design intent. The
+corpus-support reading measures **how long a plausible cue survives**, and that
+is the number a reader usually means by "the memory horizon". Both belong in the
+headline; neither alone does.
+
+Command lines (each log carries the full output):
+
+```
+.venv/bin/python tools/state_probe.py --cue uniform        --seed S \
+    --distractors data/eval/tinystories_valid.txt \
+    --distances 8,16,32,64,128,256 --calibration-distances 0,1,2,4 \
+    --trials 512 --batch 512 --control-trials 64 --stability 6 --label cue-uniform-seedS
+.venv/bin/python tools/state_probe.py --cue corpus-support --seed 0 \
+    --distractors data/eval/tinystories_valid.txt \
+    --distances 8,16,32,64,128,256 --calibration-distances 0,1,2,4 \
+    --trials 512 --batch 512 --control-trials 64 --stability 6 --label cue-corpus-support-seed0
+```
+
+#### Between-sweep spread, `--cue uniform` (the number the ±0.940 must not be read as)
+
+| seed | d=8 accuracy, mean of 6 partitions | control | acc − control | d=16 | horizon |
+|---:|---:|---:|---:|---|---:|
+| 0 | 12.956% ± 1.013 | 0.391% ± 0.113 | +12.565 pts | stable above control, +0.879 pts | 8 B |
+| 1 | 15.430% ± 0.575 | 0.260% ± 0.184 | +15.169 pts | stable above control, +2.279 pts | 8 B |
+| 2 | 15.072% ± 1.248 | 0.260% ± 0.146 | +14.811 pts | **sign flips** (+0.716 pts, min 0.000) | 8 B |
+| 3 | 13.444% ± 1.066 | 0.391% ± 0.226 | +13.053 pts | stable above control, +1.042 pts | 8 B |
+| 4 | 12.728% ± 0.847 | 0.423% ± 0.208 | +12.305 pts | stable above control, +1.302 pts | 8 B |
+
+**d=8 → 12.73–15.43%, a 2.70-point between-sweep spread.** The horizon is 8 B in
+all five. d=16 is the marginal row, and it is marginal *in the honest direction*:
+above control most of the time, never absent.
+
+#### The amplitude bound, which is what actually transfers
+
+Because the state is `s_t = σ·s_{t-1} + enc_t`, the cue's relative amplitude at
+distance `d` is `σ^d`, known in closed form rather than fitted. That converts the
+probe's response curve into a bound that transfers: the probe's detection
+threshold sits between `σ_mean^8 = 5.3e-03` (detected, 12.5%) and
+`σ_mean^16 = 2.8e-05` (not detected). **Anything below ~5e-03 relative amplitude
+is UNMEASURED, not absent** — the probe cannot see it, and a null there is a
+statement about the instrument.
+
+This is also the cleanest statement of the cue-dependence, and it is worth
+separating from the horizon number because it is *not* cue-dependent: the
+amplitude threshold below is a property of the **instrument**, at roughly
+`σ_mean^8`, whichever cue you feed it. What changes with the cue is **where that
+threshold is crossed**, because an in-distribution cue byte carries more
+amplitude into the state than a byte the corpus has never contained. So the
+honest decomposition of the headline is: **the instrument's threshold is fixed;
+the stimulus decides where the threshold lands; the "8 B" was a threshold
+crossing, not a wall.**
+
+### The 2×2, and the two cells this design cannot reach
+
+| state has cue? | output uses cue? | cell |
+|---|---|---|
+| no | no | no learned memory at this distance (d ≥ 32 under `--cue uniform`; d ≥ 64 under `--cue corpus-support`) |
+| **YES** (d=8, and d=16 under an in-distribution cue) | **no** | **memory exists; the predictive head/objective does not use it** |
+
+At d=8 the head's probability on the cue byte moves by a differential of
+**−1.5e-03 [−5.3e-03, +1.5e-03]** against a matched mismatched-cue control
+(stated bar: 0.01 in probability units). Nothing above 5.5e-03 anywhere in the
+sweep, i.e. nothing.
+
+**Two cells are structurally unreachable here and are not reported.** The
+bottom-right "yes/yes" is not established, because with a *uniform random* cue
+there is no correct continuation: leg B measures whether the output distribution
+moves, which follows almost automatically from leg A since the byte head is a
+fixed linear map of the state. And the "state no / head yes for **literal** cues"
+row — the surface-form-shortcut row — cannot be produced by this design at all,
+because it requires a cue with surface form, which is exactly what this probe is
+forbidden to use. **A "yes/yes" from this tool would not mean task-relevant
+retrieval.**
+
+### VERDICT: INCONCLUSIVE, and the reason is the control, not the effect
+
+The random-byte control arm (identical pipeline, uniform random distractors,
+n=64) read **above chance at 8 of 16 distances**, **9.375–18.750%** against real
+text's 0.2–1.6%, and at d=32 it reads **18.75% where the real arm reads 0.59%**.
+Under the gate's stated rule that is a veto, so the tool returns INCONCLUSIVE.
+
+**CORRECTED 2026-10-05.** This paragraph used to say the control arm read
+"3–19% against real text's 0–13%". The logged control-arm values flagged above
+chance span **9.375%–18.750%** (the 3–19% and 0–13% figures appear in no log);
+both ends are now the values in `runs/state_probe/probe_final.log`.
+
+**Recorded as an open decision, not silently re-specified.** Changing a gate
+after seeing the data is the failure mode this file has shipped once. The case
+that the veto is mis-specified: in that arm the cue is *genuinely present* in the
+state (the recurrence is deterministic), and on random bytes the distractor
+content sums to something nearly constant across trials, so a planted cue is a
+larger share of the trial-to-trial variation than on real text. A high reading
+there is a true positive, not a fabrication, so that arm cannot separate "the
+probe is powerful" from "the probe is faking". The arm that can is the
+mismatched-cue control, and it sits at chance at every distance (0.00–0.59% at
+d=8). **Whether the random-byte arm should remain a hard veto is a gate
+definition and it is unresolved.** Supporting evidence that the veto itself is
+weak: the set of distances it flags moves with the run ([0,1,2,4,8,16,32,64] in
+`runs/state_probe/probe_final.log` vs [0,1,2,4,16,32,64,128] in
+`runs/state_probe/probe.log`), because at n=64 one lucky decode is 1.6%.
+
+**CORRECTED 2026-10-05 — "on the same sweep" was false.** These two flagged sets
+were described as coming from the same sweep. They do not:
+`probe.log` reads d=8 at **13.8672%** and `probe_final.log` reads d=8 at
+**12.8906%**, so they are two different runs of the tool on the same checkpoint.
+The conclusion — that the veto flags an unstable set of distances — survives;
+the sentence claiming a single sweep did not, and no claim is made here about
+which corpus windows either run drew.
+
+### Consistency with the decay histogram: they disagree, in both directions
+
+Checkpoint decay: σ min 0.02781, mean **0.51911**, max **0.98474**; mean
+half-life **1.162 B**; **8 of 8192** dims above 8 B.
+
+| quantity | value | vs the 8 B (`--cue uniform`) horizon |
+|---|---|---|
+| mean half-life | 1.162 B | **understates ~7×** — the cue is decodable ~7× further than the mean |
+| `max σ^d > 1e-7` survives to | **1024 B** (1 dim of 8192) | **overstates 128×** (16× against the 16 B corpus-support horizon) |
+
+Neither summary number predicts the horizon, and the reason is a category error
+worth stating once: the decay histogram's tail figure is a **per-coordinate
+amplitude** (`σ_max^8 = 0.88`, i.e. the hottest coordinate keeps 88% of the cue
+at 8 bytes) while the probe reads an **8192-dim concatenation** in which that
+surviving signal is spread over a handful of coordinates. The two measure
+different things; the probe measures the second. Anyone quoting "memory up to
+1024 B" from the decay tail is quoting a statement about one coordinate, not
+about the state.
+
+**The tool and this section used to disagree about this, and the tool was
+wrong.** `tools/state_probe.py` printed
+
+> `CONSISTENT: the probe's horizon is at or below what the decay parameters
+> permit, and the decay histogram predicts the probe's answer.`
+
+while this file filed the opposite as a retraction. Both cannot stand, and the
+tool's string is false on **both** of its clauses: the tail reaches 1024 B
+against a measured 8–16 B, and a per-coordinate bound sitting 16–128× above the
+measurement is not a prediction of it. The 1024 B figure is checked directly in
+`probe_final.log` — `dims with σ^d > 1e-7` is 1 at d=1024 and 0 at d=2048 — and
+it is a real property of the weights; it is simply a statement about one
+coordinate, not about the horizon. **As of 2026-10-05 the tool prints the honest
+version**: "NO CONTRADICTION, BUT THE DECAY HISTOGRAM DOES NOT PREDICT THE
+PROBE … the tail is an UPPER BOUND ON A SINGLE COORDINATE'S AMPLITUDE, not a
+prediction … A bound N× above the measurement cannot locate the measurement."
+This retraction and the tool now say the same thing.
+
+### CHECKPOINT IDENTITY — the file probed is not the checkpoint behind the quoted statistics
+
+`runs/lrroles/arm_lrdecay1x_t919897.npz` is **not** the model behind the
+"mean half-life 1.14 B; 7 of 8192 dims > 8 B" figure quoted in blocker 2 and in
+`PLAN-2026-10-04-ROADMAP.md`. It is a 30,000-step AdamW continuation from
+t=889,897 and measures **1.162 B / 8 dims > 8 B**. The 1.138 B / 7 dims pair
+belongs to `armsgdlr0.000125_t919897.npz`, whose σ_mean 0.51479 is the
+incumbent's value exactly — consistent with this file's finding that the decay
+role is frozen under a magnitude-proportional optimizer.
+
+Decay statistics for all four t=919,897 checkpoints (re-derived from the
+checkpoint files themselves, so these columns are attributable):
+
+| checkpoint | σ_mean | mean half-life | dims > 8 B |
+|---|---:|---:|---:|
+| `arm_lrdecay1x` | 0.51911 | 1.162 B | 8 |
+| `arm_lrdecay4x` | 0.52264 | 1.179 B | 9 |
+| `arm_lrdecay16x` | 0.52404 | 1.189 B | 9 |
+| `armsgdlr0.000125` (SGD, decay role frozen) | 0.51479 | 1.138 B | 7 |
+
+**REMOVED 2026-10-05 — the `d=8 accuracy` column (12.1094 / 12.5000 / 12.3047 /
+11.5234 %).** None of those four numbers appears in any log in the repo
+(`grep -rn` across the tree: nothing), and the three checkpoints other than
+`arm_lrdecay1x` have no probe log at all. The σ_mean / half-life / `dims > 8 B`
+columns of the same table are computed directly from the checkpoint weights and
+are exactly correct, so they are kept; the accuracies are not, and an
+unattributable number next to an attributable one is worse than a gap.
+
+Consequently the previous closing sentence here — "the 8 B horizon is the same
+on all four" — is also removed: it rests only on the removed column. What
+survives is the checkpoint-identity finding itself, which is about the decay
+statistics and needs no probe run: the file named in blocker 2 is not the file
+behind the half-life figure that blocker 2 quotes.
+
+### Four defects found in the probe while building it
+
+Recorded because each produced a plausible-looking wrong number, which is the
+failure class v3 P0 item 3 exists to prevent:
+
+1. **`p_cue` indexed the output distribution by the next REAL byte, not the
+   cue.** The "does the output use the cue" leg was silently measuring ordinary
+   byte predictability. It read a believable 0.52 at d=8 — closely matching the
+   distance-curve cell's `p_close` at the same distance, which is exactly why it
+   survived review. That coincidence is the whole lesson of this file applied to
+   me.
+2. **Calibration rows reused the previous iteration's mismatched-cue control**,
+   judging d=2 and d=4 against a control belonging to a different distance.
+3. **The context-CE sanity accumulator sat inside the snapshot branch**, summing
+   ~13 values and dividing by 16385. It printed "0.0030 nats/byte" for a stream
+   whose true CE is ~1.2 — the check was hiding the bug it existed to catch.
+4. **A significance-only bar** on leg B classified a 2e-3 shift in probability as
+   a result. The bar is now stated in probability units (0.01).
+
+Two methodological corrections are also recorded because they changed numbers:
+the leg-A gate compares against the pipeline's **own empirical null** (permuted
+labels) rather than the analytic chance rate — at n=256 one lucky control decode
+is enough to clear chance + 2σ and would have vetoed a real 5% reading — and the
+`--stability` sweep exists because a single fold partition cannot decide a
+1–2% row.
+
+### Seven more defects, found by adversarial audit (2026-10-05)
+
+Same failure class as the four above: each produced a plausible-looking wrong
+number, a wrong *label*, or a destroyed sweep. All reproduced before fixing.
+
+1. **`max()` on an empty generator destroyed the sweep.** The
+   "horizon recomputed on stable rows" line was guarded only by `if rowsA:`, so
+   when no row had `has` set it raised `ValueError: max() iterable argument is
+   empty`. Reproduced live. Worse: `if args.save:` sat *after* that block, so a
+   completed multi-minute sweep was discarded with nothing on disk. **Fixed
+   twice over** — the horizon line is guarded, and **`--save` now runs
+   immediately after both arms exist, before the 2×2, the horizon, the amplitude
+   table and the consistency section**, so nothing printed after the sweep can
+   now cost you the sweep.
+2. **Rows with a negative or zero differential were announced as "stable, above
+   control."** The `--stability` bucket was gated on `flips` alone, so a row the
+   tool had just labelled "consistently null" landed in the same list as a real
+   result. Reproduced live (`stable, above control: [8, 16, 32]` on rows reading
+   −3.125 / 0.000 / 0.000 pts). **Fixed**: the append is gated on
+   `d_r.mean() > 0`, the "consistently null" rows are reported in their own
+   bucket, and the horizon is recomputed from the **partition-aggregated**
+   decision rather than the single-partition `has` it used before — which is the
+   very quantity `--stability` exists to distrust.
+3. **The `CUE : ONE byte, UNIFORM over all 256 symbols` banner was
+   unconditional**, so `--cue corpus-support` and `--cue corpus-freq` runs
+   printed a false header 18 lines before the truth. Since the cue distribution
+   turns out to be the load-bearing variable in *every* conclusion this tool
+   draws, this is not cosmetic. **Fixed**: the banner is selected on `args.cue`,
+   `CUE MODE : --cue <mode>` is printed, and the closing reminder names the cue
+   the horizon belongs to.
+4. **`--load` died with a bare `KeyError`** when `--distances` asked for
+   distances the archive never held — e.g. re-loading a 4-distance `.npz` with
+   the default distance list. **Fixed**: the request is intersected with the
+   archive's `X_<d>` / `p_cue_<d>` / `p_mis_<d>` keys, the mismatch is printed
+   before the header, and a run whose *main* distances are entirely absent
+   refuses to print a horizon.
+5. **Off-by-one in the context-CE accumulator.** `nxt = seq[:, min(t+1, Dmax)]`
+   meant the final step scored the byte the model had *just consumed* — a
+   trivially high-probability token — dragging the mean down. The step is now
+   skipped and the divisor counts scored positions only.
+6. **The tool claimed the decay histogram "predicts the probe's answer."**
+   Reconciled above: the string is corrected and this retraction now agrees with
+   what the tool prints.
+7. **`INCONCLUSIVE` exits 2, undocumented.** The code is right — it is the tool
+   correctly refusing to call a result — but a `set -e` wrapper treats the
+   primary documented outcome as an error. **Documented rather than changed**:
+   the verdict block now prints the exit code and states that 2 is the
+   documented INCONCLUSIVE status, with the wrapper to use if it matters.
+
+Two more RESULTS.md defects were numbers with **no artifact anywhere in the
+repo**, removed rather than kept: the `1.1893 nats/byte` context CE (the shipped
+log carries the broken `0.0030`; fresh runs read 1.22–1.25 nats/byte at these
+settings) and the four-checkpoint `d=8 accuracy` column. The `0.47% → 0.98%`
+corpus-window sentence and the `3–19%` control-arm span were likewise removed or
+corrected above.
+
+### Not established
+
+- The verdict is **INCONCLUSIVE** and the gate definition is unresolved. This
+  section does **not** close blocker 2 and does not establish "memory exists but
+  is unused" as a property of the model — only that at 8 bytes under a uniform
+  cue (and at 16 bytes under an in-distribution cue) the cue is linearly
+  decodable from the state and the head does not respond to it.
+- **The horizon is a property of the stimulus as much as of the model.** It is
+  8 B under `--cue uniform` and ≥16 B under `--cue corpus-support`, on the same
+  weights. A horizon quoted without its cue distribution is not a measurement.
+  Neither number has been swept beyond two cue distributions; `--cue
+  corpus-freq` exists and warns about its modal baseline but has not been run at
+  scale.
+- A **linear** readout can miss information that is present but not linearly
+  available. That is the main alternative to "the state does not carry it".
+- The probe's threshold is an **amplitude** bound (≈5e-03 relative); every
+  distance row beyond that is UNMEASURED, not null.
+- **The cue is planted first**, so it is always the oldest and most attenuated
+  element of the state — the hardest possible retention case. Deliberate (it is
+  the only way to plant a cue whose presence is not predictable from surface
+  form), and it is a real limitation on the horizon number.
+- One checkpoint family, one training corpus, one stream length, 512 trials. The
+  d=8 result reproduces across 12 fold partitions and 5 independent sweeps
+  (12.73–15.43%, a 2.70-point spread) and the horizon is 8 B in all five. **The
+  horizon number has no CI**, and the `±` printed on any single sweep is
+  within-sweep partition noise, ~1.8× narrower than the between-sweep spread.
+- The `d=16` row is marginal rather than null at the shipped `--cue uniform`
+  settings: stable above control in 4 of 5 sweeps, sign-flipping in 1 of 5.
+- Says nothing about literal-cue induction (#23's domain), obfuscated or
+  parallel-tracking retrieval (never tested by anything in this repo), or
+  language-modelling quality.
+- The saved state snapshots are **248 MB**, not 2.4 GB (`du -h
+  runs/state_probe/sweep_512b.npz` → 248M; the earlier 2.4 GB figure was off by
+  10×). `runs/` and `*.log` are gitignored, so neither the snapshots nor the
+  logs are in git — delete them freely.
