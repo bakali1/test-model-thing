@@ -2915,3 +2915,43 @@ corrected above.
   runs/state_probe/sweep_512b.npz` → 248M; the earlier 2.4 GB figure was off by
   10×). `runs/` and `*.log` are gitignored, so neither the snapshots nor the
   logs are in git — delete them freely.
+
+---
+
+## RETRACTION — the `/B` decay-role "defect" was not a defect; the SGD memory-role finding is an artifact of its own harness (2026-10-05)
+
+This retracts the claim first recorded in `3f2faca` and repeated in the
+ROADMAP and in the "optimizer axis" section above: that the decay rows'
+gradient was "exactly B× too large relative to every other parameter group".
+
+**It was not.** The engine has a single `/B` in the whole backward path and it
+is on the loss (`gpu_port.py:787`); `dWd`, `dW`, `dx` and the decay rows carry
+none. The entire 4,481,793-coordinate gradient buffer is B× the mean gradient,
+**uniformly**. There was never a decay-role asymmetry.
+
+Consequence that matters more than the correction itself: the SGD arm's
+`_gradfix` divided **only** the 16 `.decay` slices by B
+(`scratch-optimizer-study/_derived_gpu_port_sgd.py:1107`), so the decay role
+ran at an effective learning rate **1024× smaller** than every other parameter.
+The result that followed — "σ moved 1e-5 over 30,000 SGD steps; the memory role
+does not train under a magnitude-proportional optimizer; this is an
+ARCHITECTURE question" — is an artifact of that correction. The arm measured
+its own harness.
+
+What stands, restated correctly:
+
+- "Harmless under AdamW" (scale-invariance of `m/√v`) is real, but it is a
+  property of every group, not of the decay role.
+- SNR ~0.05 vs 0.633 frozen — unchanged and unrelated.
+- The decay parameters still did not move in the ladder, but per the strategic
+  review (`docs/reviews/STRATEGIC-REVIEW-2026-10-05.md`) that is because the
+  corpus rewards ≈0.03 nats for any horizon beyond 8 B — not because an
+  optimizer choice froze them.
+
+The reviewer's n-gram measurement, which is the reason to read the rest of the
+strategic review: an order-8 byte n-gram (0 parameters, 8 MB train) scores
+**0.81 nats/byte** on TMT's held-out set against TMT's **1.2094** — the model
+loses to a memorisation table on its own training distribution by 0.40 nats
+using 0.9% of the data, and the CE curve is flat (12 B and 16 B are *worse*
+than 8 B). The ruler cannot see memory; the experimental programme was aimed at
+a bottleneck the corpus does not present.
