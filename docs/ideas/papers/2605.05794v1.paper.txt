@@ -1,0 +1,1387 @@
+ 
+ Revealing Modular Gradient Noise Imbalance in LLMs: Calibrating Adam via Signal-to-Noise Ratio 
+ Report GitHub Issue
+ × 
+ Title: 
+ Content selection saved. Describe the issue below:
+ Description: 
+ Submit without GitHub 
+ Submit in GitHub 
+ arXiv is now an independent nonprofit! 
+ Learn more 
+ × 
+ Back to arXiv 
+ Why HTML? 
+ Report Issue 
+ Back to Abstract 
+ Download PDF 
+ Abstract 
+ 1 Introduction 
+ 2 Related Works 
+ Efficient LLM Optimizers. 
+ Heterogeneity of LLM modules. 
+ Positioning of MoLS . 
+ 3 Motivation 
+ 3.1 The Noise-Damping Deficit in Adam 
+ 3.2 Module-wise Rescaling via SNR 
+ Comparison with Existing Works. 
+ 4 Methodology 
+ One-shot Module-wise SNR Estimation. 
+ Relative Signal-wise Rescaling. 
+ Practical Integration. 
+ 5 Experiments 
+ 5.1 Pre-Training LLaMA Models 
+ Setup. 
+ Baselines. 
+ Main Results. 
+ Scaling up to Pre-Training LLaMA-3B and 7B. 
+ 5.2 Efficient Fine-Tuning 
+ Setup. 
+ Baselines. 
+ Main Results. 
+ 6 Additional Investigations 
+ Pre-Training on GPT and Qwen Architectures. 
+ Pre-Training in the Long-Context Regime. 
+ Pre-Training with Extended Token Budgets. 
+ Comparison with Hand-Tuned Module-Wise Learning Rates. 
+ Ablation Study on Modules. 
+ 7 Conclusion 
+ References 
+ A Experimental Details 
+ B SNR Estimation for Module-wise Scaling 
+ C Empirical Analysis 
+ D Discussion and Future Works 
+ Static Scaling versus Dynamic Adaptation. 
+ Computational Trade-offs of SNR Estimation. 
+ Stability Considerations in Large-Scale Training. 
+ Sensitivity to Sampling and Data Variability. 
+ Theoretical Safety. 
+ Choice of Reference Module. 
+ Relationship to Adaptive Optimizers. 
+ D.1 Future Works 
+ Limitations of Current Design. 
+ Dynamic SNR Re-estimation. 
+ Robust SNR Estimation and Parameter Grouping. 
+ Generalization to Other Optimizers and Architectures. 
+ Reference-Free Normalization and Practical Deployment. 
+ Finer-Grained Module Grouping. 
+ License: CC BY 4.0
+arXiv:2605.05794v1 [cs.LG] 07 May 2026
+ Revealing Modular Gradient Noise Imbalance in LLMs: 
+ Calibrating Adam via Signal-to-Noise Ratio
+ Ziqing Wen
+ Affiliation: College of Computer Science and Technology,
+ Email: {zqwen 
+ Zhouyang Liu
+ Affiliation: College of Computer Science and Technology,
+ Email: liuzhouyang20 
+ Jiahuan Wang
+ Affiliation: College of Computer Science and Technology,
+ Email: luoping 
+ Ping Luo
+ Affiliation: College of Computer Science and Technology,
+ Email: wangjiahuan 
+ Li Shen
+ Affiliation: College of Computer Science and Technology,
+ Email: lishen 
+ Dongsheng Li
+ Affiliation: College of Computer Science and Technology,
+ Email: dsli}@nudt.edu.cn 
+ Tao Sun
+ † † thanks: Corresponding author. 
+ Affiliation: National University of Defense Technology, Changsha, Hunan, China
+ Affiliation: College of Computer Science and Technology,
+ Email: nudtsuntao@163.com 
+ Abstract
+ The impressive performance of large language models (LLMs) arises from their massive scale and heterogeneous module composition. However, this structural heterogeneity introduces additional optimization challenges. While adaptive optimizers such as Adam(W) provide per-parameter adaptivity, they do not explicitly account for module-level gradient heterogeneity, resulting in slower convergence, suboptimal performance, or training instability. Existing approaches typically rely on manually tuned module-specific learning rates or specific optimization strategies, which are computationally costly and difficult to generalize across tasks or models. To establish a more principled approach, we first analyze the noise-damping behavior of Adam in high-noise modules and introduce Module-wise Learning Rate Scaling via SNR ( MoLS ) . MoLS estimates module-level SNRs to scale Adam updates, allowing automated module-wise learning rate allocation without manual tuning. Empirical results through multiple LLM training benchmarks demonstrate that MoLS improves convergence speed and generalization, achieving performance comparable to carefully tuned module-specific learning rates, while remaining compatible with memory-efficient training algorithms.
+ 1 Introduction
+ Large Language Models (LLMs) are built upon functionally distinct modules, typically consisting of stacked Transformer blocks Vaswani et al. (2017) ; Radford et al. (2019) ; Touvron et al. (2023) . This modularity allows for the efficient organization of specialized functional components, such as self-attention and feed-forward networks. By leveraging these functionally diverse modules, LLMs gain the ability to handle complex natural language processing tasks. However, the sheer depth and structural diversity of these modules introduce significant optimization complexities Zhang et al. (2024) . To handle this complexity, adaptive optimization methods, particularly Adam(W) Kingma (2014) ; Loshchilov and Hutter (2017) , are widely used in practice.
+ Despite its effectiveness, Adam’s element-wise adaptivity does not explicitly account for the structural heterogeneity across modules. Some modules exhibit consistently larger or more variable gradients, leading to scale mismatches that Adam’s adaptivity cannot fully correct, resulting in slow convergence or unstable training Li et al. (2025) .
+Recent studies indicate that different modules in LLMs exhibit markedly different gradient and optimization properties Liu et al. (2020) ; Ormaniec et al. (2024) ; Kunstner et al. (2024) ; Zhang et al. (2025) . Building on this heterogeneity, Zeng et al. (2022) and Wang et al. (2025a) have suggested the use of module-specific learning rates in Adam to better accommodate these differences and enhance convergence stability.
+ While these studies recognize the need for module-wise learning rate configuration even with Adam, they provide no principled or quantitative method to determine the specific scaling ratios. As a result, these ratios are treated as hyperparameters, requiring exhaustive grid searches—an approach that is computationally expensive, infeasible for large-scale models, and theoretically ungrounded. Consequently, current methods rely on fixed heuristics that ignore module-specific gradient statistical properties, leading to configurations that are difficult to generalize across tasks or models. In essence, while existing literature recognizes the need for module-wise learning rate scaling, determining optimal magnitudes remains an open, heuristic-driven challenge.
+ Motivated by these limitations and the strong correlation between Adam optimizer updates and gradient signal-to-noise ratio (SNR) Orvieto and Gower (2025) , we analyze the heterogeneity of LLM architectures from the SNR perspective. Our analysis demonstrates that different modules experience systematically imbalanced effective signal strengths, offering a principled explanation for a noise-damping deficit of Adam in heterogeneous architectures that has not been systematically studied. This insight suggests that scaling learning rates according to each module’s SNR could naturally rebalance updates, motivating our approach: Module-wise Learning Rate Scaling via SNR ( MoLS ) . MoLS estimates module-level SNRs during a brief calibration phase and applies the resulting scaling factors to module-wise learning rates. By doing so, MoLS provides an automated, lightweight solution to reduce signal-to-noise imbalance across modules, reducing manual tuning and improving both convergence and generalization. Our main contributions are listed as follows:
+ • 
+ SNR Analysis: We study module-level gradient statistics from the perspective of SNR and analyze how they relate to learning-rate scaling. Compared to prior works that rely on Hessian-based or sharpness-related measures, our analysis reveals systematic imbalances of SNR across LLM modules and offers an interpretable explanation for the noise-dominated behavior observed in high-noise components.
+ • 
+ SNR-Based Scaling Strategy: Based on the SNR analysis, we introduce a learning-rate scaling strategy based on module-wise SNR estimates. SNRs are computed during a short warm-up phase, after which learning rates are gradually adjusted toward their target values. This design avoids loss instability caused by abrupt learning rate scaling, introduces minimal additional computational overhead, and is fully compatible with standard LLM training paradigms.
+ • 
+ Evaluation: We evaluate the effectiveness of our method on a range of LLM benchmarks, where MoLS effectively improves convergence speed and generalization performance. Moreover, MoLS achieves performance
+comparable to manually fine-tuned module-wise learning rates, and is compatible with other memory-efficient methods such as Adam-mini Zhang et al. (2025) and LoRA Hu et al. (2022) .
+ Overall, MoLS provides a statistically grounded and efficient approach to module-wise learning-rate scaling in LLM optimization.
+ 2 Related Works
+ Efficient LLM Optimizers.
+ Adaptive optimizers such as Adam(W) Kingma (2014) ; Loshchilov and Hutter (2017) are commonly used in LLMs training. Existing works primarily focus on improving the performance and memory efficiency of Adam, including Nesterov-style momentum Dozat (2016) , confidence-guided updates You et al. (2020) , parameter-noise–normalized SGD Xu et al. (2024) , matrix-based preconditioners Jordan et al. (2024) ; Vyas et al. (2024) , powered gradients Wang et al. (2025b) , clustering-based learning rates Li et al. (2025) , block-shared normalizers Zhang et al. (2025) , and low-rank projection methods Zhao et al. (2024) ; Zhu et al. (2024) . While effective, these approaches either ignore the heterogeneity among LLM modules or depend on complex optimization strategies.
+ Heterogeneity of LLM modules.
+ LLMs contain multiple functional modules that exhibit pronounced heterogeneity in their optimization characteristics. Zeng et al. (2022) identified a significant inconsistency in the gradient scales between the Embedding and other modules. Zhang et al. (2024) analyzed the block-diagonal structure of the Hessian across LLM modules, revealing substantial variation in curvature statistics. Focusing on self-attention, Ormaniec et al. (2024) examined Hessian blocks corresponding to the Query/Key and Value/Output projections and identified clear differences between these submodules. Building on this, Wang et al. (2025a) analysed the module-wise sharpness in LLMs and argued that heterogeneous modules may benefit from distinct learning rates to accommodate their optimization landscapes. However, assigning module-wise learning rates makes hyperparameter tuning considerably more difficult.
+ Positioning of MoLS .
+ MoLS is complementary to existing adaptive optimizers. Instead of altering Adam’s update rule or introducing computationally expensive approximations, MoLS addresses a comparatively underexplored challenge: the imbalance in effective signal strength across model modules arising from stochastic gradient noise. By estimating module-wise signal-to-noise ratios, MoLS offers a principled and lightweight mechanism for calibrating learning rates at the module level. From this perspective, MoLS serves as an automated and statistically grounded alternative to manual module-wise learning rate tuning.
+ 3 Motivation
+ In this section, we first introduce the update rules of Adam Kingma (2014) and analyze the updates of Adam from a Signal-to-Noise Ratio (SNR) perspective. We subsequently introduce our Module-wise LR Scaling via SNR ( MoLS ) .
+ (a) Pre-training LLaMA-60M on C4. 
+ (b) Pre-training LLaMA-130M on C4. 
+ Figure 1 : SNR variation across modules during training. The SNR variation trends across models of different sizes are similar, with a decrease throughout the training. Throughout the training, the SNR of the VO module remains the highest, and the relative SNR relationships between modules stabilize after the first 1% of iterations. Both the Emb and Head experience considerable noise in the early stages of training. 
+ 3.1 The Noise-Damping Deficit in Adam
+ Adam(W) Kingma (2014) ; Loshchilov and Hutter (2017) has become the standard optimizer for training LLMs. Adam maintains the first and second moments for each parameter element in weight ${\mathbf{w}}$ as follows
+ $\displaystyle{\mathbf{m}}^{t+1}$ 
+ $\displaystyle=\beta_{1}\cdot{\mathbf{m}}^{t}+(1-\beta_{1})\cdot{\mathbf{g}}^{t},$ 
+ (1) 
+ $\displaystyle{\mathbf{v}}^{t+1}$ 
+ $\displaystyle=\beta_{2}\cdot{\mathbf{v}}^{t}+(1-\beta_{2})\cdot{\mathbf{g}}^{\odot 2},$ 
+ where $\beta_{1},\beta_{2}\in[0,1)$ represent the decay rates, and $\odot$ denotes the Hadamard multiplication. Adam updates weight by
+ ${\mathbf{w}}^{t+1}={\mathbf{w}}^{t}-\eta_{t}\cdot\frac{{\mathbf{m}}^{t}}{\sqrt{{\mathbf{v}}^{t}}+\epsilon},$ 
+ (2) 
+ where $\eta_{t}>0$ denotes the learning rate at time step $t$ , and $\epsilon$ is a small constant for numerical stability. The success of the Adam optimizer lies in its ability to normalize gradient scales, allowing for consistent progress across different dimensions of the loss landscape. Ideally, the first-moment estimate ${\mathbf{m}}^{t}$ serves as a proxy for the mean of the gradients, $\mathbb{E}[{\mathbf{g}}]$ , while the second-moment estimate ${\mathbf{v}}^{t}$ approximates the local curvature, corresponding to $\mathbb{E}[{\mathbf{g}}^{\odot 2}]$ Hwang (2024) ; Orvieto and Gower (2025) . However, this interpretation assumes that the second moment predominantly captures the curvature of the loss surface. In the context of stochastic optimization, $\mathbb{E}[{\mathbf{g}}^{\odot 2}]$ can be decomposed into the squared signal and the gradient variance as follows
+ $\mathbb{E}[{\mathbf{g}}^{\odot 2}]=\bm{\mu}^{\odot 2}+\bm{\sigma}^{\odot 2},$ 
+ (3) 
+ where $\bm{\mu}=\mathbb{E}\left[{\mathbf{g}}\right]$ denotes the true gradient signal and $\bm{\sigma}^{2}=\text{Var}({\mathbf{g}})$ represents the stochastic noise.
+ To quantify the impact of noise on optimization, we consider the model parameters as a collection of matrices or tensors $\{{\mathbf{w}}_{m}\}$ , where each module consists of a set of parameters. For a given module ${\mathbf{w}}_{m}$ , we define the Effective Signal Step ( $\mathcal{D}_{m}$ ) as a measure of the module’s optimization efficiency, which reflects the average optimization efficiency across all parameters in the module. Specifically, for any parameter $i$ in module $m$ , the effective signal step $\mathcal{D}_{i}$ at time step $t$ can be defined as
+ $\displaystyle\mathcal{D}_{m,i}$ 
+ $\displaystyle=\mathbb{E}\left[\frac{{\mathbf{m}}_{m,i}^{t}}{\sqrt{{\mathbf{v}}^{t}_{m,i}}+\epsilon}\right]\approx\frac{\bm{\mu}_{m,i}}{\sqrt{\bm{\mu}_{m,i}^{2}+\bm{\sigma}_{m,i}^{2}}}$ 
+ (4) 
+ $\displaystyle=\frac{1}{\sqrt{1+\bm{\sigma}_{m,i}^{2}/\bm{\mu}_{m,i}^{2}}}=\frac{1}{\sqrt{1+1/S_{m,i}}},$ 
+ where $S_{m,i}=\frac{\|\bm{\mu}_{m,i}\|^{2}}{\|\bm{\sigma}_{m,i}\|^{2}}$ represents the SNR for the $i$ -th parameter, with $\bm{\mu}_{m,i}$ and $\bm{\sigma}_{m,i}$ representing the expected gradient and variance for parameter $i$ , respectively. The behavior of $\mathcal{D}_{m,i}$ characterizes how Adam adaptively scales updates based on the local signal integrity. To build intuition, we examine two limiting cases:
+ • 
+ High SNR Regime ( $S_{m,i}\to\infty$ ): When the signal dominates the noise, $\mathcal{D}_{m,i}$ approaches $1$ . In this case, the update term ${\mathbf{M}}/\sqrt{{\mathbf{V}}}$ simplifies to $\sign(\bm{\mu})$ , and Adam effectively aligns with Sign Gradient Descent (SignGD) Bernstein et al. (2018) . This observation is consistent with prior findings that sign-based methods can match Kunstner et al. (2023) or even outperform Chen et al. (2023) Adam in certain settings.
+ • 
+ Low SNR Regime ( $S_{m,i}\to 0$ ): Conversely, when noise overwhelms the signal where $\bm{\sigma}_{m,i}\gg\bm{\mu}_{m,i}$ , $\mathcal{D}_{m,i}$ collapses towards $\sqrt{S_{m,i}}$ . Here, the update magnitude is heavily suppressed by the variance in the denominator, leading to an unintended noise-damping effect.
+ In practice, the SNR of different model components varies substantially over the course of training. In the early stages, update directions tend to be more stable, with stronger signal components and higher effective SNR. Later in training, as gradient magnitudes shrink and stochastic fluctuations become comparable to the signal, the SNR typically decreases. This shift is consistent with a transition from rapid progress to fine-grained convergence.
+ 3.2 Module-wise Rescaling via SNR
+ To estimate the dynamic changes in SNR across different modules in LLM training, we group parameters by functionality (Embedding, Head, Query/Key, Value/Output, MLP) and estimate the average SNR for each module as follows
+ $S_{m}=\frac{1}{|{\mathbf{w}}_{m}|}\sum_{i=1}^{|{\mathbf{w}}_{m}|}S_{m,i},$ 
+ where $m\in\{\text{Emb, Head, QK, VO, MLP}\}$ and $|{\mathbf{w}}_{m}|$ denotes the number of parameters in ${\mathbf{w}}_{m}$ . This grouping covers 99% of the trainable parameters in LLMs, and because parameters within the same module share similar properties, the resulting module-level average SNR remains statistically meaningful.
+ This empirical analysis uncovers a pronounced imbalance in SNR across different Transformer modules (Figure 1 , and Figure 7 in Appendix). At a global level, the SNR of all modules exhibits a gradual decline over the course of training, indicating that optimization is approaching convergence and that the loss landscape has transitioned into a relatively flat region. Despite this shared trend, substantial disparities emerge across modules, particularly during the early stages of training. The attention components, such as the Q/K and V/O, as well as the MLP blocks consistently operate in a high-SNR regime, enabling gradient updates that are largely sign-consistent and dominated by informative signals. By contrast, the embedding layers and the output head display significantly lower SNR values, remaining below $0.1$ even at initialization. As a result, Adam’s updates become noise-dominated and tend toward ${\sqrt{S_{m}}}$ .
+ This disparity implies that under a global learning rate $\eta_{t}$ , the Embedding and Head layers are being ”left behind” because their effective signal contribution is severely attenuated compared to the VO baseline. To resolve this structural imbalance, we propose the Relative Signal-wise Equilibrium principle: the effective signal contribution of every module should be rescaled to match the baseline established by the healthy reference module.
+ Considering that the damping factor in Adam follows an inverse square root relationship with SNR (i.e., $\mathcal{D}_{m}\propto\sqrt{S_{m}}$ ), we define the Relative Rescaling Factor ( $\alpha_{m}$ ) as
+ $\alpha_{m}=\frac{1/\sqrt{S_{m}}}{1/\sqrt{S_{base}}}=\sqrt{\frac{S_{base}}{S_{m}}}.$ 
+ (5) 
+ In this framework, the reference module’s scaling factor $\alpha_{base}$ is naturally anchored to $1.0$ , while noise-heavy modules with $S_{m} 1 .
+ Comparison with Existing Works.
+ Wang et al. (2025a) studied sharpness heterogeneity across LLM modules and showed that module-wise learning rates can speed up training, but left tuning guidelines unspecified, requiring manual adjustment. Similarly, Li et al. (2025) examined intra-layer heterogeneity and proposed clustering-based scaling. Crucially, MoLS eliminates the need for clustering heuristics or hyperparameter tuning, offering a fully automated and principled solution for module-wise learning rate configuration.
+ 4 Methodology
+ In this section, we present our practical methodology, building directly upon the module-wise SNR analysis in the previous section. Our goal is to correct the structural imbalance in Adam’s effective updates across Transformer modules using a lightweight and scalable calibration, without introducing dynamic overhead or instability. We refer to our approach as Module-wise LR Scaling via SNR ( MoLS ) . We design the method with the following considerations:
+ • 
+ Computation cost: Dynamic SNR estimation during training is computationally expensive for LLMs.
+ • 
+ Training stability: Sudden changes in learning rate or update can destabilize LLM training, causing spikes in the loss. This requires additional transition intervals to smooth the change of the learning rate.
+ • 
+ Empirical observation: We observe empirically that after the first 1% of training steps, module-level SNR magnitudes tend to stabilize, which motivates a one-shot estimation during warm-up followed by smooth scaling of module learning rates.
+ One-shot Module-wise SNR Estimation.
+ We perform a one-shot module-wise SNR estimation using a small set of additional samples during the warm-up phase for each module. The estimated SNRs are then used to compute the relative scaling factors for each module.
+ Relative Signal-wise Rescaling.
+ Let $m_{\text{base}}$ denote a reference module with high SNR (e.g., the module with the largest estimated SNR during warm-up). For module $m$ , the scaling factor is defined in equation 5 .
+This factor is applied multiplicatively to the global learning rate. Once determined, the factors remain fixed for the remainder of training.
+ Practical Integration.
+ The method does not modify Adam’s internal updates and incurs negligible overhead. By distributing the scaling smoothly over the remaining warm-up steps, we avoid abrupt learning rate changes, ensuring stable training for large-scale LLMs.
+ 5 Experiments
+ In this section, we experimentally validate the effectiveness
+of our proposed method, focusing on both pre-training and
+fine-tuning tasks. Detailed descriptions of experimental settings can be found in the Appendix.
+ 5.1 Pre-Training LLaMA Models
+ We show that MoLS can be incorporated into the Adam-style optimizer in a plug-and-play manner while incurring negligible computational overhead. Across different pre-training datasets and models up to 7B parameters, MoLS achieves faster convergence and lower perplexity compared to the baselines.
+ (a) LLaMA-60M 
+ (b) LLaMA-130M 
+ (c) LLaMA-350M 
+ Figure 2 : PPL curves for pre-training LLaMA-60M to 350M on OpenWebText dataset. MoLS outperforms the finely-tuned baselines while maintaining a higher convergence rate. 
+ Setup.
+ All experiments use BF16 precision to save GPU memory, and we follow the same LLaMA model settings as those reported by Zhao et al. (2024) . The default sequence length is set to 256, with a total batch size of 512, and a gradient clipping of 1.0. We apply linear warmup over the first 10% of training steps and cosine decay for the remainder. We evaluate the effectiveness of MoLS under two settings: full-rank pre-training on C4 Raffel et al. (2020) and OpenWebText Gokaslan et al. (2019) dataset, where we apply MoLS on Adam. The other setting is memory-efficient pre-training on C4, where MoLS is applied on Adam-mini.
+ Baselines.
+ We consider a range of open-source LLM pre-training optimizers as baselines, including Adam Kingma (2014) ; Loshchilov and Hutter (2017) , which is the standard optimizer used in LLM training. NAdam Dozat (2016) , the Nesterov-accelerated version of Adam. LAMB You et al. (2020) , an Adam variant with layer-wise adaptive scaling. Muon Jordan et al. (2024) ; Liu et al. (2025) , an SGD-with-momentum variant incorporating Newton–Schulz iterations. Furthermore, we evaluate a set of memory-efficient optimizers, including Adam-mini Zhang et al. (2025) , an Adam variant with block-wise second-moment storage, GaLore Zhao et al. (2024) , and APOLLO Zhu et al. (2024) . For a fair comparison, all methods adopt an identical learning rate search strategy, exploring the range
+ $\{1\mathrm{e}{-4},2.5\mathrm{e}{-4},5\mathrm{e}{-4},1\mathrm{e}{-3},2.5\mathrm{e}{-3},5\mathrm{e}{-3},1\mathrm{e}{-2},2.5\mathrm{e}{-2}\}$ .
+We provide the full set of hyperparameters in the appendix.
+ Methods 
+ 60M 
+ 130M 
+ 350M 
+ 1.3B 
+ Pre-training with Full-Rank Optimizers 
+ Adam 
+ 29.55 ±.02 
+ 22.82 ±.00 
+ 17.25 ±.00 
+ 14.51 ±.00 
+ NAdam 
+ 28.95 ±.04 
+ 22.42 ±.02 
+ 16.76 ±.00 
+ 15.06 ±.00 
+ LAMB 
+ 28.39 ±.11 
+ 22.30 ±.05 
+ 16.69 ±.05 
+ 13.74 ±.00 
+ Muon 
+ 28.99 ±.03 
+ 22.73 ±.01 
+ 17.23 ±.01 
+ 14.29 ±.00 
+ Adam+ MoLS 
+ 28.48 ±.10 
+ 21.94 ±.06 
+ 16.41 ±.03 
+ 13.45 ±.00 
+ $\Delta$ Reduction 
+ -1.07 
+ -0.88 
+ -0.84 
+ -1.06 
+ Pre-training with Memory-efficient Optimizers 
+ Adam-mini 
+ 29.63 ±0.5 
+ 23.73 ±.01 
+ 17.83 ±.01 
+ 15.10 ±.00 
+ GaLore 
+ 33.24 ±.03 
+ 25.22 ±.02 
+ 18.67 ±.01 
+ 14.90 ±.00 
+ APOLLO 
+ 29.92 ±.15 
+ 22.86 ±.20 
+ 16.66 ±.07 
+ 14.20 ±.00 
+ Adam-mini+ MoLS 
+ 28.49 ±.07 
+ 21.91 ±.07 
+ 16.86 ±.03 
+ 13.57 ±.00 
+ $\Delta$ Reduction 
+ -1.14 
+ -1.82 
+ -0.97 
+ -1.53 
+ Training Tokens 
+ $1.1$ B 
+ $2.2$ B 
+ $6.4$ B 
+ $13.1$ B 
+ Table 1 : Final validation PPL (lower is better, 3 independent runs for 60M to 350M models) for pre-training LLaMA models on the C4 dataset. Bold and green types denote the best results and PPL reduction $\downarrow$ of MoLS ( blue background ).
+ Main Results.
+ We report the final validation perplexity (PPL) of LLaMA models ranging from 60M to 1.3B parameters on the C4 dataset in Table 1 and $\alpha_{m}$ in the Appendix. We further compare the wall-clock training time of Adam and Adam + MoLS , from which several observations emerge. First, MoLS consistently achieves lower final validation PPL than all evaluated baselines, yielding up to a $1.06$ PPL reduction over Adam on the 1.3B model. Second, MoLS introduces negligible computational overhead. As shown in Table 2 , the additional cost incurred by SNR estimation accounts for less than $2\%$ of the total training time, making the overhead effectively negligible. Moreover, since SNR estimation is performed on the CPU, MoLS introduces no additional GPU memory overhead. Third, MoLS delivers approximately $1.2\times$ to $1.4\times$ speedup over Adam with tuned hyperparameters and exhibits faster early-stage convergence compared to LAMB. Finally, MoLS is fully compatible with memory-efficient optimizers such as Adam-mini, reducing the final PPL by $1.53$ on the 1.3B model. Together, these results demonstrate the effectiveness, efficiency, and broad applicability of MoLS across model scales and optimization settings.
+ Methods 
+ PPL 
+ Training Time (h) 
+ Adam 
+ 14.51 
+ 54.18 
+ Adam + MoLS 
+ 13.45( +7.30% ) 
+ 55.08( +1.66% ) 
+ Adam-mini 
+ 15.10 
+ 53.10 
+ Adam-mini + MoLS 
+ 13.57( +10.1% ) 
+ 54.01( +1.71% ) 
+ Table 2 : Gains vs Costs. Relative gains $\uparrow$ in final PPL and costs $\downarrow$ in total training time on pre-training LLaMA-1.3B. 
+ Scaling up to Pre-Training LLaMA-3B and 7B.
+ We validate MoLS on 8-bit Adam Dettmers et al. (2021) for pre-training LLaMA-3B and 7B models with gradient checkpointing to save memory. Owing to limited computational resources, we do not include Nadam, LAMB, and Adam-mini in this experiment, and present the validation PPL across training steps in Table 3 . Our MoLS reduces the final PPL by 1.12 on LLaMA-3B and 1.69 on 7B. This effectively validates the effectiveness of MoLS on large-scale LLMs.
+ Methods 
+ 30K 
+ 60K 
+ 90K 
+ 120K 
+ 150K 
+ Pre-training LLaMA-3B 
+ 8-bit Adam 
+ 18.63 
+ 15.69 
+ 14.36 
+ 14.19 
+ - 
+ Muon 
+ 18.14 
+ 15.40 
+ 14.13 
+ 14.02 
+ - 
+ GaLore 
+ 18.44 
+ 15.98 
+ 14.90 
+ 14.73 
+ - 
+ APOLLO 
+ 19.49 
+ 15.40 
+ 14.09 
+ 13.75 
+ - 
+ 8-bit Adam + MoLS 
+ 17.81 
+ 14.51 
+ 13.26 
+ 13.07 
+ - 
+ Pre-training LLaMA-7B 
+ 8-bit Adam 
+ 18.73 
+ 16.13 
+ 14.56 
+ 13.40 
+ 13.23 
+ Muon 
+ 18.16 
+ 15.71 
+ 13.87 
+ 13.23 
+ 13.19 
+ GaLore 
+ 18.35 
+ 15.63 
+ 14.33 
+ 13.77 
+ 13.69 
+ APOLLO 
+ 18.49 
+ 15.17 
+ 13.54 
+ 12.80 
+ 12.63 
+ 8-bit Adam + MoLS 
+ 16.22 
+ 13.77 
+ 12.34 
+ 11.70 
+ 11.54 
+ Table 3 : Pre-training LLaMA-3B and LLaMA-7B models on the C4 dataset with gradient checkpointing. 
+ 5.2 Efficient Fine-Tuning
+ Method 
+ WG 
+ PIQA 
+ SIQA 
+ OBQA 
+ HS 
+ BoolQ 
+ Arc-E 
+ Arc-C 
+ Avg. 
+ Adam 
+ 68.19 
+ 76.12 
+ 72.36 
+ 69.00 
+ 69.19 
+ 64.34 
+ 72.22 
+ 55.12 
+ 68.07 
+ NAdam 
+ 67.91 
+ 76.20 
+ 70.77 
+ 68.21 
+ 69.03 
+ 63.77 
+ 73.31 
+ 55.20 
+ 68.05 
+ Lamb 
+ 68.33 
+ 74.81 
+ 71.56 
+ 69.07 
+ 68.21 
+ 64.00 
+ 71.48 
+ 54.92 
+ 67.79 
+ Muon 
+ 70.21 
+ 76.34 
+ 71.90 
+ 68.89 
+ 69.31 
+ 64.51 
+ 72.15 
+ 55.14 
+ 68.55 
+ Adam + MoLS 
+ 70.47 
+ 77.61 
+ 72.41 
+ 70.33 
+ 69.18 
+ 64.40 
+ 73.73 
+ 55.36 
+ 69.18 
+ Table 4 : Evaluation results on Llama-3.2-1B for common-sense reasoning tasks. 
+ In this section, we validate our method on LLM downstream tasks. We show that MoLS remains effective on these downstream tasks and is compatible with LoRA Hu et al. (2022) .
+ Setup.
+ We employ four open-source pre-trained models in the fine-tuning experiments, including LLaMA-3.2-1B/3B Grattafiori et al. (2024) , Gemma3-1B Team et al. (2025) , and Qwen2.5-7B Qwen et al. (2024) . The downstream tasks are divided into two categories: SFT on 8 common-sense reasoning tasks, including Winogrande (WG) Sakaguchi et al. (2021) ,
+PIQA Bisk et al. (2020) , SIQA Sap et al. (2019) , Open-BookQA (OBQA) Mihaylov et al. (2018) , HellaSwag
+(HS) Zellers et al. (2019) , BoolQ Clark et al. (2019) , and ARC (ARC-Easy and ARC-Challenge) Clark et al. (2018) . The experimental setup follows Zhu et al. (2024) ; PEFT on MMLU Hendrycks et al. (2020) tasks, the implementation follows Zheng et al. (2024) .
+ Baselines.
+ For the common-sense reasoning tasks, we compare against full-parameter baselines used in Section 5.1 . For PEFT experiments, we include Full-Adam, LoRA Hu et al. (2022) , GaLore, and APOLLO as representative baselines.
+ Main Results.
+ The SFT results are reported in Table 4 , while the MMLU accuracies under PEFT are summarized in Table 5 . Across common-sense reasoning benchmarks, MoLS consistently matches or outperforms all baselines, achieving up to a $1.11$ average accuracy improvement over Adam. Furthermore, MoLS integrates seamlessly with LoRA, yielding additional accuracy gains on MMLU and underscoring the versatility and robustness of the proposed approach.
+ Models 
+ Methods 
+ STEM 
+ Soc. 
+ Hum. 
+ Other 
+ Avg. 
+ Gemma3-1B 
+ Full 
+ 27.63 
+ 26.84 
+ 25.12 
+ 25.14 
+ 26.04 
+ LoRA 
+ 26.61 
+ 25.93 
+ 24.78 
+ 25.02 
+ 25.48 
+ GaLore 
+ 27.40 
+ 26.71 
+ 24.80 
+ 25.69 
+ 25.99 
+ APOLLO 
+ 27.47 
+ 27.14 
+ 25.61 
+ 25.76 
+ 26.38 
+ LoRA + MoLS 
+ 27.51 
+ 26.96 
+ 25.67 
+ 25.49 
+ 26.31 
+ LLaMA3.2-3B 
+ Full 
+ 46.55 
+ 65.81 
+ 49.16 
+ 63.17 
+ 55.48 
+ LoRA 
+ 47.22 
+ 63.41 
+ 49.56 
+ 61.57 
+ 54.86 
+ GaLore 
+ 46.62 
+ 65.58 
+ 48.37 
+ 63.33 
+ 55.22 
+ APOLLO 
+ 46.16 
+ 65.91 
+ 49.03 
+ 62.80 
+ 55.29 
+ LoRA + MoLS 
+ 47.34 
+ 65.77 
+ 49.61 
+ 62.41 
+ 55.62 
+ Qwen2.5-7B 
+ Full 
+ OOM 
+ - 
+ LoRA 
+ 67.69 
+ 82.91 
+ 66.29 
+ 75.72 
+ 72.41 
+ GaLore 
+ 68.32 
+ 82.87 
+ 66.08 
+ 76.10 
+ 72.55 
+ APOLLO 
+ 68.49 
+ 82.97 
+ 65.80 
+ 76.65 
+ 72.65 
+ LoRA + MoLS 
+ 68.71 
+ 82.87 
+ 66.41 
+ 77.21 
+ 73.01 
+ Table 5 : PEFT results on MMLU tasks (1 A100 40GB GPU). We report the best accuracy obtained by sweeping the learning rate with the range $\{1\mathrm{e}{-5},\ 2.5\mathrm{e}{-5},\ 5\mathrm{e}{-5},\ 1\mathrm{e}{-4},\ 1.5\mathrm{e}{-4},\ 2\mathrm{e}{-4}\}$ . 
+ 6 Additional Investigations
+ In this section, we present a set of supplementary empirical studies aimed at further evaluating the robustness and generalization of MoLS . Specifically, our analysis covers the following aspects: (i) pre-training on alternative model architectures, including GPT-2 Radford et al. (2019) and Qwen2.5 Qwen et al. (2024) ; (ii) pre-training with extended sequence lengths; (iii) pre-training with larger training token budgets; (iv) comparisons against manually tuned module-level learning rates; and (v) ablation studies examining the role of SNR across different model modules. Moreover, we provide a training loss analysis and ablation studies on SNR estimation samples in the Appendix.
+ Pre-Training on GPT and Qwen Architectures.
+ To further assess the generality of our approach, we extend our experiments beyond the LLaMA family and pretrain GPT-2 Radford et al. (2019) and Qwen2.5 Qwen et al. (2024) models on the C4 dataset. The quantitative results are summarized in Table 6 . Across both architectures, MoLS consistently achieves lower final validation PPL. These results demonstrate that MoLS is not specific to a particular model family, but is broadly effective across diverse architectures.
+ Methods 
+ GPT2-125M 
+ GPT2-355M 
+ Qwen2.5-350M 
+ Adam 
+ 31.09 
+ 22.19 
+ 16.87 
+ NAdam 
+ 30.26 
+ 21.55 
+ 16.48 
+ LAMB 
+ 30.50 
+ 21.70 
+ 16.72 
+ Muon 
+ 30.26 
+ 22.39 
+ 16.78 
+ Adam+ MoLS 
+ 29.65 
+ 21.66 
+ 16.34 
+ Training Tokens 
+ 1.1B 
+ 2.2B 
+ 6.4B 
+ Table 6 : Final validation PPL for pre-training GPT/Qwen on C4.
+ Figure 3 : Final validation loss for pre-training LLaMA-130M on C4 by hand-tuned module-wise learning rate of Adam. We tune $lr_{\text{base}},\alpha_{\text{MLP}},$ and $\alpha_{\text{others}}$ . Our MoLS achieves a final validation loss of 3.088, which is close to the optimal value (3.074). 
+ Pre-Training in the Long-Context Regime.
+ Long-context modeling is essential for effective reasoning in large language models, yet training with extended sequence lengths is more susceptible to optimization instabilities such as gradient explosion or vanishing. To examine the robustness of our method in this regime, we evaluate its performance under long-context pre-training. Specifically, we pretrain a LLaMA-130M model using a sequence length of 1024, while keeping other experimental settings identical to Section 5.1 . The resulting validation PPL learning curves are presented in Figure 4 . As shown, MoLS consistently outperforms the baselines even in the long-context setting, highlighting its robustness and effectiveness for large-scale LLM pre-training.
+ Figure 4 : Pre-training LLaMA-130M with context length of 1024. 
+ Pre-Training with Extended Token Budgets.
+ Because MoLS applies module-wise learning-rate scaling, certain components are trained with larger effective learning rates, which could render comparisons at a fixed number of training iterations potentially unfair. To mitigate this concern, we evaluate all baseline methods under extended training schedules, ensuring that optimizers with smaller learning rates are afforded a sufficient number of optimization steps. Concretely, we pretrain LLaMA-130M for 100k iterations, corresponding to approximately $5\times$ the number of training tokens recommended by the Chinchilla scaling law Hoffmann et al. (2022) . The resulting performance curves are reported in Figure 5 . Even under prolonged training with substantially increased token budgets, MoLS consistently maintains a clear advantage. These results indicate that the observed gains are not an artifact of faster early optimization, but persist over long training horizons, effectively alleviating concerns about insufficient optimization steps for the baselines.
+ Figure 5 : Pre-training LLaMA-130M on 5× Chinchilla tokens. 
+ Comparison with Hand-Tuned Module-Wise Learning Rates.
+ Our approach introduces an adaptive learning rate at the module level. To assess whether the resulting scaling is competitive with carefully selected alternatives, we compare against manually tuned module-wise learning rates as a baseline. Owing to the prohibitive computational cost of exhaustive hyperparameter search, we restrict the manual tuning to a small set of parameter groups guided by prior empirical findings.
+Specifically, we set a base learning rate for the QK and VO modules as
+ $lr_{\text{base}}\in\{1\mathrm{e}{-3},\,2.5\mathrm{e}{-3},\,5\mathrm{e}{-3}\}.$ 
+The learning rate for the MLP modules is defined as a multiple of the base rate,
+ $lr_{\text{mlp}}=\alpha_{\text{mlp}}\cdot lr_{\text{base}},\ \alpha_{\text{mlp}}\in\{0.25,\,0.5,\,1.0,\,2.0,\,5.0\},$ 
+while the remaining modules (e.g., embeddings and output head) use
+ $lr_{\text{others}}=\alpha_{\text{others}}\cdot lr_{\text{base}},\ \alpha_{\text{others}}\in\{1.0,\,2.0,\,5.0,\,10.0,\,20.0\}.$ 
+The results are summarized in Figure 3 . Overall, our method outperforms the majority of manually tuned configurations and achieves performance close to the best hand-selected setting.
+ Ablation Study on Modules.
+ We conduct ablation experiments on module-scaling configurations, using different grouping strategies to pretrain LLaMA-130M for SNR estimation; the results are shown in Table 7 . We can see that finer-grained grouping leads to better improvements.
+ Grouping strategies 
+ Loss 
+ Reduction 
+ Vanilla 
+ 3.127 
+ - 
+ Attn, MLP 
+ 3.139 
+ +0.012 
+ Attn, MLP, Emb 
+ 3.103 
+ - 0.024 
+ QK, VO, MLP, Emb 
+ 3.092 
+ - 0.035 
+ QK, VO, MLP, Emb, Head 
+ 3.088 
+ - 0.039 
+ Table 7 : Ablation study on grouping strategies for pre-training LLaMA-130M on C4. 
+ 7 Conclusion
+ In this paper, we propose Module-wise Learning Rate Scaling via SNR ( MoLS ) , a plug-and-play, automated module-wise learning rate calibration method for large language models that addresses the excessive suppression of effective update magnitudes in low SNR modules under Adam-based optimizers.
+ MoLS estimates the SNR of each functional module during a brief warm-up phase and applies module-level scaling to align the effective updates of noise-dominated modules with those of high-SNR reference modules, such as value/output projections.
+Importantly, MoLS introduces no additional hyperparameters and enables principled module-wise learning rate allocation without manual tuning. Extensive experiments on both pre-training and supervised fine-tuning across multiple model families demonstrate that the scaling factors estimated by MoLS closely match manually optimized module-wise learning rates, leading to improved convergence speed and generalization.
+Furthermore, MoLS is compatible with memory-efficient optimizers such as Adam-mini, making it suitable for large-scale and resource-constrained training settings.
+Overall, MoLS provides a simple yet effective mechanism for correcting structural optimization imbalances in Transformer-based models and highlights the importance of accounting for gradient noise when designing optimization strategies for LLMs.
+ Acknowledgements
+ Tao Sun is supported in part by the National Natural Science Foundation of China (Grant Nos. 62522610, 62376278), and NUDT Foundational Research Funding (JS25-02).
+ References
+ Bernstein et al. (2018) 
+ J. Bernstein, Y. Wang, K. Azizzadenesheli, and A. Anandkumar 
+ SignSGD: compressed optimisation for non-convex problems .
+ In International conference on machine learning ,
+ pp. 560–569 .
+ Cited by: 1st item .
+ Bisk et al. (2020) 
+ Y. Bisk, R. Zellers, J. Gao, Y. Choi, et al. 
+ Piqa: reasoning about physical commonsense in natural language .
+ In Proceedings of the AAAI conference on artificial intelligence ,
+ Vol. 34 , pp. 7432–7439 .
+ Cited by: §5.2 .
+ Chen et al. (2023) 
+ X. Chen, C. Liang, D. Huang, E. Real, K. Wang, H. Pham, X. Dong, T. Luong, C. Hsieh, Y. Lu, et al. 
+ Symbolic discovery of optimization algorithms .
+ Advances in neural information processing systems 36 , pp. 49205–49233 .
+ Cited by: Appendix C ,
+ 1st item .
+ Clark et al. (2019) 
+ C. Clark, K. Lee, M. Chang, T. Kwiatkowski, M. Collins, and K. Toutanova 
+ Boolq: exploring the surprising difficulty of natural yes/no questions .
+ arXiv preprint arXiv:1905.10044 .
+ Cited by: §5.2 .
+ Clark et al. (2018) 
+ P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick, and O. Tafjord 
+ Think you have solved question answering? try arc, the ai2 reasoning challenge .
+ arXiv preprint arXiv:1803.05457 .
+ Cited by: §5.2 .
+ Dettmers et al. (2021) 
+ T. Dettmers, M. Lewis, S. Shleifer, and L. Zettlemoyer 
+ 8-bit optimizers via block-wise quantization .
+ arXiv preprint arXiv:2110.02861 .
+ Cited by: §5.1 .
+ Dozat (2016) 
+ T. Dozat 
+ Incorporating nesterov momentum into adam .
+ Cited by: §2 ,
+ §5.1 .
+ Gokaslan et al. (2019) 
+ A. Gokaslan, V. Cohen, E. Pavlick, and S. Tellex 
+ OpenWebText corpus .
+ Note: http://Skylion007.github.io/OpenWebTextCorpus 
+ Cited by: §5.1 .
+ Grattafiori et al. (2024) 
+ A. Grattafiori, A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman, A. Mathur, A. Schelten, A. Vaughan, et al. 
+ The llama 3 herd of models .
+ arXiv preprint arXiv:2407.21783 .
+ Cited by: §5.2 .
+ Hendrycks et al. (2020) 
+ D. Hendrycks, C. Burns, S. Basart, A. Zou, M. Mazeika, D. Song, and J. Steinhardt 
+ Measuring massive multitask language understanding .
+ arXiv preprint arXiv:2009.03300 .
+ Cited by: §5.2 .
+ Hoffmann et al. (2022) 
+ J. Hoffmann, S. Borgeaud, A. Mensch, E. Buchatskaya, T. Cai, E. Rutherford, D. d. L. Casas, L. A. Hendricks, J. Welbl, A. Clark, et al. 
+ Training compute-optimal large language models .
+ arXiv preprint arXiv:2203.15556 .
+ Cited by: §6 .
+ Hu et al. (2022) 
+ E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen, et al. 
+ Lora: low-rank adaptation of large language models. .
+ ICLR 1 ( 2 ), pp. 3 .
+ Cited by: 3rd item ,
+ §5.2 ,
+ §5.2 .
+ Hwang (2024) 
+ D. Hwang 
+ FAdam: adam is a natural gradient optimizer using diagonal empirical fisher information .
+ arXiv preprint arXiv:2405.12807 .
+ Cited by: §3.1 .
+ Jordan et al. (2024) 
+ K. Jordan, Y. Jin, V. Boza, Y. Jiacheng, F. Cesista, L. Newhouse, and J. Bernstein 
+ Muon: an optimizer for hidden layers in neural networks .
+ External Links: Link 
+ Cited by: §2 ,
+ §5.1 .
+ Kingma (2014) 
+ D. P. Kingma 
+ Adam: a method for stochastic optimization .
+ arXiv preprint arXiv:1412.6980 .
+ Cited by: §1 ,
+ §2 ,
+ §3.1 ,
+ §3 ,
+ §5.1 .
+ Kunstner et al. (2023) 
+ F. Kunstner, J. Chen, J. W. Lavington, and M. Schmidt 
+ Noise is not the main factor behind the gap between sgd and adam on transformers, but sign descent might be .
+ arXiv preprint arXiv:2304.13960 .
+ Cited by: 1st item .
+ Kunstner et al. (2024) 
+ F. Kunstner, A. Milligan, R. Yadav, M. Schmidt, and A. Bietti 
+ Heavy-tailed class imbalance and why adam outperforms gradient descent on language models .
+ Advances in Neural Information Processing Systems 37 , pp. 30106–30148 .
+ Cited by: §1 .
+ Li et al. (2025) 
+ S. Li, J. Tian, Z. Wang, X. Jin, Z. Liu, W. Zhang, and D. Xu 
+ Taming llms by scaling learning rates with gradient grouping .
+ arXiv preprint arXiv:2506.01049 .
+ Cited by: Appendix C ,
+ §1 ,
+ §2 ,
+ §3.2 .
+ Liu et al. (2025) 
+ J. Liu, J. Su, X. Yao, Z. Jiang, G. Lai, Y. Du, Y. Qin, W. Xu, E. Lu, J. Yan, et al. 
+ Muon is scalable for llm training .
+ arXiv preprint arXiv:2502.16982 .
+ Cited by: §5.1 .
+ Liu et al. (2020) 
+ L. Liu, X. Liu, J. Gao, W. Chen, and J. Han 
+ Understanding the difficulty of training transformers .
+ arXiv preprint arXiv:2004.08249 .
+ Cited by: §1 .
+ Liu et al. (2024) 
+ S. Liu, C. Wang, H. Yin, P. Molchanov, Y. F. Wang, K. Cheng, and M. Chen 
+ Dora: weight-decomposed low-rank adaptation .
+ In Forty-first International Conference on Machine Learning ,
+ Cited by: Appendix A .
+ Loshchilov and Hutter (2017) 
+ I. Loshchilov and F. Hutter 
+ Decoupled weight decay regularization .
+ arXiv preprint arXiv:1711.05101 .
+ Cited by: §1 ,
+ §2 ,
+ §3.1 ,
+ §5.1 .
+ Mihaylov et al. (2018) 
+ T. Mihaylov, P. Clark, T. Khot, and A. Sabharwal 
+ Can a suit of armor conduct electricity? a new dataset for open book question answering .
+ arXiv preprint arXiv:1809.02789 .
+ Cited by: §5.2 .
+ Ormaniec et al. (2024) 
+ W. Ormaniec, F. Dangel, and S. P. Singh 
+ What does it mean to be a transformer? insights from a theoretical hessian analysis .
+ arXiv preprint arXiv:2410.10986 .
+ Cited by: §1 ,
+ §2 .
+ Orvieto and Gower (2025) 
+ A. Orvieto and R. M. Gower 
+ In search of adam’s secret sauce .
+ In The Thirty-ninth Annual Conference on Neural Information Processing Systems ,
+ External Links: Link 
+ Cited by: §1 ,
+ §3.1 .
+ Paszke et al. (2017) 
+ A. Paszke, S. Gross, S. Chintala, G. Chanan, E. Yang, Z. DeVito, Z. Lin, A. Desmaison, L. Antiga, and A. Lerer 
+ Automatic differentiation in pytorch .
+ In NIPS-W ,
+ Cited by: Appendix A .
+ Qwen et al. (2024) 
+ Qwen, A. Yang, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Li, D. Liu, and F. Huang 
+ Qwen2.5 technical report .
+ Cited by: §5.2 ,
+ §6 ,
+ §6 .
+ Radford et al. (2019) 
+ A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever, et al. 
+ Language models are unsupervised multitask learners .
+ OpenAI blog 1 ( 8 ), pp. 9 .
+ Cited by: §1 ,
+ §6 ,
+ §6 .
+ Raffel et al. (2020) 
+ C. Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang, M. Matena, Y. Zhou, W. Li, and P. J. Liu 
+ Exploring the limits of transfer learning with a unified text-to-text transformer .
+ Journal of machine learning research 21 ( 140 ), pp. 1–67 .
+ Cited by: §5.1 .
+ Sakaguchi et al. (2021) 
+ K. Sakaguchi, R. L. Bras, C. Bhagavatula, and Y. Choi 
+ Winogrande: an adversarial winograd schema challenge at scale .
+ Communications of the ACM 64 ( 9 ), pp. 99–106 .
+ Cited by: §5.2 .
+ Sap et al. (2019) 
+ M. Sap, H. Rashkin, D. Chen, R. LeBras, and Y. Choi 
+ Socialiqa: commonsense reasoning about social interactions .
+ arXiv preprint arXiv:1904.09728 .
+ Cited by: §5.2 .
+ Shazeer and Stern (2018) 
+ N. Shazeer and M. Stern 
+ Adafactor: adaptive learning rates with sublinear memory cost .
+ In International Conference on Machine Learning ,
+ pp. 4596–4604 .
+ Cited by: Appendix C .
+ Team et al. (2025) 
+ G. Team, A. Kamath, J. Ferret, S. Pathak, N. Vieillard, R. Merhej, S. Perrin, T. Matejovicova, A. Ramé, M. Rivière, et al. 
+ Gemma 3 technical report .
+ arXiv preprint arXiv:2503.19786 .
+ Cited by: §5.2 .
+ Touvron et al. (2023) 
+ H. Touvron, T. Lavril, G. Izacard, X. Martinet, M. Lachaux, T. Lacroix, B. Rozière, N. Goyal, E. Hambro, F. Azhar, et al. 
+ Llama: open and efficient foundation language models .
+ arXiv preprint arXiv:2302.13971 .
+ Cited by: Appendix A ,
+ §1 .
+ Vaswani et al. (2017) 
+ A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, and I. Polosukhin 
+ Attention is all you need .
+ Advances in neural information processing systems 30 .
+ Cited by: §1 .
+ Vyas et al. (2024) 
+ N. Vyas, D. Morwani, R. Zhao, M. Kwun, I. Shapira, D. Brandfonbrener, L. Janson, and S. Kakade 
+ Soap: improving and stabilizing shampoo using adam .
+ arXiv preprint arXiv:2409.11321 .
+ Cited by: Appendix C ,
+ §2 .
+ Wang et al. (2025a) 
+ J. Wang, M. Wang, Z. Zhou, J. Yan, L. Wu, et al. 
+ The sharpness disparity principle in transformers for accelerating language model pre-training .
+ arXiv preprint arXiv:2502.19002 .
+ Cited by: Appendix A ,
+ §1 ,
+ §2 ,
+ §3.2 .
+ Wang et al. (2025b) 
+ M. Wang, J. Wang, J. Zhang, W. Wang, P. Pei, X. Cai, L. Wu, et al. 
+ GradPower: powering gradients for faster language model pre-training .
+ arXiv preprint arXiv:2505.24275 .
+ Cited by: §2 .
+ Xu et al. (2024) 
+ M. Xu, L. Xiang, X. Cai, and H. Wen 
+ No more adam: learning rate scaling at initialization is all you need .
+ arXiv preprint arXiv:2412.11768 .
+ Cited by: §2 .
+ You et al. (2020) 
+ Y. You, J. Li, S. Reddi, J. Hseu, S. Kumar, S. Bhojanapalli, X. Song, J. Demmel, K. Keutzer, and C. Hsieh 
+ Large batch optimization for deep learning: training bert in 76 minutes .
+ In International Conference on Learning Representations ,
+ External Links: Link 
+ Cited by: §2 ,
+ §5.1 .
+ Zellers et al. (2019) 
+ R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and Y. Choi 
+ Hellaswag: can a machine really finish your sentence? .
+ arXiv preprint arXiv:1905.07830 .
+ Cited by: §5.2 .
+ Zeng et al. (2022) 
+ A. Zeng, X. Liu, Z. Du, Z. Wang, H. Lai, M. Ding, Z. Yang, Y. Xu, W. Zheng, X. Xia, et al. 
+ Glm-130b: an open bilingual pre-trained model .
+ arXiv preprint arXiv:2210.02414 .
+ Cited by: §1 ,
+ §2 .
+ Zhang et al. (2024) 
+ Y. Zhang, C. Chen, T. Ding, Z. Li, R. Sun, and Z. Luo 
+ Why transformers need adam: a hessian perspective .
+ Advances in neural information processing systems 37 , pp. 131786–131823 .
+ Cited by: §1 ,
+ §2 .
+ Zhang et al. (2025) 
+ Y. Zhang, C. Chen, Z. Li, T. Ding, C. Wu, D. P. Kingma, Y. Ye, Z. Luo, and R. Sun 
+ Adam-mini: use fewer learning rates to gain more .
+ In The Thirteenth International Conference on Learning Representations ,
+ External Links: Link 
+ Cited by: 3rd item ,
+ §1 ,
+ §2 ,
+ §5.1 .
+ Zhao et al. (2024) 
+ J. Zhao, Z. Zhang, B. Chen, Z. Wang, A. Anandkumar, and Y. Tian 
+ GaLore: memory-efficient LLM training by gradient low-rank projection .
+ In Forty-first International Conference on Machine Learning ,
+ External Links: Link 
+ Cited by: §2 ,
+ §5.1 ,
+ §5.1 .
+ Zheng et al. (2024) 
+ Y. Zheng, R. Zhang, J. Zhang, Y. Ye, Z. Luo, Z. Feng, and Y. Ma 
+ Llamafactory: unified efficient fine-tuning of 100+ language models .
+ arXiv preprint arXiv:2403.13372 .
+ Cited by: §5.2 .
+ Zhu et al. (2024) 
+ H. Zhu, Z. Zhang, W. Cong, X. Liu, S. Park, V. Chandra, B. Long, D. Z. Pan, Z. Wang, and J. Lee 
+ APOLLO: sgd-like memory, adamw-level performance .
+ External Links: 2412.05270 ,
+ Link 
+ Cited by: Appendix A ,
+ §2 ,
+ §5.1 ,
+ §5.2 .
+ Appendix for 
+ Revealing Modular Gradient Noise Imbalance in LLMs: 
+ Calibrating Adam via Signal-to-Noise Ratio 
+ Appendix A Experimental Details
+ We detail the hyperparameters used to reproduce our experimental results. We adopt the hyperparameters of $(\beta_{1}=0.9,\beta_{2}=0.95,\epsilon=1\mathrm{e}{-8})$ across all the tasks for Adam, as these hyperparameter settings are widely used in LLM training Touvron et al. [2023] ; Wang et al. [2025a] . For each baseline, we fine-tune the learning rate within the range $\{1\mathrm{e}{-4},2.5\mathrm{e}{-4},5\mathrm{e}{-4},1\mathrm{e}{-3},2.5\mathrm{e}{-3},5\mathrm{e}{-3},1\mathrm{e}{-2},2.5\mathrm{e}{-2}\}$ , and we detail all the adopted learning rates in Table 8 and 9 . In addition, we provide the architectural hyperparameters used for the LLaMA and Qwen models in Table 10 .
+ For pretraining experiments, we use a default sequence length of 256, a total batch size of 512 (with a maximum token of 131k), and apply gradient clipping with a threshold of 1.0. For larger models such as LLaMA-3B and LLaMA-7B, we enable gradient checkpointing to reduce memory usage. For experiments of all optimizers, we implemented a learning
+rate warmup phase for the initial 10% of the total
+training steps, followed by a cosine annealing
+schedule that gradually reduces the learning rate to
+10% of its initial value. All experiments adopt BF16 precision to reduce memory consumption and are parallelized using Distributed Data Parallel (DDP) across multiple GPUs with gradient synchronization using PyTorch’s Paszke et al. [2017] torch.distributed framework. For the main training, we use random seeds 0–2, and shuffle the data using random seed 42.
+ For the commonsense reasoning experiments, we follow the experimental setup by Liu et al. [2024] and Zhu et al. [2024] . We present the detailed configurations for the MMLU fine-tuning experiments in Table 11 .
+ Models 
+ 60M 
+ 130M 
+ 350M 
+ 1B 
+ 3B 
+ 7B 
+ Hyperparameters 
+ $lr$ 
+ $lr$ 
+ $lr$ 
+ $lr$ 
+ $lr$ 
+ $lr$ 
+ Adam (8-bit) 
+ 5.0e-3 
+ 1.0e-3 
+ 1.0e-3 
+ 5.0e-4 
+ 5.0e-4 
+ 5.0e-4 
+ NAdam 
+ 5.0e-3 
+ 1.0e-3 
+ 1.0e-3 
+ 5.0e-4 
+ - 
+ - 
+ Lamb 
+ 1.0e-2 
+ 1.0e-2 
+ 5.0e-3 
+ 5.0e-3 
+ - 
+ - 
+ MUON 
+ 5.0e-3 
+ 2.5e-3 
+ 1.0e-3 
+ 1.0e-3 
+ 1.0e-3 
+ 5.0e-4 
+ Adam (8-bit) + MoLS 
+ 2.5e-3 
+ 2.5e-3 
+ 1.0e-3 
+ 1.0e-3 
+ 5.0e-4 
+ 5.0e-4 
+ Table 8 : Hyperparameters ( $lr,\alpha$ ) for pre-training LLaMA models. 
+ Models 
+ 60M 
+ 130M 
+ 350M 
+ 1B 
+ 3B 
+ 7B 
+ Hyperparameters 
+ $lr$ 
+ $\alpha$ 
+ $lr$ 
+ $\alpha$ 
+ $lr$ 
+ $\alpha$ 
+ $lr$ 
+ $\alpha$ 
+ $lr$ 
+ $\alpha$ 
+ $lr$ 
+ $\alpha$ 
+ Adam-mini 
+ 5.0e-3 
+ - 
+ 1.0e-3 
+ - 
+ 5.0e-4 
+ - 
+ 2.5e-4 
+ - 
+ - 
+ - 
+ - 
+ - 
+ GaLore 
+ 1.0e-2 
+ 0.25 
+ 1.0e-2 
+ 0.25 
+ 1.0e-2 
+ 0.25 
+ 1.0e-2 
+ 0.25 
+ 5.0e-3 
+ 0.25 
+ 1.0e-2 
+ 0.25 
+ APOLLO 
+ 1.0e-2 
+ 1.0 
+ 1.0e-2 
+ 1.0 
+ 1.0e-2 
+ 1.0 
+ 1.0e-2 
+ 1.0 
+ 5.0e-3 
+ 1.0 
+ 1.0e-2 
+ 1.0 
+ Adam-mini + MoLS 
+ 2.5e-3 
+ - 
+ 1.0e-3 
+ - 
+ 1.0e-3 
+ - 
+ 1.0e-3 
+ - 
+ - 
+ - 
+ - 
+ - 
+ Table 9 : Hyperparameters ( $lr,\alpha$ ) for pre-training LLaMA models. 
+ Model 
+ Params 
+ Hidden 
+ Intermediate 
+ Heads 
+ Layers 
+ Iteration 
+ Training tokens 
+ LLaMA 
+ 60M 
+ 512 
+ 1376 
+ 8 
+ 8 
+ 10K 
+ 1.3B 
+ 130M 
+ 768 
+ 2048 
+ 12 
+ 12 
+ 20K 
+ 2.6B 
+ 350M 
+ 1024 
+ 2736 
+ 16 
+ 24 
+ 60K 
+ 7.8B 
+ 1B 
+ 2048 
+ 5461 
+ 24 
+ 32 
+ 100K 
+ 13.1B 
+ 3B 
+ 2560 
+ 6848 
+ 32 
+ 32 
+ 120K 
+ 15.7B 
+ 7B 
+ 4096 
+ 11008 
+ 32 
+ 32 
+ 150K 
+ 19.7B 
+ Qwen 
+ 350M 
+ 1024 
+ 3328 
+ 16 
+ 26 
+ 60K 
+ 7.8B 
+ GPT 
+ 125M 
+ 768 
+ 3072 
+ 12 
+ 12 
+ 20K 
+ 2.6B 
+ 355M 
+ 1024 
+ 4096 
+ 16 
+ 24 
+ 60K 
+ 7.8B 
+ Table 10 : Architecture hyperparameters of LLaMA for pre-training. Batch size and training data amount are specified in tokens. 
+ Hyperparameters 
+ Gemma3-1B 
+ LLaMA3.2-3B 
+ Qwen2.5-7B 
+ $lr$ Scheduler 
+ Cosine 
+ rank $r$ 
+ 4 
+ 8 
+ 8 
+ Warmup Steps 
+ 10% 
+ Epochs 
+ 3 
+ Batch Size 
+ 16 
+ N-shots 
+ 5 
+ Where 
+ All 
+ Cut-off Len. 
+ 2048 
+ $lr$ 
+ 2.0e-4 
+ 2.5e-5 
+ 1.0e-5 
+ Table 11 : Hyperparameters of fine-tuning different models on the MMLU benchmark. 
+ Appendix B SNR Estimation for Module-wise Scaling
+ For SNR estimation in our method, we consistently use $16{,}384$ samples across all models, corresponding to $32$ training iterations. This choice provides a stable and reliable estimate of the SNR. While reducing the number of estimation samples can further decrease the time spent on SNR computation, it may also introduce additional estimation noise. In practice, the final results show little sensitivity to the sample size used for SNR estimation. This is because our approach mainly relies on obtaining a roughly correct relative ratio, rather than an exact numerical estimate. We report the final validation PPL and the corresponding SNR estimation time for different sample sizes in Table 12 . As observed, the differences in final PPL across different sample sizes are not significant. This indicates that our method remains robust even with imprecise SNR estimation. When computational time is limited, fewer samples can be used to reduce training time.
+ Concretely, these samples are used to compute element-wise SNR values based on the gradients obtained during the backward pass. The resulting per-element SNRs are then averaged within each module to produce a module-level SNR estimate, which is subsequently used for learning-rate scaling.
+ Samples 
+ PPL 
+ Estimation Time (min.) 
+ 2048 
+ 21.99 
+ 0.67 
+ 4096 
+ 22.04 
+ 1.16 
+ 8096 
+ 21.96 
+ 2.02 
+ 16384 
+ 21.94 
+ 3.73 
+ 32768 
+ 21.93 
+ 7.83 
+ Table 12 : Final validation PPL and SNR estimation time for pre-training LLaMA-130M on C4 with different SNR estimation samples. 
+ Once the module-wise SNR values were computed, we scaled the learning rates by setting the $\alpha$ parameter of a reference base module to 1.0. The $\alpha$ values for other modules were adjusted relative to this base module, ensuring that their updates were properly scaled based on the calculated SNR. This module-level scaling allows for dynamic adjustment of learning rates, tailored to the effective signal strength of each module while maintaining a stable and efficient training process.
+ In Table 13 , we present the calculated alpha values from pretraining the LLaMA model. As shown, the relative ratios of alpha remain consistent across models of different sizes. This effectively demonstrates the stability and adaptability of our estimation method across different model sizes.
+ Models 
+ $\alpha_{\text{VO}}$ 
+ $\alpha_{\text{QK}}$ 
+ $\alpha_{\text{MLP}}$ 
+ $\alpha_{\text{Emb}}$ 
+ $\alpha_{\text{Head}}$ 
+ 60M 
+ $1.00$ 
+ $1.20$ 
+ $1.31$ 
+ $12.2$ 
+ $10.2$ 
+ 130M 
+ $1.00$ 
+ $1.43$ 
+ $1.41$ 
+ $11.8$ 
+ $5.94$ 
+ 350M 
+ $1.00$ 
+ $1.56$ 
+ $1.38$ 
+ $13.3$ 
+ $6.70$ 
+ 1.3B 
+ $1.00$ 
+ $1.76$ 
+ $1.55$ 
+ $12.8$ 
+ $9.70$ 
+ 3B 
+ $1.00$ 
+ $1.60$ 
+ $1.40$ 
+ $8.66$ 
+ $3.96$ 
+ 7B 
+ $1.00$ 
+ $1.51$ 
+ $1.39$ 
+ $7.91$ 
+ $5.77$ 
+ Table 13 : Estimated $\alpha$ values for pre-training LLaMA-60M to 7B on the C4 dataset. 
+ Appendix C Empirical Analysis
+    Methods 
+     60M 
+     130M 
+     350M 
+     1.3B 
+     Pre-training with Full-Rank Optimizers 
+    Adam 
+     29.55 
+    22.82 
+    17.25 
+    14.51 
+    NAdam 
+     28.95 
+    22.42 
+    16.76 
+    15.06 
+    LAMB 
+     28.39 
+    22.30 
+    16.69 
+    13.74 
+    MUON 
+     28.99 
+    22.73 
+    17.23 
+    14.29 
+    SGG 
+     30.31 
+    22.18 
+    17.28 
+    14.30 
+    SOAP 
+     29.02 
+    22.59 
+    17.03 
+    14.62 
+    Adam+ MoLS 
+     28.48 
+     21.94 
+     16.41 
+     13.45 
+     $\Delta$ Gains 
+     -1.07 
+     -0.88 
+     -0.84 
+     -1.06 
+     Pre-training with Memory-efficient Optimizers 
+    Adam-mini 
+     29.63 
+    23.73 
+    17.83 
+    15.10 
+    GaLore 
+     33.24 
+    25.22 
+    18.67 
+    14.90 
+    APOLLO 
+     29.92 
+    22.86 
+    16.66 
+    14.20 
+    Lion 
+     32.46 
+    25.47 
+    21.25 
+    15.69 
+    Adafactor 
+     32.57 
+    23.98 
+    17.74 
+    15.19 
+    Adam-mini+ MoLS 
+     28.49 
+     21.91 
+     16.86 
+     13.57 
+     $\Delta$ Gains 
+     -1.14 
+     -1.82 
+     -0.97 
+     -1.53 
+    Training Tokens 
+    1.1B 
+    2.2B 
+    6.4B 
+    13.1B 
+ Table 14 : Full comparison of final validation perplexity for pre-training LLaMA models on the C4 dataset.
+ In this section, we provide additional experimental results beyond the main text to further validate the effectiveness of our method. These include additional pretraining baselines, the total training time of each baseline, and PPL learning curves that were omitted from the main experiments. We also report SNR measurements on datasets and models beyond C4 and LLaMA.
+ (a) LLaMA-130M 
+ (b) LLaMA-350M 
+ (c) LLaMA-1.3B 
+ Figure 6 : Validation PPL curves for pre-training LLaMA-130M to 1.3B. 
+ For pre-training, due to similar experimental settings, we adopt results of SGG Li et al. [2025] and reproduce SOAP Vyas et al. [2024] as the additional pre-training baselines, and add Lion Chen et al. [2023] and Adafactor Shazeer and Stern [2018] as memory-efficient pre-training baselines; the complete results are reported in Table 14 . In addition, we present validation PPL curves for different pretraining methods on LLaMA models ranging from 130M to 1.3B parameters, as well as training loss curves for Adam and Adam+ MoLS in Figures 6 and 8 , respectively, showing that our method achieves faster convergence than Adam.
+ Furthermore, to analyze the dynamic behavior of SNR on datasets and models beyond C4 and LLaMA, we pretrain LLaMA-60M on OpenWebText and GPT2-125M on C4 to study SNR dynamics. Notably, in GPT2 the head module is tied to the embedding module, and thus we do not analyze the head separately. The experimental results are shown in Figure 7 , where we observe that the fundamental SNR dynamics are largely consistent across different datasets and models, effectively validating the generalization of our method.
+ (a) Pre-training LLaMA-60M on OpenWebText. 
+ (b) Pre-training GPT2-125M on C4. 
+ Figure 7 : SNR variation across modules during pre-training. The dynamic behavior of SNR remains consistent on models beyond LLaMA and datasets beyond C4, further demonstrating the generalization capability of our method. 
+ (a) LLaMA-130M 
+ (b) LLaMA-350M 
+ (c) LLaMA-1.3B 
+ Figure 8 : Training PPL curves for pre-training LLaMA-130M to 1.3B (smoothed by 50 iterations). 
+ Methods 
+ PPL 
+ Training Time (h) 
+ Adam 
+ 14.51 
+ 54.18 
+ NAdam 
+ 15.06( +3.79% ) 
+ 55.30( +2.06% ) 
+ LAMB 
+ 13.74( +5.31% ) 
+ 57.41( +5.96% ) 
+ MUON 
+ 14.29( +1.51% ) 
+ 91.83( +69.4% ) 
+ Adam + MoLS 
+ 13.45( +7.30% ) 
+ 55.08( +1.66% ) 
+ Adam-mini 
+ 15.10 
+ 53.10 
+ GaLore 
+ 14.90( +1.32% ) 
+ 65.63( +23.5% ) 
+ APOLLO 
+ 14.20( +5.96% ) 
+ 53.71( +1.14% ) 
+ Adam-mini + MoLS 
+ 13.57( +10.1% ) 
+ 54.01( +1.71% ) 
+ Table 15 : Gains vs Costs. Full comparison of relative gains $\uparrow$ in final PPL and costs $\downarrow$ in total training time on pre-training LLaMA-1.3B. We run each method on 16 NVIDIA RTX 3090 24GB GPUs with a batch size of 32. 
+ Appendix D Discussion and Future Works
+ Static Scaling versus Dynamic Adaptation.
+ MoLS adopts a static module-wise learning rate scaling strategy after a brief warm-up phase, which naturally raises the question of whether dynamic SNR estimation throughout training could further improve performance. While SNR may evolve as optimization progresses, we emphasize that MoLS is designed to address the structural imbalance of gradient signal strength across modules rather than to track fine-grained temporal dynamics. In practice, we find that the relative SNR ordering across modules is already well-established during the early stage of training, particularly for embedding and output head layers. By converting an otherwise manual and task-specific tuning problem into a one-shot, statistically grounded calibration, MoLS significantly reduces tuning complexity while preserving robustness across models and tasks.
+ Computational Trade-offs of SNR Estimation.
+ A key design consideration of MoLS is computational efficiency. Online or frequent SNR estimation would require additional gradient statistics and incur non-negligible memory and computation overhead, which is prohibitive for large-scale LLM training. MoLS deliberately limits SNR estimation to a short warm-up phase, ensuring negligible overhead compared to standard training. This trade-off favors scalability and ease of deployment, while still capturing the dominant sources of module-wise imbalance. Future work may explore lightweight approximations, such as low-frequency or event-triggered SNR re-estimation, to further balance adaptivity and efficiency.
+ Stability Considerations in Large-Scale Training.
+ Abrupt changes in learning rates are known to cause instability in large language model training, often leading to loss spikes or divergence. MoLS explicitly avoids such instability by estimating SNR during warm-up and smoothly adjusting each module’s learning rate toward its target value over the remaining warm-up steps. Empirically, we observe that modules with low early-stage SNR, such as embeddings and output heads, particularly benefit from this gradual calibration, resulting in more stable optimization trajectories.
+ Sensitivity to Sampling and Data Variability.
+ SNR estimation inherently depends on stochastic gradient samples and may vary with batch size or data distribution. However, MoLS relies on relative SNR ratios at the module level rather than absolute values. By aggregating statistics across parameters within each module and optionally employing robust estimators such as the median, MoLS substantially reduces variance and sensitivity to sampling noise. Further investigation into uncertainty-aware SNR estimation or confidence interval-based scaling could improve robustness under extreme data regimes.
+ Theoretical Safety.
+ The SNR-based scaling in MoLS is applied relative to a reference module and typically estimated during a pre-warmup phase. This approach ensures that the adjusted learning rates remain proportional to the reliable signal in each module, avoiding overly aggressive updates that could lead to divergence. In practice, even modules with low observed SNR benefit from increased effective step sizes without compromising stability, as the variance captured by SNR primarily reflects sparsity-induced fluctuations rather than harmful stochastic noise. Empirical results across pretraining and fine-tuning tasks confirm that this strategy consistently accelerates convergence while maintaining robust training dynamics.
+ Choice of Reference Module.
+ MoLS normalizes module-wise scaling factors with respect to a reference module, which may appear to introduce an additional design choice. In practice, we find that attention-related modules exhibit stable and consistent SNR across architectures and tasks, making them reliable reference points. Importantly, the reference module only affects the global normalization and does not alter the relative scaling between modules. Future work could investigate automatic reference selection or reference-free normalization schemes.
+ Relationship to Adaptive Optimizers.
+ Although modern optimizers such as Adam and LAMB already incorporate parameter-wise adaptivity, MoLS operates at a complementary level by correcting systematic module-wise disparities in effective update magnitudes. While Adam normalizes updates based on second-order statistics per parameter, MoLS adjusts learning rates based on the signal-to-noise characteristics aggregated at the module level. Understanding the theoretical interaction between MoLS and adaptive optimizers, as well as extending MoLS to alternative optimization frameworks, remains an interesting direction for future research.
+ Algorithm 1 SNR Estimation for Module-wise LR Scaling 
+   Input: Model with modules $\mathcal{M}$ , reference module $m_{\text{base}}$ , $\eta_{base}$ for base lr, $\epsilon$ for numerical stability
+   for $m\in\mathcal{M}$ do 
+   Compute module-wise SNR
+ $S_{m}=\frac{\|\mathbb{E}[\mathbf{g}_{m}]\|^{2}}{\mathrm{Var}(\mathbf{g}_{m})+\epsilon}$ 
+   Compute relative scaling factor $\alpha_{m}=\sqrt{\frac{S_{\text{base}}}{S_{m}}}$ 
+   end for 
+  Apply $\alpha_{m}\cdot\eta_{\text{base}}$ to adjust the module-wise lr, smoothly reaching the target lr over the remainder of warm-up
+ D.1 Future Works
+ Limitations of Current Design.
+ While MoLS achieves promising results in optimizing LLMs by addressing module-wise SNR imbalance, it still has several inherent limitations that deserve future exploration. First, MoLS adopts a static module-wise scaling strategy, where SNR is estimated only once during the warm-up phase. Although the relative SNR ordering across modules stabilizes early in training (as shown in Figure 1), dynamic changes in SNR during the late-stage fine-grained convergence (e.g., gradual noise increase in MLP modules as gradients shrink) may not be fully captured, potentially limiting further performance gains. Second, the SNR estimation of MoLS relies on the empirical mean and variance of gradients, which is susceptible to sampling noise and batch size variations. While aggregating module-level statistics mitigates this issue, it does not fully eliminate the impact of extreme data distributions (e.g., highly domain-specific datasets) or small-batch training scenarios. Third, MoLS currently depends on predefined module boundaries (e.g., Embedding, QK, VO, MLP) for SNR aggregation, which may not be optimal for emerging model architectures with more flexible modular designs (e.g., mixture-of-experts, dynamic neural networks with adaptive structures).
+ Dynamic SNR Re-estimation.
+ Building on the static scaling limitation, future work can explore dynamic SNR re-estimation strategies to adapt to temporal changes in module-wise signal integrity. Potential directions include low-frequency updates (e.g., re-estimating SNR every 10k iterations) or event-triggered calibration (e.g., when validation loss plateaus for consecutive steps). This design would balance adaptivity and computational efficiency, avoiding the excessive overhead of real-time SNR estimation while capturing late-stage SNR dynamics that static scaling misses.
+ Robust SNR Estimation and Parameter Grouping.
+ To address the sensitivity of SNR estimation to sampling noise and data variability, we plan to investigate robust estimation methods such as median-based statistics or uncertainty-aware scaling (e.g., incorporating confidence intervals of SNR). Additionally, extending MoLS to automatic parameter grouping—leveraging gradient similarity, parameter importance scores, or structural characteristics—would eliminate the need for manual predefined module boundaries, making the method more adaptable to diverse model architectures beyond standard Transformers.
+ Generalization to Other Optimizers and Architectures.
+ Currently, MoLS is integrated with Adam and Adam-mini, but its core principle of module-wise scaling via SNR can be extended to other optimization frameworks. Future work will explore adapting MoLS to SGD variants (e.g., Lion) and other adaptive optimizers (e.g., LAMB), analyzing the theoretical interaction between SNR-based scaling and different update rules. Furthermore, extending MoLS to non-Transformer architectures (e.g., convolutional neural networks, multimodal models combining vision and language) will broaden its applicability, as the problem of module-wise gradient heterogeneity is not limited to LLMs.
+ Reference-Free Normalization and Practical Deployment.
+ MoLS currently relies on a manually selected reference module (e.g., VO) for scaling factor normalization. Future work could investigate automatic reference selection (e.g., identifying the module with the most stable SNR across training) or reference-free normalization schemes, making MoLS more self-contained and user-friendly. Additionally, optimizing MoLS for extreme resource-constrained scenarios (e.g., edge-device LLM training) by reducing SNR estimation overhead further would enhance its practical value.
+ Finer-Grained Module Grouping.
+ A natural extension of this work is to explore more fine-grained grouping strategies, such as distinguishing between shallow and deep layers or applying layer-wise scaling within the same module type. Such designs may further capture the hierarchical heterogeneity of gradient statistics in deep transformer architectures. However, introducing finer-grained groups would inevitably increase computational overhead and introduce additional grouping-related hyperparameters, which runs counter to the lightweight and plug-and-play design philosophy of our method. In this work, we therefore focus on a coarse yet robust module-level grouping that strikes a practical balance between effectiveness and simplicity, and leave more granular grouping strategies to future work.
+ Experimental support, please
+ view the build logs 
+ for errors. Generated by
+ L
+ A 
+ T
+ E 
+ xml 
+ .
+ Instructions for reporting errors
+ We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile
+ support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the
+ methods listed below:
+ Click the "Report Issue" ( 
+ ) button, located in the page header.
+ Tip: You can select the relevant text first, to include it in your report.
+ Our team has already identified the following issues . We appreciate your time reviewing and reporting rendering errors we
+ may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability
+ should not be a barrier to accessing research. Thank you for your continued support in championing open access for
+ all.
+ Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion , and welcome developer contributions .
+ We gratefully acknowledge support from
+ our major funders ,
+ member institutions , ,
+ and all contributors.
+ About 
+ · 
+ Help 
+ · 
+ Contact 
+ · 
+ Subscribe 
+ · 
+ Copyright 
+ · 
+ Privacy 
+ · 
+ Accessibility 
+ · 
+ Operational Status (opens in new tab) 
+ Major funding support from

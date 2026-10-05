@@ -1,0 +1,633 @@
+On the importance of initialization and momentum in deep learning
+
+
+Ilya Sutskever1                                                                        ilyasu@google.com
+James Martens                                                                    jmartens@cs.toronto.edu
+George Dahl                                                                         gdahl@cs.toronto.edu
+Geo↵rey Hinton                                                                    hinton@cs.toronto.edu
+
+
+                     Abstract                              widepread use until fairly recently. DNNs became
+                                                           the subject of renewed attention following the work
+    Deep and recurrent neural networks (DNNs               of Hinton et al. (2006) who introduced the idea of
+    and RNNs respectively) are powerful mod-               greedy layerwise pre-training. This approach has since
+    els that were considered to be almost impos-           branched into a family of methods (Bengio et al.,
+    sible to train using stochastic gradient de-           2007), all of which train the layers of the DNN in a
+    scent with momentum. In this paper, we                 sequence using an auxiliary objective and then “fine-
+    show that when stochastic gradient descent             tune” the entire network with standard optimization
+    with momentum uses a well-designed random              methods such as stochastic gradient descent (SGD).
+    initialization and a particular type of slowly         More recently, Martens (2010) attracted considerable
+    increasing schedule for the momentum pa-               attention by showing that a type of truncated-Newton
+    rameter, it can train both DNNs and RNNs               method called Hessian-free Optimization (HF) is capa-
+    (on datasets with long-term dependencies) to           ble of training DNNs from certain random initializa-
+    levels of performance that were previously             tions without the use of pre-training, and can achieve
+    achievable only with Hessian-Free optimiza-            lower errors for the various auto-encoding tasks con-
+    tion. We find that both the initialization             sidered by Hinton & Salakhutdinov (2006).
+    and the momentum are crucial since poorly
+    initialized networks cannot be trained with            Recurrent neural networks (RNNs), the temporal ana-
+    momentum and well-initialized networks per-            logue of DNNs, are highly expressive sequence mod-
+    form markedly worse when the momentum is               els that can model complex sequence relationships.
+    absent or poorly tuned.                                They can be viewed as very deep neural networks
+                                                           that have a “layer” for each time-step with parame-
+    Our success training these models suggests             ter sharing across the layers and, for this reason, they
+    that previous attempts to train deep and re-           are considered to be even harder to train than DNNs.
+    current neural networks from random initial-           Recently, Martens & Sutskever (2011) showed that
+    izations have likely failed due to poor ini-           the HF method of Martens (2010) could e↵ectively
+    tialization schemes. Furthermore, carefully            train RNNs on artificial problems that exhibit very
+    tuned momentum methods suffice for dealing             long-range dependencies (Hochreiter & Schmidhuber,
+    with the curvature issues in deep and recur-           1997). Without resorting to special types of memory
+    rent network training objectives without the           units, these problems were considered to be impossi-
+    need for sophisticated second-order methods.           bly difficult for first-order optimization methods due
+                                                           to the well known vanishing gradient problem (Bengio
+                                                           et al., 1994). Sutskever et al. (2011) and later Mikolov
+1. Introduction                                            et al. (2012) then applied HF to train RNNs to per-
+                                                           form character-level language modeling and achieved
+Deep and recurrent neural networks (DNNs and               excellent results.
+RNNs, respectively) are powerful models that achieve
+high performance on difficult pattern recognition prob-    Recently, several results have appeared to challenge
+lems in vision, and speech (Krizhevsky et al., 2012;       the commonly held belief that simpler first-order
+Hinton et al., 2012; Dahl et al., 2012; Graves, 2012).     methods are incapable of learning deep models from
+                                                           random initializations. The work of Glorot & Ben-
+Although their representational power is appealing,        gio (2010), Mohamed et al. (2012), and Krizhevsky
+the difficulty of training DNNs has prevented their        et al. (2012) reported little difficulty training neural
+                                                           networks with depths up to 8 from certain well-chosen
+Proceedings of the 30 th International Conference on Ma-
+chine Learning, Atlanta, Georgia, USA, 2013. JMLR:             1
+                                                                Work was done while the author was at the University
+W&CP volume 28. Copyright 2013 by the author(s).           of Toronto.
+                    On the importance of initialization and momentum in deep learning
+
+random initializations. Notably, Chapelle & Erhan           is surprisingly e↵ective and can be naturally combined
+(2011) used the random initialization of Glorot & Ben-      with techniques such as those in Raiko et al. (2011).
+gio (2010) and SGD to train the 11-layer autoencoder
+                                                            We will also discuss the links between classical mo-
+of Hinton & Salakhutdinov (2006), and were able to
+                                                            mentum and Nesterov’s accelerated gradient method
+surpass the results reported by Hinton & Salakhutdi-
+                                                            (which has been the subject of much recent study in
+nov (2006). While these results still fall short of those
+                                                            convex optimization theory), arguing that the latter
+reported in Martens (2010) for the same tasks, they
+                                                            can be viewed as a simple modification of the former
+indicate that learning deep networks is not nearly as
+                                                            which increases stability, and can sometimes provide a
+hard as was previously believed.
+                                                            distinct improvement in performance we demonstrated
+The first contribution of this paper is a much more         in our experiments. We perform a theoretical analysis
+thorough investigation of the difficulty of training deep   which makes clear the precise di↵erence in local be-
+and temporal networks than has been previously done.        havior of these two algorithms. Additionally, we show
+In particular, we study the e↵ectiveness of SGD when        how HF employs what can be viewed as a type of “mo-
+combined with well-chosen initialization schemes and        mentum” through its use of special initializations to
+various forms of momentum-based acceleration. We            conjugate gradient that are computed from the up-
+show that while a definite performance gap seems to         date at the previous time-step. We use this property
+exist between plain SGD and HF on certain deep and          to develop a more momentum-like version of HF which
+temporal learning problems, this gap can be elimi-          combines some of the advantages of both methods to
+nated or nearly eliminated (depending on the prob-          further improve on the results of Martens (2010).
+lem) by careful use of classical momentum methods
+or Nesterov’s accelerated gradient. In particular, we
+show how certain carefully designed schedules for the
+                                                            2. Momentum and Nesterov’s
+constant of momentum µ, which are inspired by var-             Accelerated Gradient
+ious theoretical convergence-rate theorems (Nesterov,       The momentum method (Polyak, 1964), which we refer
+1983; 2003), produce results that even surpass those re-    to as classical momentum (CM), is a technique for ac-
+ported by Martens (2010) on certain deep-autencoder         celerating gradient descent that accumulates a velocity
+training tasks. For the long-term dependency RNN            vector in directions of persistent reduction in the ob-
+tasks examined in Martens & Sutskever (2011), which         jective across iterations. Given an objective function
+first appeared in Hochreiter & Schmidhuber (1997),          f (✓) to be minimized, classical momentum is given by:
+we obtain results that fall just short of those reported
+in that work, where a considerably more complex ap-                        vt+1    =   µvt "rf (✓t )               (1)
+proach was used.
+                                                                           ✓t+1    =   ✓t + vt+1                   (2)
+Our results are particularly surprising given that mo-
+mentum and its use within neural network optimiza-          where " > 0 is the learning rate, µ 2 [0, 1] is the mo-
+tion has been studied extensively before, such as in the    mentum coefficient, and rf (✓t ) is the gradient at ✓t .
+work of Orr (1996), and it was never found to have such     Since directions d of low-curvature have, by defini-
+an important role in deep learning. One explanation is      tion, slower local change in their rate of reduction (i.e.,
+that previous theoretical analyses and practical bench-     d> rf ), they will tend to persist across iterations and
+marking focused on local convergence in the stochastic      be amplified by CM. Second-order methods also am-
+setting, which is more of an estimation problem than        plify steps in low-curvature directions, but instead of
+an optimization one (Bottou & LeCun, 2004). In deep         accumulating changes they reweight the update along
+learning problems this final phase of learning is not       each eigen-direction of the curvature matrix by the in-
+nearly as long or important as the initial “transient       verse of the associated curvature. And just as second-
+phase” (Darken & Moody, 1993), where a better ar-           order methods enjoy improved local convergence rates,
+gument can be made for the beneficial e↵ects of mo-         Polyak (1964) showed that CM can considerably accel-
+mentum.                                                                                                          p
+                                                            erate convergence to a local minimum, requiring R-
+In addition to the inappropriate focus on purely local      times fewer iterations than steepest descent to reach
+convergence rates, we believe that the use of poorly de-    the same level of accuracy, where R is the condition
+signed standard random initializations, such as those       number
+                                                                p of the p  curvature at the minimum and µ is set
+in Hinton & Salakhutdinov (2006), and suboptimal            to ( R 1)/( R + 1).
+meta-parameter schedules (for the momentum con-
+                                                            Nesterov’s Accelerated Gradient (abbrv. NAG; Nes-
+stant in particular) has hampered the discovery of the
+                                                            terov, 1983) has been the subject of much recent at-
+true e↵ectiveness of first-order momentum methods in
+                                                            tention by the convex optimization community (e.g.,
+deep learning. We carefully avoid both of these pit-
+                                                            Cotter et al., 2011; Lan, 2010). Like momentum,
+falls in our experiments and provide a simple to under-
+                                                            NAG is a first-order optimization method with better
+stand and easy to use framework for deep learning that
+                                                            convergence rate guarantee than gradient descent in
+                    On the importance of initialization and momentum in deep learning
+
+certain situations. In particular, for general smooth
+(non-strongly) convex functions and a deterministic
+gradient, NAG achieves a global convergence rate of
+O(1/T 2 ) (versus the O(1/T ) of gradient descent), with
+constant proportional to the Lipschitz coefficient of the
+derivative and the squared Euclidean distance to the
+solution. While NAG is not typically thought of as a
+type of momentum, it indeed turns out to be closely re-
+lated to classical momentum, di↵ering only in the pre-
+cise update of the velocity vector v, the significance of
+which we will discuss in the next sub-section. Specifi-
+cally, as shown in the appendix, the NAG update may
+                                                             Figure 1. (Top) Classical Momentum (Bottom) Nes-
+be rewritten as:
+                                                             terov Accelerated Gradient
+            vt+1   =   µvt "rf (✓t + µvt )            (3)
+            ✓t+1   =   ✓t + vt+1                      (4)                                 p
+                                                             of the optimization where / T is the dominant term
+                                                             (i.e., when the optimization problem resembles an es-
+While the classical convergence theories for both meth-      timation one).
+ods rely on noiseless gradient estimates (i.e., not
+stochastic), with some care in practice they are both        2.1. The Relationship between CM and NAG
+applicable to the stochastic setting. However, the the-
+ory predicts that any advantages in terms of asymp-          From Eqs. 1-4 we see that both CM and NAG compute
+totic local rate of convergence will be lost (Orr, 1996;     the new velocity by applying a gradient-based correc-
+Wiegerinck et al., 1999), a result also confirmed in ex-     tion to the previous velocity vector (which is decayed),
+periments (LeCun et al., 1998). For these reasons,           and then add the velocity to ✓t . But while CM com-
+interest in momentum methods diminished after they           putes the gradient update from the current position
+had received substantial attention in the 90’s. And be-      ✓t , NAG first performs a partial update to ✓t , comput-
+cause of this apparent incompatibility with stochastic       ing ✓t + µvt , which is similar to ✓t+1 , but missing the
+optimization, some authors even discourage using mo-         as yet unknown correction. This benign-looking dif-
+mentum or downplay its potential advantages (LeCun           ference seems to allow NAG to change v in a quicker
+et al., 1998).                                               and more responsive way, letting it behave more sta-
+                                                             bly than CM in many situations, especially for higher
+However, while local convergence is all that matters
+                                                             values of µ.
+in terms of asymptotic convergence rates (and on cer-
+tain very simple/shallow neural network optimization         Indeed, consider the situation where the addition of
+problems it may even dominate the total learning             µvt results in an immediate undesirable increase in
+time), in practice, the “transient phase” of convergence     the objective f . The gradient correction to the ve-
+(Darken & Moody, 1993), which occurs before fine lo-         locity vt is computed at position ✓t + µvt and if µvt
+cal convergence sets in, seems to matter a lot more          is indeed a poor update, then rf (✓t + µvt ) will point
+for optimizing deep neural networks. In this transient       back towards ✓t more strongly than rf (✓t ) does, thus
+phase of learning, directions of reduction in the ob-        providing a larger and more timely correction to vt
+jective tend to persist across many successive gradient      than CM. See fig. 1 for a diagram which illustrates
+estimates and are not completely swamped by noise.           this phenomenon geometrically. While each iteration
+                                                             of NAG may only be slightly more e↵ective than CM
+Although the transient phase of learning is most no-
+                                                             at correcting a large and inappropriate velocity, this
+ticeable in training deep learning models, it is still no-
+                                                             di↵erence in e↵ectiveness may compound as the al-
+ticeable in convex objectives. The convergence rate
+                                                             gorithms iterate. To demonstrate this compounding,
+of stochastic gradient descent onpsmooth convex func-
+                                                             we applied both NAG and CM to a two-dimensional
+tions is given by O(L/T + / T ), where             is the
+                                                             oblong quadratic objective, both with the same mo-
+variance in the gradient estimate and L is the Lip-
+                                                             mentum and learning rate constants (see fig. 2 in the
+shits coefficient of rf . In contrast, the convergence
+                                                             appendix). While the optimization path taken by CM
+rate of an accelerated gradient method of Lan (2010)
+                                                             exhibits large oscillations along the high-curvature ver-
+(which is related to but di↵erent from NAG, in that
+                                                             tical direction, NAG is able to avoid these oscillations
+it combines Nesterov style
+                         p momentum with dual aver-          almost entirely, confirming the intuition that it is much
+aging) is O(L/T 2 + / T ). Thus, for convex objec-
+                                                             more e↵ective than CM at decelerating over the course
+tives, momentum-based methods will outperform SGD
+                                                             of multiple iterations, thus making NAG more tolerant
+in the early or transient stages of the optimization
+                                                             of large values of µ compared to CM.
+where L/T is the dominant term. However, the two
+methods will be equally e↵ective during the final stages     In order to make these intuitions more rigorous and
+                      On the importance of initialization and momentum in deep learning
+
+help quantify precisely the way in which CM and                            oscillations (or divergence) and thus allows the use of
+NAG di↵er, we analyzed the behavior of each method                         a larger µ than is possible with CM for a given ".
+when applied to a positive definite quadratic objective
+q(x) = x> Ax/2 + b> x. We can think of CM and NAG
+as operating independently over the di↵erent eigendi-
+                                                                           3. Deep Autoencoders
+rections of A. NAG operates along any one of these                         The aim of our experiments is three-fold. First, to
+directions equivalently to CM, except with an e↵ective                     investigate the attainable performance of stochastic
+value of µ that is given by µ(1      "), where is the                      momentum methods on deep autoencoders starting
+associated eigenvalue/curvature.                                           from well-designed random initializations; second, to
+The first step of this argument is to reparameterize                       explore the importance and e↵ect of the schedule for
+q(x) in terms of the coefficients of x under the basis                     the momentum parameter µ assuming an optimal fixed
+of eigenvectors of A. Note that since A = U > DU for                       choice of the learning rate "; and third, to compare the
+a diagonal D and orthonormal U (as A is symmetric),                        performance of NAG versus CM.
+we can reparameterize q(x) by the matrix transform                         For our experiments with feed-forward nets, we fo-
+U and optimize y = U x using the objective p(y) ⌘                          cused on training the three deep autoencoder prob-
+q(x) = q(U > y) = y > U U > DU U > y/2 + b> U > y =                        lems described in Hinton & Salakhutdinov (2006) (see
+y > Dy/2 + cP >
+                y, where c = U b. We can further rewrite                   sec. A.2 for details). The task of the neural net-
+                n
+p as p(y) = i=1 [p]i ([y]i ), where [p]i (t) = i t2 /2+[c]i t              work autoencoder is to reconstruct its own input sub-
+and i > 0 are the diagonal entries of D (and thus                          ject to the constraint that one of its hidden layers is
+the eigenvalues of A) and correspond to the curva-                         of low-dimension. This “bottleneck” layer acts as a
+ture along the associated eigenvector directions. As                       low-dimensional code for the original input, similar to
+shown in the appendix (Proposition 6.1), both CM                           other dimensionality reduction techniques like Princi-
+and NAG, being first-order methods, are “invariant”                        ple Component Analysis (PCA). These autoencoders
+to these kinds of reparameterizations by orthonormal                       are some of the deepest neural networks with pub-
+transformations such as U . Thus when analyzing the                        lished results, ranging between 7 and 11 layers, and
+behavior of either algorithm applied to q(x), we can in-                   have become a standard benchmarking problem (e.g.,
+stead apply them to p(y), and transform the resulting                      Martens, 2010; Glorot & Bengio, 2010; Chapelle & Er-
+sequence of iterates back to the default parameteriza-                     han, 2011; Raiko et al., 2011). See the appendix for
+tion (via multiplication by U 1 = U > ).                                   more details.
+                                 Pn
+Theorem 2.1. Let p(y) =             i=1 [p]i ([y]i ) such that             Because the focus of this study is on optimization, we
+[p]i (t) = i t2 /2 + ci t. Let " be arbitrary and fixed.                   only report training errors in our experiments. Test
+Denote by CM x (µ, p, y, v) and CM v (µ, p, y, v) the pa-                  error depends strongly on the amount of overfitting in
+rameter vector and the velocity vector respectively, ob-                   these problems, which in turn depends on the type and
+tained by applying one step of CM (i.e., Eq. 1 and then                    amount of regularization used during training. While
+Eq. 2) to the function p at point y, with velocity v,                      regularization is an issue of vital importance when de-
+momentum coefficient µ, and learning rate ". Define                        signing systems of practical utility, it is outside the
+N AGx and N AGv analogously. Then the following                            scope of our discussion. And while it could be ob-
+holds for z 2 {x, v}:                                                      jected that the gains achieved using better optimiza-
+                      2                                 3                  tion methods are only due to more exact fitting of the
+                          CM z (µ, [p]1 , [y]1 , [v]1 )                    training set in a manner that does not generalize, this
+                      6              ..                 7
+  CM z (µ, p, y, v) = 4               .                 5                  is simply not the case in these problems, where under-
+                          CM z (µ, [p]n , [y]n , [v]n )                    trained solutions are known to perform poorly on both
+                      2                                                  3 the training and test sets (underfitting).
+                          CM z (µ(1         1 "), [p]1 , [y]1 , [v]1 )
+                     6                        ..                      7 The networks we trained used the standard sigmoid
+N AGz (µ, p, y, v) = 4                         .                      5 nonlinearity and were initialized using the “sparse ini-
+                          CM z (µ(1        n "), [p]n , [y]n , [v]n )   tialization” technique (SI) of Martens (2010) that is
+                                                                        described in sec. 3.1. Each trial consists of 750,000
+                                                                        parameter updates on minibatches of size 200. No reg-
+Proof. See the appendix.                                                ularization is used. The schedule for µ was given by
+                                                                        the following formula:
+The theorem has several implications. First, CM and                                µt = min(1    2 1 log2 (bt/250c+1) , µmax )   (5)
+NAG become equivalent when " is small (when " ⌧ 1
+for every eigenvalue     of A), so NAG and CM are                          where        µmax           was     chosen     from
+distinct only when " is reasonably large. When " is                        {0.999, 0.995, 0.99, 0.9, 0}. This schedule was mo-
+relatively large, NAG uses smaller e↵ective momentum                       tivated by Nesterov (1983) who advocates using what
+for the high-curvature eigen-directions, which prevents                    amounts to µt = 1 3/(t + 5) after some manipulation
+                     On the importance of initialization and momentum in deep learning
+
+  task      0(SGD)    0.9N    0.99N    0.995N   0.999N       0.9M   0.99M   0.995M     0.999M     SGDC      HF†      HF⇤
+ Curves      0.48     0.16    0.096     0.091   0.074        0.15    0.10     0.10       0.10      0.16     0.058    0.11
+ Mnist        2.1      1.0    0.73       0.75    0.80         1.0    0.77     0.84       0.90       0.9      0.69    1.40
+ Faces       36.4     14.2     8.5        7.8     7.7        15.3     8.7      8.3        9.3      NA         7.5    12.0
+
+Table 1. The table reports the squared errors on the problems for each combination of µmax and a momentum type
+(NAG, CM). When µmax is 0 the choice of NAG vs CM is of no consequence so the training errors are presented in a
+single column. For each choice of µmax , the highest-performing learning rate is used. The column SGDC lists the results of
+Chapelle & Erhan (2011) who used 1.7M SGD steps and tanh networks. The column HF† lists the results of HF without
+L2 regularization, as described in sec. 5; and the column HF⇤ lists the results of Martens (2010).
+
+
+                 problem     before   after                     would prevent this. This phase shift between opti-
+                 Curves      0.096    0.074
+                  Mnist       1.20    0.73
+                                                                mization that favors fast accelerated motion along the
+                  Faces      10.83     7.7                      error surface (the “transient phase”) followed by more
+                                                                careful optimization-as-estimation phase seems consis-
+Table 2. The e↵ect of low-momentum finetuning for NAG.          tent with the picture presented by Darken & Moody
+The table shows the training squared errors before and          (1993). However, while asymptotically it is the second
+after the momentum coefficient is reduced. During the pri-      phase which must eventually dominate computation
+mary (“transient”) phase of learning we used the optimal        time, in practice it seems that for deeper networks in
+momentum and learning rates.                                    particular, the first phase dominates overall computa-
+                                                                tion time as long as the second phase is cut o↵ before
+                                                                the remaining potential gains become either insignifi-
+(see appendix), and by Nesterov (2003) who advocates            cant or entirely dominated by overfitting (or both).
+a constant µt that depends on (essentially) the con-
+                                                                It may be tempting then to use lower values of µ from
+dition number. The constant µt achieves exponential
+                                                                the outset, or to reduce it immediately when progress
+convergence on strongly convex functions, while the
+                                                                in reducing the error appears to slow down. However,
+1 3/(t + 5) schedule is appropriate when the function
+                                                                in our experiments we found that doing this was detri-
+is not strongly convex. The schedule of Eq. 5 blends
+                                                                mental in terms of the final errors we could achieve,
+these proposals. For each choice of µmax , we report
+                                                                and that despite appearing to not make much progress,
+the learning rate that achieved the best training error.
+                                                                or even becoming significantly non-monotonic, the op-
+Given the schedule for µ, the learning rate " was
+                                                                timizers were doing something apparently useful over
+chosen from {0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001}
+                                                                these extended periods of time at higher values of µ.
+in order to achieve the lowest final error training error
+after our fixed number of updates.                              A speculative explanation as to why we see this be-
+                                                                havior is as follows. While a large value of µ allows
+Table 1 summarizes the results of these experiments.
+                                                                the momentum methods to make useful progress along
+It shows that NAG achieves the lowest published
+                                                                slowly-changing directions of low-curvature, this may
+results on this set of problems, including those of
+                                                                not immediately result in a significant reduction in er-
+Martens (2010). It also shows that larger values of
+                                                                ror, due to the failure of these methods to converge in
+µmax tend to achieve better performance and that
+                                                                the more turbulent high-curvature directions (which
+NAG usually outperforms CM, especially when µmax
+                                                                is especially hard when µ is large). Nevertheless, this
+is 0.995 and 0.999. Most surprising and importantly,
+                                                                progress in low-curvature directions takes the optimiz-
+the results demonstrate that NAG can achieve results
+                                                                ers to new regions of the parameter space that are
+that are comparable with some of the best HF results
+                                                                characterized by closer proximity to the optimum (in
+for training deep autoencoders. Note that the previ-
+                                                                the case of a convex objective), or just higher-quality
+ously published results on HF used L2 regularization,
+                                                                local minimia (in the case of non-convex optimiza-
+so they cannot be directly compared. However, the
+                                                                tion). Thus, while it is important to adopt a more
+table also includes experiments we performed with an
+                                                                careful scheme that allows fine convergence to take
+improved version of HF (see sec. 2.1) where weight
+                                                                place along the high-curvature directions, this must be
+decay was removed towards the end of training.
+                                                                done with care. Reducing µ and moving to this fine
+We found it beneficial to reduce µ to 0.9 (unless µ             convergence regime too early may make it difficult for
+is 0, in which case it is unchanged) during the final           the optimization to make significant progress along the
+1000 parameter updates of the optimization without              low-curvature directions, since without the benefit of
+reducing the learning rate, as shown in Table 2. It             momentum-based acceleration, first-order methods are
+appears that reducing the momentum coefficient al-              notoriously bad at this (which is what motivated the
+lows for finer convergence to take place whereas oth-           use of second-order methods like HF for deep learn-
+erwise the overly aggressive nature of CM or NAG                ing).
+                       On the importance of initialization and momentum in deep learning
+
+ SI scale multiplier    0.25   0.5     1       2      4         connection type     sparsity            scale
+        error            16    16    0.074   0.083   0.35     in-to-hid (add,mul)    dense          0.001·N (0, 1)
+                                                                in-to-hid (mem)      dense           0.1·N (0, 1)
+Table 3. The table reports the training squared error that         hid-to-hid       15 fan-in   spectral radius of 1.1
+is attained by changing the scale of the initialization.           hid-to-out        dense           0.1·N (0, 1)
+                                                                    hid-bias         dense                0
+                                                                    out-bias         dense       average of outputs
+3.1. Random Initializations
+                                                             Table 4. The RNN initialization used in the experiments.
+The results in the previous section were obtained with
+                                                             The scale of the vis-hid connections is problem dependent.
+standard logistic sigmoid neural networks that were
+initialized with the sparse initialization technique (SI)
+described in Martens (2010). In this scheme, each ran-       Each task involved optimizing the parameters of a ran-
+dom unit is connected to 15 randomly chosen units in         domly initialized RNN with 100 standard tanh hidden
+the previous layer, whose weights are drawn from a           units (the same model used by Martens & Sutskever
+unit Gaussian, and the biases are set to zero. The in-       (2011)). The tasks were designed by Hochreiter &
+tuitive justification is that the total amount of input      Schmidhuber (1997), and are referred to as training
+to each unit will not depend on the size of the previ-       “problems”. See sec. A.3 of the appendix for details.
+ous layer and hence they will not as easily saturate.
+Meanwhile, because the inputs to each unit are not all       4.1. ESN-based Initialization
+randomly weighted blends of the outputs of many 100s
+                                                             As argued by Jaeger & Haas (2004), the spectral ra-
+or 1000s of units in the previous layer, they will tend
+                                                             dius of the hidden-to-hidden matrix has a profound
+to be qualitatively more “diverse” in their response
+                                                             e↵ect on the dynamics of the RNN’s hidden state
+to inputs. When using tanh units, we transform the
+                                                             (with a tanh nonlinearity). When it is smaller than
+weights to simulate sigmoid units by setting the biases
+                                                             1, the dynamics will have a tendency to quickly “for-
+to 0.5 and rescaling the weights by 0.25.
+                                                             get” whatever input signal they may have been ex-
+We investigated the performance of the optimization          posed to. When it is much larger than 1, the dy-
+as a function of the scale constant used in SI (which        namics become oscillatory and chaotic, allowing it to
+defaults to 1 for sigmoid units). We found that SI           generate responses that are varied for di↵erent input
+works reasonably well if it is rescaled by a factor of       histories. While this allows information to be retained
+2, but leads to noticeable (but not severe) slow down        over many time steps, it can also lead to severe explod-
+when scaled by a factor of 3. When we used the factor        ing gradients that make gradient-based learning much
+1/2 or 5 we did not achieve sensible results.                more difficult. However, when the spectral radius is
+                                                             only slightly greater than 1, the dynamics remain os-
+4. Recurrent Neural Networks                                 cillatory and chaotic while the gradient are no longer
+                                                             exploding (and if they do explode, then only “slightly
+Echo-State Networks (ESNs) is a family of RNNs with
+                                                             so”), so learning may be possible with a spectral ra-
+an unusually simple training method: their hidden-to-
+                                                             dius of this order. This suggests that a spectral radius
+output connections are learned from data, but their re-
+                                                             of around 1.1 may be e↵ective.
+current connections are fixed to a random draw from
+a specific distribution and are not learned. Despite         To achieve robust results, we also found it is essential
+their simplicity, ESNs with many hidden units (or            to carefully set the initial scale of the input-to-hidden
+with units with explicit temporal integration, like the      connections. When training RNNs to solve those tasks
+LSTM) have achieved high performance on tasks with           that possess many random and irrelevant distractor in-
+long range dependencies (?). In this section, we inves-      puts, we found that having the scale of these connec-
+tigate the e↵ectiveness of momentum-based methods            tions set too high at the start led to relevant informa-
+with ESN-inspired initialization at training RNNs with       tion in the hidden state being too easily “overwritten”
+conventional size and standard (i.e., non-integrating)       by the many irrelevant signals, which ultimately led
+neurons. We find that momentum-accelerated SGD               the optimizer to converge towards an extremely poor
+can successfully train such RNNs on various artificial       local minimum where useful information was never re-
+datasets exhibiting considerable long-range temporal         layed over long distances. Conversely, we found that if
+dependencies. This is unexpected because RNNs were           this scale was set too low, it led to significantly slower
+believed to be almost impossible to successfully train       learning. Having experimented with multiple scales we
+on such datasets with first-order methods, due to var-       found that a Gaussian draw with a standard deviation
+ious difficulties such as vanishing/exploding gradients      of 0.001 achieved a good balance between these con-
+(Bengio et al., 1994). While we found that the use           cerns. However, unlike the value of 1.1 for the spectral
+of momentum significantly improved performance and           radius of the dynamics matrix, which worked well on
+robustness, we obtained nontrivial results even with         all tasks, we found that good choices for initial scale
+standard SGD, provided that the learning rate was            of the input-to-hidden weights depended a lot on the
+set low enough.                                              particular characteristics of the particular task (such
+                    On the importance of initialization and momentum in deep learning
+
+as its dimensionality or the input variance). Indeed,       even better performance. But the main achievement
+for tasks that do not have many irrelevant inputs, a        of these results is a demonstration of the ability of
+larger scale of the input-to-hidden weights (namely,        momentum methods to cope with long-range tempo-
+0.1) worked better, because the aforementioned dis-         ral dependency training tasks to a level which seems
+advantage of large input-to-hidden weights does not         sufficient for most practical purposes. Moreover, our
+apply. See table 4 for a summary of the initializations     approach seems to be more tolerant of smaller mini-
+used in the experiments. Finally, we found centering        batches, and is considerably simpler than the partic-
+(mean subtraction) of both the inputs and the outputs       ular version of HF proposed in Martens & Sutskever
+to be important to reliably solve all of the training       (2011), which used a specialized update damping tech-
+problems. See the appendix for more details.                nique whose benefits seemed mostly limited to training
+                                                            RNNs to solve these kinds of extreme temporal depen-
+4.2. Experimental Results                                   dency problems.
+We conducted experiments to determine the effi-
+cacy of our initializations, the e↵ect of momentum,         5. Momentum and HF
+and to compare NAG with CM. Every learning trial            Truncated Newton methods, that include the HF
+used the aforementioned initialization, 50,000 param-       method of Martens (2010) as a particular example,
+eter updates and on minibatches of 100 sequences,           work by optimizing a local quadratic model of the
+and the following schedule for the momentum co-             objective via the linear conjugate gradient algorithm
+efficient µ: µ = 0.9 for the first 1000 parameter,          (CG), which is a first-order method. While HF, like
+after which µ = µ0 , where µ0 can take the fol-             all truncated-Newton methods, takes steps computed
+lowing values {0, 0.9, 0.98, 0.995}. For each µ0 , we       using partially converged calls to CG, it is naturally
+use the empirically best learning rate chosen from          accelerated along at least some directions of lower cur-
+{10 3 , 10 4 , 10 5 , 10 6 }.                               vature compared to the gradient. It can even be shown
+The results are presented in Table 5, which are the av-     (Martens & Sutskever, 2012) that CG will tend to fa-
+erage loss over 4 di↵erent random seeds. Instead of re-     vor convergence to the exact solution to the quadratic
+porting the loss being minimized (which is the squared      sub-problem first along higher curvature directions
+error or cross entropy), we use a more interpretable        (with a bias towards those which are more clustered
+zero-one loss, as is standard practice with these prob-     together in their curvature-scalars/eigenvalues).
+lems. For the bit memorization, we report the frac-         While CG accumulates information as it iterates which
+tion of timesteps that are computed incorrectly. And        allows it to be optimal in a much stronger sense than
+for the addition and the multiplication problems, we        any other first-order method (like NAG), once it is
+report the fraction of cases where the RNN the error        terminated, this information is lost. Thus, standard
+in the final output prediction exceeded 0.04.               truncated Newton methods can be thought of as per-
+Our results show that despite the considerable long-        sisting information which accelerates convergence (of
+range dependencies present in training data for these       the current quadratic) only over the number of itera-
+problems, RNNs can be successfully and robustly             tions CG performs. By contrast, momentum methods
+trained to solve them, through the use of the initial-      persist information that can inform new updates across
+ization discussed in sec. 4.1, momentum of the NAG          an arbitrary number of iterations.
+type, a large µ0 , and a particularly small learning rate   One key di↵erence between standard truncated New-
+(as compared with feedforward networks). Our results        ton methods and HF is the use of “hot-started” calls to
+also suggest that with larger values of µ0 achieve bet-     CG, which use as their initial solution the one found at
+ter results with NAG but not with CM, possibly due to       the previous call to CG. While this solution was com-
+NAG’s tolerance of larger µ0 ’s (as discussed in sec. 2).   puted using old gradient and curvature information
+Although we were able to achieve surprisingly good          from a previous point in parameter space and possi-
+training performance on these problems using a suf-         bly a di↵erent set of training data, it may be well-
+ficiently strong momentum, the results of Martens &         converged along certain eigen-directions of the new
+Sutskever (2011) appear to be moderately better and         quadratic, despite being very poorly converged along
+more robust. They achieved lower error rates and their      others (perhaps worse than the default initial solution
+initialization was chosen with less care, although the      of ~0). However, to the extent to which the new local
+initializations are in many ways similar to ours. No-       quadratic model resembles the old one, and in partic-
+tably, Martens & Sutskever (2011) were able to solve        ular in the more difficult to optimize directions of low-
+these problems without centering, while we had to           curvature (which will arguably be more likely to per-
+use centering to solve the multiplication problem (the      sist across nearby locations in parameter space), the
+other problems are already centered). This suggests         previous solution will be a preferable starting point to
+that the initialization proposed here, together with the    0, and may even allow for gradually increasing levels
+method of Martens & Sutskever (2011), could achieve         of convergence along certain directions which persist
+                    On the importance of initialization and momentum in deep learning
+
+                 problem          biases    0     0.9N     0.98N     0.995N     0.9M    0.98M     0.995M
+                add T = 80         0.82    0.39   0.02      0.21    0.00025     0.43      0.62     0.036
+                mul T = 80         0.84    0.48   0.36      0.22     0.0013     0.029    0.025      0.37
+               mem-5 T = 200       2.5     1.27   1.02      0.96      0.63      1.12      1.09      0.92
+               mem-20 T = 80       8.0     5.37   2.77     0.0144   0.00005     1.75    0.0017     0.053
+
+Table 5. Each column reports the errors (zero-one losses; sec. 4.2) on di↵erent problems for each combination of µ0 and
+momentum type (NAG, CM), averaged over 4 di↵erent random seeds. The “biases” column lists the error attainable by
+learning the output biases and ignoring the hidden state. This is the error of an RNN that failed to “establish communi-
+cation” between its inputs and targets. For each µ0 , we used the fixed learning rate that gave the best performance.
+
+in the local quadratic models across many updates.            them over NAG, or if they are closer to the aforemen-
+                                                              tioned worst-case examples. To examine this question
+The connection between HF and momentum methods
+                                                              we took a quadratic generated during the middle of a
+can be made more concrete by noticing that a single
+                                                              typical run of HF on the curves dataset and compared
+step of CG is e↵ectively a gradient update taken from
+                                                              the convergence rate of CG, initialized from zero, to
+the current point, plus the previous update reapplied,
+                                                              NAG (also initialized from zero). Figure 5 in the ap-
+just as with NAG, and that if CG terminated after just
+                                                              pendix presents the results of this experiment. While
+1 step, HF becomes equivalent to NAG, except that it
+                                                              this experiment indicates some potential advantages to
+uses a special formula based on the curvature matrix
+                                                              HF, the closeness of the performance of NAG and HF
+for the learning rate instead of a fixed constant. The
+                                                              suggests that these results might be explained by the
+most e↵ective implementations of HF even employ a
+                                                              solutions leaving the area of trust in the quadratics be-
+“decay” constant (Martens & Sutskever, 2012) which
+                                                              fore any extra speed kicks in, or more subtly, that the
+acts analogously to the momentum constant µ. Thus,
+                                                              faithfulness of approximation goes down just enough
+in this sense, the CG initializations used by HF allow
+                                                              as CG iterates to o↵set the benefit of the acceleration
+us to view it as a hybrid of NAG and an exact second-
+                                                              it provides.
+order method, with the number of CG iterations used
+to compute each update e↵ectively acting as a dial
+between the two extremes.                                     6. Discussion
+Inspired by the surprising success of momentum-based          Martens (2010) and Martens & Sutskever (2011)
+methods for deep learning problems, we experimented           demonstrated the e↵ectiveness of the HF method as
+with making HF behave even more like NAG than it al-          a tool for performing optimizations for which previ-
+ready does. The resulting approach performed surpris-         ous attempts to apply simpler first-order methods had
+ingly well (see Table 1). For a more detailed account         failed. While some recent work (Chapelle & Erhan,
+of these experiments, see sec. A.6 of the appendix.           2011; Glorot & Bengio, 2010) suggested that first-order
+                                                              methods can actually achieve some success on these
+If viewed on the basis of each CG step (instead of            kinds of problems when used in conjunction with good
+each update to parameters ✓), HF can be thought of            initializations, their results still fell short of those re-
+as a peculiar type of first-order method which approx-        ported for HF. In this paper we have completed this
+imates the objective as a series of quadratics only so        picture and demonstrated conclusively that a large
+that it can make use of the powerful first-order CG           part of the remaining performance gap that is not
+method. So apart from any potential benefit to global         addressed by using a well-designed random initializa-
+convergence from its tendency to prefer certain direc-        tion is in fact addressed by careful use of momentum-
+tions of movement in parameter space over others, per-        based acceleration (possibly of the Nesterov type). We
+haps the main theoretical benefit to using HF over a          showed that careful attention must be paid to the mo-
+first-order method like NAG is its use of CG, which,          mentum constant µ, as predicted by the theory for
+while itself a first-order method, is well known to have      local and convex optimization.
+strongly optimal convergence properties for quadrat-
+ics, and can take advantage of clustered eigenvalues          Momentum-accelerated SGD, despite being a first-
+to accelerate convergence (see Martens & Sutskever            order approach, is capable of accelerating directions
+(2012) for a detailed account of this well-known phe-         of low-curvature just like an approximate Newton
+nomenon). However, it is known that in the worst              method such as HF. Our experiments support the idea
+case that CG, when run in batch mode, will converge           that this is important, as we observed that the use of
+asymptotically no faster than NAG (also run in batch          stronger momentum (as determined by µ) had a dra-
+mode) for certain specially designed quadratics with          matic e↵ect on optimization performance, particularly
+very evenly distributed eigenvalues/curvatures. Thus          for the RNNs. Moreover, we showed that HF can be
+it is worth asking whether the quadratics which arise         viewed as a first-order method, and as a generalization
+during the optimization of neural networks by HF are          of NAG in particular, and that it already derives some
+such that CG has a distinct advantage in optimizing           of its benefits through a momentum-like mechanism.
+                     On the importance of initialization and momentum in deep learning
+
+References                                                    LeCun, Y., Bottou, L., Orr, G., and Müller, K. Efficient
+                                                                backprop. Neural networks: Tricks of the trade, pp. 546–
+Bengio, Y., Simard, P., and Frasconi, P.        Learning        546, 1998.
+  long-term dependencies with gradient descent is diffi-
+  cult. IEEE Transactions on Neural Networks, 5:157–166,      Martens, J. Deep learning via Hessian-free optimization.
+  1994.                                                        In Proceedings of the 27th International Conference on
+                                                               Machine Learning (ICML), 2010.
+Bengio, Y., Lamblin, P, Popovici, D., and Larochelle, H.
+  Greedy layer-wise training of deep networks. In In NIPS.    Martens, J. and Sutskever, I. Learning recurrent neural
+  MIT Press, 2007.                                             networks with hessian-free optimization. In Proceedings
+                                                               of the 28th International Conference on Machine Learn-
+Bottou, L. and LeCun, Y. Large scale online learning. In       ing (ICML), pp. 1033–1040, 2011.
+  Advances in Neural Information Processing Systems 16:
+  Proceedings of the 2003 Conference, volume 16, pp. 217.     Martens, J. and Sutskever, I. Training deep and recurrent
+  MIT Press, 2004.                                             networks with hessian-free optimization. Neural Net-
+                                                               works: Tricks of the Trade, pp. 479–535, 2012.
+Chapelle, O. and Erhan, D. Improved Preconditioner for
+  Hessian Free Optimization. In NIPS Workshop on Deep         Mikolov, Tomáš, Sutskever, Ilya, Deoras, Anoop, Le,
+  Learning and Unsupervised Feature Learning, 2011.             Hai-Son, Kombrink, Stefan, and Cernocky, J. Sub-
+                                                                word language modeling with neural networks. preprint
+Cotter, A., Shamir, O., Srebro, N., and Sridharan, K. Bet-      (http://www. fit. vutbr. cz/imikolov/rnnlm/char. pdf ),
+  ter mini-batch algorithms via accelerated gradient meth-      2012.
+  ods. arXiv preprint arXiv:1106.4574, 2011.
+                                                              Mohamed, A., Dahl, G.E., and Hinton, G. Acoustic mod-
+Dahl, G.E., Yu, D., Deng, L., and Acero, A. Context-           eling using deep belief networks. Audio, Speech, and
+  dependent pre-trained deep neural networks for large-        Language Processing, IEEE Transactions on, 20(1):14
+  vocabulary speech recognition. Audio, Speech, and Lan-       –22, Jan. 2012.
+  guage Processing, IEEE Transactions on, 20(1):30–42,
+  2012.                                                       Nesterov, Y. A method of solving a convex program-
+                                                                ming problem with convergence rate O(1/sqr(k)). Soviet
+Darken, C. and Moody, J. Towards faster stochastic gra-         Mathematics Doklady, 27:372–376, 1983.
+  dient search. Advances in neural information processing
+  systems, pp. 1009–1009, 1993.                               Nesterov, Y. Introductory lectures on convex optimization:
+                                                                A basic course, volume 87. Springer, 2003.
+Glorot, X. and Bengio, Y. Understanding the difficulty
+  of training deep feedforward neural networks. In Pro-       Orr, G.B. Dynamics and algorithms for stochastic search.
+  ceedings of AISTATS 2010, volume 9, pp. 249–256, may          1996.
+  2010.
+                                                              Polyak, B.T. Some methods of speeding up the convergence
+Graves, A. Sequence transduction with recurrent neural          of iteration methods. USSR Computational Mathematics
+  networks. arXiv preprint arXiv:1211.3711, 2012.               and Mathematical Physics, 4(5):1–17, 1964.
+Hinton, G and Salakhutdinov, R. Reducing the dimension-       Raiko, Tapani, Valpola, Harri, and LeCun, Yann. Deep
+  ality of data with neural networks. Science, 313:504–507,     learning made easier by linear transformations in percep-
+  2006.                                                         trons. In NIPS 2011 Workshop on Deep Learning and
+                                                                Unsupervised Feature Learning, Sierra Nevada, Spain,
+Hinton, G., Deng, L., Yu, D., Dahl, G., Mohamed, A.,            2011.
+  Jaitly, N., Senior, A., Vanhoucke, V., Nguyen, P.,
+  Sainath, T., et al. Deep neural networks for acoustic       Sutskever, I., Martens, J., and Hinton, G. Generating
+  modeling in speech recognition. IEEE Signal Processing        text with recurrent neural networks. In Proceedings of
+  Magazine, 2012.                                               the 28th International Conference on Machine Learning,
+                                                                ICML ’11, pp. 1017–1024, June 2011.
+Hinton, G.E., Osindero, S., and Teh, Y.W. A fast learning
+  algorithm for deep belief nets. Neural computation, 18      Wiegerinck, W., Komoda, A., and Heskes, T. Stochas-
+  (7):1527–1554, 2006.                                         tic dynamics of learning with momentum in neural net-
+                                                               works. Journal of Physics A: Mathematical and General,
+Hochreiter, S. and Schmidhuber, J. Long short-term mem-        27(13):4425, 1999.
+  ory. Neural computation, 9(8):1735–1780, 1997.
+Jaeger, H. personal communication, 2012.
+Jaeger, H. and Haas, H. Harnessing nonlinearity: Pre-
+  dicting chaotic systems and saving energy in wireless
+  communication. Science, 304:78–80, 2004.
+Krizhevsky, A., Sutskever, I., and Hinton, G. Imagenet
+  classification with deep convolutional neural networks.
+  In Advances in Neural Information Processing Systems
+  25, pp. 1106–1114, 2012.
+Lan, G. An optimal method for stochastic composite op-
+  timization. Mathematical Programming, pp. 1–33, 2010.
+

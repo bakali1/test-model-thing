@@ -1,0 +1,253 @@
+ 
+ Enhancing SignSGD: Small-Batch Convergence Analysis and a Hybrid Switching Strategy 
+ Report GitHub Issue
+ × 
+ Title: 
+ Content selection saved. Describe the issue below:
+ Description: 
+ Submit without GitHub 
+ Submit in GitHub 
+ arXiv is now an independent nonprofit! 
+ Learn more 
+ × 
+ Back to arXiv 
+ Why HTML? 
+ Report Issue 
+ Back to Abstract 
+ Download PDF 
+ Abstract 
+ I Introduction 
+ II Background and Related Work 
+ III Small-Batch Convergence Under Unimodal Symmetric Noise 
+ IV Pre-Quantization Dithering 
+ V Calibrated Switching to SGD 
+ VI Results Summary and Discussion 
+ VII Conclusion 
+ References 
+ License: arXiv.org perpetual non-exclusive license
+arXiv:2604.25550v1 [cs.LG] 28 Apr 2026
+ Enhancing SignSGD: Small-Batch Convergence Analysis and a Hybrid Switching Strategy
+ Haoran Chen, Wentao Wang
+ Affiliation: École polytechnique 
+ Palaiseau, France 
+ haoran.chen@polytechnique.edu, wentao.wang@polytechnique.edu
+ Abstract
+ SignSGD compresses each stochastic gradient coordinate to a single bit, offering substantial memory and communication savings, but its 1-bit quantization removes magnitude information and is known to leave a generalization gap relative to well-tuned SGD. We revisit SignSGD from a 1-bit quantization and dithering perspective and contribute three improvements. First, we derive a small-batch convergence rate for SignSGD under unimodal symmetric gradient noise using a signal-to-noise weighted stationarity measure, removing the large-batch assumption of prior analyses. Second, we inject annealed Gaussian noise before the sign operator, which acts as a classical dithering mechanism and probabilistically restores magnitude information lost to hard thresholding. Third, we adapt the SWATS strategy to sign-based updates with a projection-based learning-rate calibration that smoothly transitions from SignSGD to SGD. Single-worker experiments on ResNet-18 isolate optimizer effects from communication aspects: pre-sign dithering surpasses Adam on CIFAR-100, and the calibrated switch reaches 92.18% test accuracy on CIFAR-10, outperforming both pure SGD (91.38%) and pure SignSGD with momentum (90.82%).
+ Index Terms: 
+Stochastic optimization, 1-bit quantization, dithering, sign-SGD, communication-efficient training, deep learning.
+ I Introduction 
+ Training deep neural networks at scale stresses both compute and communication budgets, motivating compressed gradient updates for memory-constrained and distributed settings. SignSGD [ 1 ] replaces each stochastic gradient coordinate $\tilde{g}_{i}$ by its sign, yielding a 1-bit update with strong communication-reduction properties when combined with majority-vote aggregation across workers. From a signal-processing viewpoint, $\mathrm{sign}(\tilde{g}_{i})$ is a coarse 1-bit quantizer applied to a noisy signal, and many of the algorithm’s behaviors—robustness to sparse gradient noise, biased fixed points, and sensitivity to small-magnitude coordinates—are natural consequences of this quantization.
+ Despite its appeal, sign-based optimizers exhibit a persistent generalization gap relative to well-tuned SGD on vision benchmarks [ 1 ] , mirroring the gap observed for adaptive methods more broadly [ 8 ] , and now also visible in modern variants such as Lion [ 4 ] , which is in essence a sign-of-momentum optimizer. The gap is commonly attributed to two factors: (i) hard thresholding discards magnitude information that would otherwise modulate the step direction near small or noisy coordinates, and (ii) the uniform $\pm\delta$ step can prevent convergence to flat minima associated with good generalization [ 2 ] .
+ Contributions. Through a 1-bit-quantization-and-dithering lens, we make three contributions:
+ • 
+ Small-batch convergence analysis (Sec. III ): we derive a signal-to-noise (SNR) weighted stationarity rate for SignSGD with constant batch size under unimodal symmetric noise, complementing the large-batch rate of [ 1 ] .
+ • 
+ Pre-sign dithering (Sec. IV ): we add annealed Gaussian noise before the sign operator, the optimizer-side analogue of classical subtractive dithering in 1-bit A/D conversion [ 10 , 11 ] , and show it consistently improves test accuracy on CIFAR-100, surpassing Adam.
+ • 
+ Calibrated switch to SGD (Sec. V ): we adapt SWATS [ 8 ] to sign-based updates with a projection-based learning-rate calibration that matches the effective step size of SignSGD with momentum at the switching iterate, avoiding the magnitude mismatch of a naive switch.
+ Scope. All experiments use a single worker and are intended to isolate the optimization-side effects of 1-bit quantization, dithering, and switching from communication-side considerations. The dithering and switching mechanisms are compatible with majority-vote aggregation, but a multi-worker evaluation is left to future work.
+ II Background and Related Work 
+ SignSGD and variants. Bernstein et al. [ 1 ] established that SignSGD attains an $\mathcal{O}(1/\sqrt{N})$ rate on the average $\ell_{1}$ -gradient norm under coordinate-wise smoothness and bounded variance, and that majority-vote aggregation across $M$ workers reduces the variance term by $\sqrt{M}$ . Subsequent work showed that vanilla SignSGD can fail to converge under non-symmetric noise and proposed error-feedback variants [ 2 ] ; communication-compressed Adam variants such as 1-bit Adam [ 3 ] extend the same idea to adaptive optimizers. Lion [ 4 ] , recently popular for large-scale pretraining, is in essence a sign-of-momentum optimizer and inherits the geometry studied here. An early predecessor is 1-bit SGD applied to speech DNN training [ 7 ] .
+ Quantized and compressed SGD. Beyond 1-bit, QSGD [ 5 ] , TernGrad [ 6 ] , and Top-K sparsification trade compression rate against unbiasedness. SignSGD sits at the extreme compression end and trades unbiasedness for simplicity.
+ Gradient noise and dithering. Adding Gaussian noise to gradients improves training of very deep networks [ 9 ] ; in signal processing, dithering before a coarse quantizer is a classical mechanism to decorrelate quantization error from the input and to encode sub-quantum-step information probabilistically [ 10 , 11 ] . Our pre-sign noise injection makes this connection explicit on the optimizer side.
+ Adaptive-to-SGD switching. SWATS [ 8 ] starts with Adam and switches to SGD with a learning rate determined by a projection condition. We transplant this idea to sign-based updates with a momentum-aware projection.
+ III Small-Batch Convergence Under Unimodal Symmetric Noise 
+ We adopt the standard assumptions of [ 1 ] : $f$ is lower bounded by $f^{\star}$ , has a coordinate-wise Lipschitz constant vector $\vec{L}$ with $L_{i}$ the Lipschitz constant of $\partial_{i}f$ , and the unbiased single-sample stochastic gradient oracle has coordinate variance bounded by $\sigma_{i}^{2}$ . We additionally assume that the per-coordinate noise is unimodal and symmetric, so that the sign-failure-probability bound of [ 1 ] —a consequence of Gauss’s inequality [ 12 ] —applies coordinate-wise. The mini-batch estimator $\tilde{g}_{k}$ at iteration $k$ is the average of $n$ independent samples of the oracle, so that $\mathrm{Var}(\tilde{g}_{k,i}\mid x_{k})\leq\sigma_{i}^{2}/n$ .
+ Let $\tilde{L}_{1}:=\sum_{i}L_{i}$ , $\tilde{\sigma}_{1}:=\sum_{i}\sigma_{i}$ , $s_{k,i}:=\sqrt{\mathrm{Var}(\tilde{g}_{k,i}\mid x_{k})}$ , and $S_{k,i}:=|g_{k,i}|/s_{k,i}$ denote the per-coordinate signal-to-noise ratio at iteration $k$ . We define the SNR-weighted stationarity measure
+ $\Phi_{k}:=\sum_{i=1}^{d}|g_{k,i}|\min\!\left(1,S_{k,i}\right)=\sum_{i=1}^{d}\min\!\left(|g_{k,i}|,\frac{|g_{k,i}|^{2}}{s_{k,i}}\right).$ 
+ (1) 
+ $\Phi_{k}$ smoothly interpolates between $\|g_{k}\|_{1}$ on high-SNR coordinates and a quadratic-in- $|g_{k,i}|$ measure on low-SNR coordinates, reflecting the diminishing usefulness of the sign bit when noise dominates the signal. This is a more refined stationarity criterion than $\|g_{k}\|_{1}$ : it weights each coordinate by its informativeness rather than its raw magnitude.
+ Theorem 1 (Small-batch SNR-weighted rate of SignSGD) . 
+ Run SignSGD for $K$ iterations with constant mini-batch size $n_{k}\equiv n$ and constant stepsize $\delta_{k}\equiv 1/\sqrt{\tilde{L}_{1}K}$ . Then 
+ $\displaystyle\mathbb{E}\!\left[\frac{1}{K}\sum_{k=0}^{K-1}\Phi_{k}\right]$ 
+ $\displaystyle\leq\frac{3\sqrt{\tilde{L}_{1}}}{\sqrt{K}}\!\left(f_{0}-f^{\star}+\tfrac{1}{2}\right),$ 
+ (2) 
+ $\displaystyle\mathbb{E}\!\left[\frac{1}{K}\sum_{k=0}^{K-1}\|g_{k}\|_{1}\right]$ 
+ $\displaystyle\leq\frac{3\sqrt{\tilde{L}_{1}}}{\sqrt{K}}\!\left(f_{0}-f^{\star}+\tfrac{1}{2}\right)+\frac{\tilde{\sigma}_{1}}{\sqrt{n}}.$ 
+ (3) 
+ Proof.
+ By coordinate-wise smoothness with $y=x_{k+1}$ , $x=x_{k}$ , 
+ $f_{k+1}-f_{k}\leq-\delta_{k}g_{k}^{\top}\mathrm{sign}(\tilde{g}_{k})+\frac{\delta_{k}^{2}}{2}\tilde{L}_{1}.$ 
+ (4) 
+ Let $p_{k,i}:=\mathbb{P}[\mathrm{sign}(\tilde{g}_{k,i})\neq\mathrm{sign}(g_{k,i})\mid x_{k}]$ , so that 
+ $\mathbb{E}[g_{k,i}\,\mathrm{sign}(\tilde{g}_{k,i})\mid x_{k}]=|g_{k,i}|(1-2p_{k,i}).$ 
+ (5) 
+ The Gauss-inequality bound for unimodal symmetric noise [ 1 , 12 ] gives, after a slight relaxation of the split point at $S=\sqrt{2/3}$ , 
+ (6) 
+ which yields $1-2p_{k,i}\geq\frac{1}{3}\min(1,S_{k,i})$ in both regimes. Summing over coordinates and combining with ( 5 ) gives 
+ $\mathbb{E}[g_{k}^{\top}\mathrm{sign}(\tilde{g}_{k})\mid x_{k}]\geq\frac{1}{3}\Phi_{k}.$ 
+ (7) 
+ Substituting ( 7 ) into ( 4 ), taking total expectation and telescoping over $k=0,\ldots,K-1$ , 
+ $f_{0}-f^{\star}\geq\frac{1}{3}\sum_{k}\delta_{k}\mathbb{E}[\Phi_{k}]-\frac{\tilde{L}_{1}}{2}\sum_{k}\delta_{k}^{2}.$ 
+ (8) 
+ With $\delta_{k}\equiv 1/\sqrt{\tilde{L}_{1}K}$ , rearranging yields ( 2 ). For ( 3 ), the elementary inequality $|a|\leq\min(|a|,a^{2}/s)+s$ valid for $a\in\mathbb{R}$ , $s>0$ , applied with $s_{k,i}\leq\sigma_{i}/\sqrt{n}$ gives $\|g_{k}\|_{1}\leq\Phi_{k}+\tilde{\sigma}_{1}/\sqrt{n}$ . Averaging over $k$ and combining with ( 2 ) completes the proof.
+∎ 
+ Discussion. Compared to Theorem 1 of [ 1 ] , which requires $n_{k}\equiv K$ (a large-batch regime where increasing the optimization horizon implicitly raises the batch size), Theorem 1 holds for any constant $n$ , at the price of a non-vanishing $\tilde{\sigma}_{1}/\sqrt{n}$ floor in ( 3 ). This floor is an honest reflection of the cost of 1-bit quantization at small batch sizes: when the per-coordinate SNR is low, the sign bit carries little information about the gradient direction, and no amount of iteration can drive $\|g_{k}\|_{1}$ below the noise level encoded in $\tilde{\sigma}_{1}/\sqrt{n}$ . The SNR-weighted measure $\Phi_{k}$ in ( 2 ), by contrast, vanishes at the standard $\mathcal{O}(1/\sqrt{K})$ rate, providing a clean stationarity guarantee in the small-batch regime.
+ IV Pre-Quantization Dithering 
+ Mechanism. The sign operator is a coarse 1-bit quantizer; its output ignores all magnitude information in its argument. Subtractive and non-subtractive dithering—adding controlled noise to a signal before quantization—is a textbook technique to decorrelate quantization error from the input and to encode sub-quantum-step information probabilistically [ 10 , 11 ] . We apply this idea to SignSGD with momentum (SignSGD-M), summarized in Algorithm 1 .
+ Algorithm 1 Dithered SignSGD-M (pre-sign noise) 
+ 1: 
+ learning rate $\delta$ , momentum $\beta\in(0,1)$ , dither schedule $\sigma_{k}^{2}=\alpha(1+k)^{-\gamma}$ 
+ 2: 
+ Initialize $x_{0}$ , $m_{0}\leftarrow 0$ 
+ 3: 
+ for $k=0,1,\ldots,K-1$ do 
+ 4: 
+   Sample mini-batch and compute $\tilde{g}_{k}$ 
+ 5: 
+    $m_{k+1}\leftarrow\beta m_{k}+(1-\beta)\tilde{g}_{k}$ 
+ 6: 
+   Sample dither $\xi_{k}\sim\mathcal{N}(0,\sigma_{k}^{2}I)$ 
+ 7: 
+    $x_{k+1}\leftarrow x_{k}-\delta\,\mathrm{sign}(m_{k+1}+\xi_{k})$ 
+ 8: 
+ end for 
+ We anneal the dither variance following [ 9 ] :
+ $\sigma_{k}^{2}=\alpha(1+k)^{-\gamma},\qquad\gamma=0.55.$ 
+ (9) 
+ For comparison we also evaluate post-sign injection,
+ $x_{k+1}=x_{k}-\delta\!\left(\mathrm{sign}(m_{k+1})+\xi_{k}\right),$ 
+ (10) 
+ which perturbs the already-normalized step and is closer in spirit to exploration noise on a constant-magnitude update.
+ Effect on the sign-failure probability. Consider a single coordinate with momentum signal $m_{i}>0$ and pre-sign Gaussian noise $\xi_{i}\sim\mathcal{N}(0,\sigma_{k}^{2})$ . The probability of correct sign is $\Phi(m_{i}/\sigma_{k})$ , where $\Phi$ is the standard normal CDF. As $\sigma_{k}\to 0$ this recovers the deterministic sign of $m_{i}$ ; for moderate $\sigma_{k}$ , coordinates with $|m_{i}|\lesssim\sigma_{k}$ produce dithered (probabilistic) signs whose expectation is $2\Phi(m_{i}/\sigma_{k})-1\approx m_{i}\sqrt{2/\pi}/\sigma_{k}$ to first order. This is, in spirit, the optimizer-side analogue of classical dithering theory [ 10 , 11 ] : the average update on small-magnitude coordinates becomes proportional to $m_{i}$ rather than its sign, partially restoring the magnitude information lost to quantization. The annealing schedule ( 9 ) ensures that this effect is strongest early in training—when the gradient signal is informative but coarsely quantized—and decays so as not to interfere with late-stage convergence.
+ Fig. 1: Test accuracy on CIFAR-100 (ResNet-18) for SignSGD-M with pre- and post-sign Gaussian dithering, against SGD and Adam baselines. Pre-sign injection with $\alpha=0.1$ is the best sign-based variant, surpassing Adam and approaching SGD; post-sign injection is unstable. Stepwise jumps reflect a learning-rate schedule shared across all methods. 
+ Empirical results. We evaluate on CIFAR-100 with ResNet-18 [ 14 ] (Fig. 1 ). Pre-sign dithering with $\alpha=0.1$ reaches roughly 76% test accuracy, the best among all sign-based variants, surpassing Adam [ 13 ] ( $\sim$ 67%) and approaching the SGD baseline ( $\sim$ 77%). Larger $\alpha=0.5$ also helps but plateaus lower, while $\alpha=0.01$ provides marginal benefit, indicating that the dither variance must be matched to the typical magnitude of the momentum signal. Post-sign injection, which perturbs the already-normalized step, fails to provide a meaningful gain: it shows at most a marginal improvement over clean SignSGD-M (within 1%) and degrades for larger $\alpha$ , consistent with random-walk behavior on a fixed-magnitude update.
+ V Calibrated Switching to SGD 
+ Motivation. A naive hand-off from SignSGD-M to SGD at a fixed epoch is unstable: the normalized $\pm\delta$ updates of SignSGD-M and the gradient-proportional updates of SGD are on different magnitude scales, and reusing either learning rate produces stagnation or divergence. Following SWATS [ 8 ] , we calibrate the SGD learning rate at the switching iterate so that the SGD update matches the projection of the sign-based update onto the gradient direction.
+ Projection rule. Let $\delta$ be the SignSGD-M learning rate, $m_{k+1}=\beta m_{k}+(1-\beta)\tilde{g}_{k}$ the just-updated momentum at iteration $k$ , and $\tilde{g}_{k}$ the current stochastic mini-batch gradient. The SignSGD-M step actually applied at iteration $k$ is $-\delta\,\mathrm{sign}(m_{k+1})$ . We seek a scalar $\lambda_{k}\geq 0$ such that the SGD update $-\lambda_{k}\tilde{g}_{k}$ equals the projection of $-\delta\,\mathrm{sign}(m_{k+1})$ onto $\tilde{g}_{k}$ :
+ $\lambda_{k}\|\tilde{g}_{k}\|_{2}^{2}=\delta\,\langle\mathrm{sign}(m_{k+1}),\tilde{g}_{k}\rangle.$ 
+ (11) 
+ Enforcing a non-negative magnitude for stability,
+ $\lambda_{k}=\delta\,\frac{|\langle\mathrm{sign}(m_{k+1}),\tilde{g}_{k}\rangle|}{\|\tilde{g}_{k}\|_{2}^{2}+\epsilon},$ 
+ (12) 
+ with small $\epsilon>0$ for numerical stability. During the SignSGD-M phase we maintain an exponential moving average (EMA) of $\lambda_{k}$ to reduce stochastic variance, and at a fixed switching epoch $T_{\mathrm{switch}}$ we transition to SGD with the EMA stepsize. We use a fixed $T_{\mathrm{switch}}$ to isolate the effect of the projection mechanism from the automatic-trigger heuristic of [ 8 ] . The full procedure is given in Algorithm 2 .
+ Algorithm 2 Hybrid SignSGD-M $\to$ SGD with projection 
+ 1: 
+ SignSGD-M lr $\delta$ , momentum $\beta\in(0,1)$ , EMA decay $\eta$ , switch epoch $T_{\mathrm{switch}}$ 
+ 2: 
+ Initialize $x_{0}$ , $m_{0}\leftarrow 0$ , $\bar{\lambda}\leftarrow 0$ 
+ 3: 
+ for $k=0,1,\ldots,K-1$ do 
+ 4: 
+   Sample mini-batch and compute $\tilde{g}_{k}$ 
+ 5: 
+    if epoch $ then 
+ 6: 
+     $m_{k+1}\leftarrow\beta m_{k}+(1-\beta)\tilde{g}_{k}$ 
+ 7: 
+     $\lambda_{k}\leftarrow\delta\,|\langle\mathrm{sign}(m_{k+1}),\tilde{g}_{k}\rangle|/(\|\tilde{g}_{k}\|_{2}^{2}+\epsilon)$ 
+ 8: 
+     $\bar{\lambda}\leftarrow\eta\bar{\lambda}+(1-\eta)\lambda_{k}$ 
+ 9: 
+     $x_{k+1}\leftarrow x_{k}-\delta\,\mathrm{sign}(m_{k+1})$ 
+ 10: 
+    else 
+ 11: 
+     $x_{k+1}\leftarrow x_{k}-\bar{\lambda}\,\tilde{g}_{k}$ $\triangleright$ SGD with calibrated lr
+ 12: 
+    end if 
+ 13: 
+ end for 
+ Fig. 2: ResNet-18 on CIFAR-10. The hybrid method (green) follows the SignSGD-M trajectory through epoch 25 (red dashed line), then transitions to SGD with the projection-calibrated learning rate from ( 12 ). Final test accuracy: hybrid 92.18%, SGD 91.38%, SignSGD-M 90.82%. 
+ Fig. 3: ResNet-18 on CIFAR-100. The hybrid method substantially mitigates the late-stage stagnation of SignSGD-M ( $\sim$ 69%), reaching $\sim$ 72%, but does not match well-tuned SGD ( $\sim$ 77%) on this benchmark. Switch at epoch 60. 
+ Empirical results. On CIFAR-10 (Fig. 2 ), the hybrid method enjoys the rapid early progress of SignSGD-M—crossing 80% test accuracy several epochs earlier than pure SGD—and after the switch fine-tunes smoothly to 92.18%, outperforming both pure SGD (91.38%) and pure SignSGD-M (90.82%). On CIFAR-100 (Fig. 3 ), the hybrid method substantially reduces the stagnation gap left by SignSGD-M ( $\sim$ 69% $\to$ $\sim$ 72%), but does not close the gap to well-tuned SGD ( $\sim$ 77%); we attribute this to the larger generalization sensitivity of CIFAR-100 to the precise late-training trajectory and to the heuristic choice of $T_{\mathrm{switch}}$ . The CIFAR-100 result indicates that calibrated switching is best understood as a remedy for sign-induced stagnation rather than a uniform improvement over SGD.
+ Practical considerations. The projection rule ( 12 ) requires only inner products and norms of quantities that SignSGD-M already computes, so the EMA tracking adds negligible cost. The dithering scheme of Sec. IV can be combined with the switching scheme of Sec. V : dithering operates inside the SignSGD-M phase and does not modify the projection rule. We did not observe instability from this combination in preliminary experiments, although a systematic study is beyond the scope of this paper.
+ VI Results Summary and Discussion 
+ Table I consolidates the final test accuracies on ResNet-18 across all settings considered. Three observations stand out. First, plain SignSGD-M trails well-tuned SGD by roughly 0.6% on CIFAR-10 and by approximately 12% on CIFAR-100, confirming that the generalization cost of 1-bit quantization grows with task difficulty. Second, pre-sign dithering is the only one of our two improvements that closes most of the CIFAR-100 gap to SGD without changing the optimizer family, while post-sign injection provides at most a marginal benefit over the clean baseline and destabilizes training at higher noise levels—a clear empirical separation between dithering before and after the quantizer. Third, the calibrated switch is most effective on CIFAR-10, where the late-training landscape is benign enough that a short SignSGD-M warm-up followed by SGD beats either pure method; on CIFAR-100 the switch removes SignSGD-M’s stagnation but does not match SGD, suggesting that the projection rule alone cannot recover the implicit regularization that SGD enjoys throughout training. Combining dithering during the SignSGD-M phase with the calibrated switch is a natural next step that we did not exhaustively explore here.
+ TABLE I: Final test accuracy (%) on ResNet-18, single-worker training. Dithering rows (Sec. IV ) and hybrid row (Sec. V ) come from independent runs with matched architectures but separately tuned learning-rate schedules; CIFAR-100 sign-based numbers are read from Fig. 1 and rounded to the nearest integer. Best per column in bold . 
+ Method 
+ CIFAR-10 
+ CIFAR-100 
+ SGD (well-tuned) 
+ 91.38 
+ 77 
+ Adam 
+ – 
+ 67 
+ SignSGD-M (clean) 
+ 90.82 
+ 65 
+ SignSGD-M + post-noise ( $\alpha{=}0.1$ ) 
+ – 
+ 66 
+ SignSGD-M + pre-noise ( $\alpha{=}0.5$ ) 
+ – 
+ 73 
+ SignSGD-M + pre-noise ( $\alpha{=}0.1$ ) 
+ – 
+ 76 
+ Hybrid (SignSGD-M $\to$ SGD) 
+ 92.18 
+ 72 
+ VII Conclusion 
+ We revisited SignSGD through a 1-bit-quantization-and-dithering lens and contributed (i) a small-batch SNR-weighted convergence rate under unimodal symmetric noise, removing the large-batch assumption of prior analyses; (ii) annealed pre-sign Gaussian dithering, the optimizer-side analogue of classical dither, which restores magnitude information lost to hard thresholding; and (iii) a SWATS-style calibrated switch from sign-based updates to SGD via a momentum-aware projection rule. Single-worker experiments on ResNet-18 isolate optimizer effects from communication and show that pre-sign dithering surpasses Adam on CIFAR-100, while the calibrated switch outperforms both pure SGD and SignSGD-M on CIFAR-10 and mitigates SignSGD-M stagnation on CIFAR-100 without fully closing the gap to SGD. Multi-worker experiments under majority-vote aggregation, error-feedback combinations, and an automatic switching trigger calibrated by the EMA stability of $\lambda_{k}$ are natural next steps.
+ References
+ [1] 
+ J. Bernstein, Y.-X. Wang, K. Azizzadenesheli, and A. Anandkumar, “signSGD: Compressed optimisation for non-convex problems,” in Proc. Int. Conf. Machine Learning (ICML) , 2018. arXiv:1802.04434.
+ [2] 
+ S. P. Karimireddy, Q. Rebjock, S. U. Stich, and M. Jaggi, “Error feedback fixes SignSGD and other gradient compression schemes,” in Proc. Int. Conf. Machine Learning (ICML) , 2019. arXiv:1901.09847.
+ [3] 
+ H. Tang, S. Gan, A. A. Awan, S. Rajbhandari, C. Li, X. Lian, J. Liu, C. Zhang, and Y. He, “1-bit Adam: Communication efficient large-scale training with Adam’s convergence speed,” in Proc. Int. Conf. Machine Learning (ICML) , 2021. arXiv:2102.02888.
+ [4] 
+ X. Chen, C. Liang, D. Huang, E. Real, K. Wang, Y. Liu, H. Pham, X. Dong, T. Luong, C.-J. Hsieh, Y. Lu, and Q. V. Le, “Symbolic discovery of optimization algorithms,” in Adv. Neural Inform. Process. Syst. (NeurIPS) , 2023. arXiv:2302.06675.
+ [5] 
+ D. Alistarh, D. Grubic, J. Li, R. Tomioka, and M. Vojnovic, “QSGD: Communication-efficient SGD via gradient quantization and encoding,” in Adv. Neural Inform. Process. Syst. (NeurIPS) , 2017. arXiv:1610.02132.
+ [6] 
+ W. Wen, C. Xu, F. Yan, C. Wu, Y. Wang, Y. Chen, and H. Li, “TernGrad: Ternary gradients to reduce communication in distributed deep learning,” in Adv. Neural Inform. Process. Syst. (NeurIPS) , 2017. arXiv:1705.07878.
+ [7] 
+ F. Seide, H. Fu, J. Droppo, G. Li, and D. Yu, “1-bit stochastic gradient descent and application to data-parallel distributed training of speech DNNs,” in Proc. Interspeech , 2014, pp. 1058–1062.
+ [8] 
+ N. S. Keskar and R. Socher, “Improving generalization performance by switching from Adam to SGD,” arXiv:1712.07628, 2017.
+ [9] 
+ A. Neelakantan, L. Vilnis, Q. V. Le, I. Sutskever, L. Kaiser, K. Kurach, and J. Martens, “Adding gradient noise improves learning for very deep networks,” arXiv:1511.06807, 2015.
+ [10] 
+ L. Schuchman, “Dither signals and their effect on quantization noise,” IEEE Trans. Commun. Technol. , vol. 12, no. 4, pp. 162–165, Dec. 1964.
+ [11] 
+ R. M. Gray and T. G. Stockham, “Dithered quantizers,” IEEE Trans. Inf. Theory , vol. 39, no. 3, pp. 805–812, May 1993.
+ [12] 
+ F. Pukelsheim, “The three sigma rule,” The American Statistician , vol. 48, no. 2, pp. 88–91, May 1994.
+ [13] 
+ D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,” in Proc. Int. Conf. Learning Representations (ICLR) , 2015.
+ [14] 
+ K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image recognition,” in Proc. IEEE Conf. Computer Vision and Pattern Recognition (CVPR) , 2016, pp. 770–778.
+ Experimental support, please
+ view the build logs 
+ for errors. Generated by
+ L
+ A 
+ T
+ E 
+ xml 
+ .
+ Instructions for reporting errors
+ We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile
+ support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the
+ methods listed below:
+ Click the "Report Issue" ( 
+ ) button, located in the page header.
+ Tip: You can select the relevant text first, to include it in your report.
+ Our team has already identified the following issues . We appreciate your time reviewing and reporting rendering errors we
+ may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability
+ should not be a barrier to accessing research. Thank you for your continued support in championing open access for
+ all.
+ Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion , and welcome developer contributions .
+ We gratefully acknowledge support from
+ our major funders ,
+ member institutions , ,
+ and all contributors.
+ About 
+ · 
+ Help 
+ · 
+ Contact 
+ · 
+ Subscribe 
+ · 
+ Copyright 
+ · 
+ Privacy 
+ · 
+ Accessibility 
+ · 
+ Operational Status (opens in new tab) 
+ Major funding support from

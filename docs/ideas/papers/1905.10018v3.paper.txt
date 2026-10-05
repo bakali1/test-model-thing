@@ -1,0 +1,610 @@
+ 
+ Momentum-Based Variance Reduction in Non-Convex SGD 
+ Report GitHub Issue
+ × 
+ Title: 
+ Content selection saved. Describe the issue below:
+ Description: 
+ Submit without GitHub 
+ Submit in GitHub 
+ arXiv is now an independent nonprofit! 
+ Learn more 
+ × 
+ Back to arXiv 
+ Why HTML? 
+ Report Issue 
+ Back to Abstract 
+ Download PDF 
+ Abstract 
+ 1 Introduction 
+ 2 Related Work 
+ 3 Notation and Assumptions 
+ 4 Momentum and Variance Reduction 
+ 5 Storm : STOchastic Recursive Momentum 
+ 5.1 Proof of Theorem 
+ 6 Empirical Validation 
+ 7 Conclusion 
+ References 
+ A Extra Lemmas 
+ A.1 Proof of Lemma 
+ B Non-adaptive Bound Without Lipschitz Assumption 
+ License: arXiv.org perpetual non-exclusive license
+arXiv:1905.10018v3 [cs.LG] 21 Apr 2020
+ Momentum-Based Variance Reduction in Non-Convex SGD
+ Ashok Cutkosky
+ Affiliation: Google Research
+ Affiliation: Mountain View, CA, USA
+ Email: ashok@cutkosky.com 
+ Francesco Orabona
+ Affiliation: Boston University
+ Affiliation: Boston, MA, USA
+ Email: francesco@orabona.com 
+ Abstract
+ Variance reduction has emerged in recent years as a strong competitor to stochastic
+gradient descent in non-convex problems, providing the first algorithms to improve
+upon the converge rate of stochastic gradient descent for finding first-order critical
+points. However, variance reduction techniques typically require carefully tuned learning
+rates and willingness to use excessively large “mega-batches” in order to achieve their improved
+results. We present a new algorithm, Storm , that does not require any batches
+and makes use of adaptive learning rates, enabling simpler implementation and less hyperparameter tuning. Our technique for removing the batches uses a variant of momentum to achieve variance reduction in non-convex optimization.
+On smooth losses $F$ , Storm finds a point $\boldsymbol{x}$ with $\mathbb{E}[\|\nabla F(\boldsymbol{x})\|]\leq O(1/\sqrt{T}+\sigma^{1/3}/T^{1/3})$ in $T$ iterations with $\sigma^{2}$ variance in the gradients, matching the optimal rate and without requiring knowledge of $\sigma$ .
+ 1 Introduction
+ This paper addresses the classic stochastic optimization problem, in which we are given a function $F:\mathbb{R}^{d}\to\mathbb{R}$ , and wish to find $\boldsymbol{x}\in\mathbb{R}^{d}$ such that $F(\boldsymbol{x})$ is as small as possible. Unfortunately, our access to $F$ is limited to a stochastic function oracle: we can obtain sample functions $f(\cdot,\xi)$ where $\xi$ represents some sample variable (e.g. a minibatch index) such that $\mathbb{E}[f(\cdot,\xi)]=F(\cdot)$ . Stochastic optimization problems are found throughout machine learning. For example, in supervised learning, $\boldsymbol{x}$ represents the parameters of a model (say the weights of a neural network), $\xi$ represents an example, $f(\boldsymbol{x},\xi)$ represents the loss on an example, and $F$ represents the training loss of the model.
+ We do not assume convexity, so in general the problem of finding a true minimum of $F$ may be NP-hard. Hence, we relax the problem to finding a critical point of $F$ – that is a point such that $\nabla F(\boldsymbol{x})=0$ . Also, we assume access only to stochastic gradients evaluated on arbitrary points, rather than Hessians or other information.
+In this setting, the standard algorithm is stochastic gradient descent (SGD). SGD produces a sequence of iterates $\boldsymbol{x}_{1},\dots,\boldsymbol{x}_{T}$ using the recursion
+ $\boldsymbol{x}_{t+1}=\boldsymbol{x}_{t}-\eta_{t}\boldsymbol{g}_{t},$ 
+ (1) 
+ where $\boldsymbol{g}_{t}=\nabla f(\boldsymbol{x}_{t},\xi_{t})$ , $f(\cdot,\xi_{1}),\dots,f(\cdot,\xi_{T})$ are i.i.d. samples from a distribution $D$ , and $\eta_{1},\dots\eta_{T}\in\mathbb{R}$ are a sequence of learning rates that must be carefully tuned to ensure good performance. Assuming the $\eta_{t}$ are selected properly, SGD guarantees that a randomly selected iterate $\boldsymbol{x}_{t}$ satisfies $\mathbb{E}[\|\nabla F(\boldsymbol{x}_{t})\|]\leq O(1/T^{1/4})$ [ 9 ] .
+ Recently, variance reduction has emerged as an improved technique for finding critical points in non-convex optimization problems. Stochastic variance-reduced gradient (SVRG) algorithms also produce iterates $x_{1},\dots,x_{T}$ according to the update formula ( 1 ), but now $\boldsymbol{g}_{t}$ is a variance reduced estimate of $\nabla F(\boldsymbol{x}_{t})$ . Over the last few years, SVRG algorithms have improved the convergence rate to critical points of non-convex SGD from $O(1/T^{1/4})$ to $O(1/T^{3/10})$ [ 2 , 21 ] to $O(1/T^{1/3})$ [ 8 , 31 ] . Despite this improvement, SVRG has not seen as much success in practice in non-convex machine learning problems [ 5 ] . Many reasons may contribute to this phenomenon, but two potential issues we address here are SVRG’s use of non-adaptive learning rates and reliance on giant batch sizes to construct variance reduced gradients through the use of low-noise gradients calculated at a “checkpoint”. In particular, for non-convex losses SVRG analyses typically involve carefully selecting learning rates, the number of samples to construct the gradient on the checkpoint points, and the frequency of update of the checkpoint points. The optimal settings balance various unknown problem parameters exactly in order to obtain improved performance, making it especially important, and especially difficult, to tune them.
+ In this paper, we address both of these issues. We present a new algorithm called STOchastic Recursive Momentum ( Storm ) that achieves variance reduction through the use of a variant of the momentum term, similar to the popular RMSProp or Adam momentum heuristics [ 24 , 13 ] . Hence, our algorithm does not require a gigantic batch to compute checkpoint gradients – in fact, our algorithm does not require any batches at all because it never needs to compute a checkpoint gradient .
+ Storm achieves the optimal convergence rate of $O(1/T^{1/3})$ [ 3 ] , and it uses an adaptive learning rate schedule that will automatically adjust to the variance values of $\nabla f(\boldsymbol{x}_{t},\xi_{t})$ .
+Overall, we consider our algorithm a significant qualitative departure from the usual paradigm for variance reduction, and we hope our analysis may provide insight into the value of momentum in non-convex optimization.
+ The rest of the paper is organized as follows. The next section discusses the related work on variance reduction and adaptive learning rates in non-convex SGD. Section 3 formally introduces our notation and assumptions. We present our basic update rule and its connection to SGD with momentum in Section 4 , and our algorithm in Section 5 . Finally, we present some empirical results in Section 6 and concludes with a discussion in Section 7 .
+ 2 Related Work
+ Variance-reduction methods were proposed independently by three groups at the same conference: Johnson and Zhang [12] , Zhang et al. [30] , Mahdavi et al. [17] , and Wang et al. [27] . The first application of variance-reduction method to non-convex SGD is due to Allen-Zhu and Hazan [2] . Using variance reduction methods, Fang et al. [8] , Zhou et al. [31] have obtained much better convergence rates for critical points in non-convex SGD. These methods are very different from our approach because they require the calculation of gradients at checkpoints.
+In fact, in order to compute the variance reduced gradient estimates $\boldsymbol{g}_{t}$ , the algorithm must periodically stop producing iterates $\boldsymbol{x}_{t}$ and instead generate a very large “mega-batch” of samples $\xi_{1},\dots,\xi_{N}$ which is used to compute a checkpoint gradient $\frac{1}{N}\sum_{i=1}^{N}\nabla f(\boldsymbol{v},\xi_{i})$ for an appropriate checkpoint point $\boldsymbol{v}$ . Depending on the algorithm, $N$ may be as large as $O(T)$ , and typically no smaller than $O(T^{2/3})$ .
+The only exceptions we are aware of are SARAH [ 18 , 19 ] and iSARAH [ 20 ] . However, their guarantees do not improve over the ones of plain SGD, and they still require at least one checkpoint gradient. Independently and simultaneously with this work, [ 25 ] have proposed a new algorithm that does improve over SGD to match our same convergence rate, although it does still require one checkpoint gradient. Interestingly, their update formula is very similar to ours, although the analysis is rather different.
+We are not aware of prior works for non-convex optimization with reduced variance methods that completely avoid using giant batches.
+ On the other hand, adaptive learning-rate schemes, that choose the values $\eta_{t}$ in some data-dependent way so as to reduce the need for tuning the values of $\eta_{t}$ manually, have been introduced by Duchi et al. [7] and popularized by the heuristic methods like RMSProp and Adam [ 24 , 13 ] . In the non-convex setting, adaptive learning rates can be shown to improve the convergence rate of SGD to $O(1/\sqrt{T}+(\sigma^{2}/T)^{1/4})$ , where $\sigma^{2}$ is a bound on the variance of $\nabla f(\boldsymbol{x}_{t})$ [ 16 , 28 , 22 ] . Hence, these adaptive algorithms obtain much better convergence guarantees when the problem is “easy”, and have become extremely popular in practice. In contrast, the only variance-reduced algorithm we are aware of that uses adaptive learning rates is [ 4 ] , but their techniques apply only to convex losses.
+ 3 Notation and Assumptions
+ In the following, we will write vectors with bold letters and we will denote the inner product between vectors $\boldsymbol{a}$ and $\boldsymbol{b}$ by $\boldsymbol{a}\cdot\boldsymbol{b}$ .
+ Throughout the paper we will make the following assumptions.
+We assume access to a stream of independent random variables $\xi_{1},\dots,\xi_{T}\in\Xi$ and a function $f$ such that for all $t$ and for all $x$ , $\mathbb{E}[f(\boldsymbol{x},\xi_{t})|\boldsymbol{x}]=F(\boldsymbol{x})$ . Note that we access two gradients on the same $\xi_{t}$ on two different points in each update, like in standard variance-reduced methods. In practice, $\xi_{t}$ may denote an i.i.d. training example, or an index into a training set while $f(\boldsymbol{x},\xi_{t})$ indicates the loss on the training example using the model parameter $\boldsymbol{x}$ .
+We assume there is some $\sigma^{2}$ that upper bounds the noise on gradients: $\mathbb{E}[\|\nabla f(\boldsymbol{x},\xi_{t})-\nabla F(\boldsymbol{x})\|^{2}]\leq\sigma^{2}$ .
+ We define $F^{\star}=\inf_{\boldsymbol{x}}F(\boldsymbol{x})$ and we will assume that $F^{\star}>-\infty$ .
+We will also need some assumptions on the functions $f(\boldsymbol{x},\xi_{t})$ .
+Define a differentiable function $f:\mathbb{R}^{d}\to\mathbb{R}$ to be $G$ -Lipschitz iff $\|\nabla f(\boldsymbol{x})\|\leq G$ for all $x$ , and $f$ to be $L$ -smooth iff $\|\nabla f(\boldsymbol{x})-\nabla f(\boldsymbol{y})\|\leq L\|\boldsymbol{x}-\boldsymbol{y}\|$ for all $x$ and $y$ . We assume that $f(\boldsymbol{x},\xi_{t})$ is differentiable, and $L$ -smooth as a function of $\boldsymbol{x}$ with probability 1. We will also assume that $f(\boldsymbol{x},\xi_{t})$ is $G$ -Lipschitz for our adaptive analysis. We show in appendix B that this assumption can be lifted at the expense of adaptivity to $\sigma$ .
+ 4 Momentum and Variance Reduction
+ Before describing our algorithm in details, we briefly explore the connection between SGD with momentum and variance reduction.
+ The stochastic gradient descent with momentum algorithm is typically implemented as
+ $\displaystyle\boldsymbol{d}_{t}$ 
+ $\displaystyle=(1-a)\boldsymbol{d}_{t-1}+a\nabla f(\boldsymbol{x}_{t},\xi_{t})$ 
+ $\displaystyle\boldsymbol{x}_{t+1}$ 
+ $\displaystyle=\boldsymbol{x}_{t}-\eta\boldsymbol{d}_{t},$ 
+ where $a$ is small, i.e. $a=0.1$ .
+In words, instead of using the current gradient $\nabla F(\boldsymbol{x}_{t})$ in the update of $\boldsymbol{x}_{t}$ , we use an exponential average of the past observed gradients.
+ While SGD with momentum and its variants have been successfully used in many machine learning applications [ 13 ] , it is well known that the presence of noise in the stochastic gradients can nullify the theoretical gain of the momentum term [ 29 , e.g.] . As a result, it is unclear how and why using momentum can be better than plain SGD. Although recent works have proved that a variant of SGD with momentum improves the non-dominant terms in the convergence rate on convex stochastic least square problems [ 6 , 11 ] , it is still unclear if the actual convergence rate can be improved.
+ Here, we take a different route. Instead of showing that momentum in SGD works in the same way as in the noiseless case, i.e. giving accelerated rates, we show that a variant of momentum can provably reduce the variance of the gradients .
+In its simplest form, the variant we propose is:
+ $\displaystyle\boldsymbol{d}_{t}$ 
+ $\displaystyle=(1-a)\boldsymbol{d}_{t-1}+a\nabla f(\boldsymbol{x}_{t},\xi_{t})+(1-a)(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t}))$ 
+ (2) 
+ $\displaystyle\boldsymbol{x}_{t+1}$ 
+ $\displaystyle=\boldsymbol{x}_{t}-\eta\boldsymbol{d}_{t}~.$ 
+ (3) 
+ The only difference is the that we add the term $(1-a)(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t}))$ to the update. As in standard variance-reduced methods, we use two gradients in each step. However, we do not need to use the gradient calculated at any checkpoint points.
+Note that if $\boldsymbol{x}_{t}\approx\boldsymbol{x}_{t-1}$ , then our update becomes approximately the momentum one. These two terms will be similar as long as the algorithm is actually converging to some point, and so we can expect the algorithm to behave exactly like the classic momentum SGD towards the end of the optimization process.
+ To understand why the above updates delivers a variance reduction, consider the “error in $\boldsymbol{d}_{t}$ ” which we denote as $\boldsymbol{\epsilon}_{t}$ :
+ $\boldsymbol{\epsilon}_{t}:=\boldsymbol{d}_{t}-\nabla F(\boldsymbol{x}_{t})~.$ 
+ This term measures the error we incur by using $\boldsymbol{d}_{t}$ as update direction instead of the correct but unknown direction, $\nabla F(\boldsymbol{x}_{t})$ . The equivalent term in SGD would be $\mathbb{E}[\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t})\|^{2}]\leq\sigma^{2}$ . So, if $\mathbb{E}[\|\boldsymbol{\epsilon}_{t}\|^{2}]$ decreases over time, we have realized a variance reduction effect. Our technical result that we use to show this decrease is provided in Lemma 2 , but let us take a moment here to appreciate why this should be expected intuitively. Considering the update written in ( 2 ), we can obtain a recursive expression for $\boldsymbol{\epsilon}_{t}$ by subtracting $\nabla F(\boldsymbol{x}_{t})$ from both sides:
+ $\boldsymbol{\epsilon}_{t}=(1-a)\boldsymbol{\epsilon}_{t-1}+a(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))+(1-a)(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-(\nabla F(\boldsymbol{x}_{t})-\nabla F(\boldsymbol{x}_{t-1})))~.$ 
+ Now, notice that there is good reason to expect the second and third terms of the RHS above to be small: we can control $a(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))$ simply by choosing small enough values $a$ , and from smoothness we expect $(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-(\nabla F(\boldsymbol{x}_{t})-\nabla F(\boldsymbol{x}_{t-1}))$ to be of the order of $O(\|\boldsymbol{x}_{t}-\boldsymbol{x}_{t-1}\|)=O(\eta\boldsymbol{d}_{t-1})$ . Therefore, by choosing small enough $\eta$ and $a$ , we obtain $\|\boldsymbol{\epsilon}_{t}\|=(1-a)\|\boldsymbol{\epsilon}_{t-1}\|+Z$ where $Z$ is some small value. Thus, intuitively $\|\boldsymbol{\epsilon}_{t}\|$ will decrease until it reaches $Z/a$ . This highlights a trade-off in setting $\eta$ and $a$ in order to decrease the numerator of $Z/a$ while keeping the denominator sufficiently large. Our central challenge is showing that it is possible to achieve a favorable trade-off in which $Z/a$ is very small, resulting in small error $\boldsymbol{\epsilon}_{t}$ .
+ 5 Storm : STOchastic Recursive Momentum
+ Algorithm 1 Storm : STOchastic Recursive Momentum 
+ 1: 
+   Input: Parameters $k$ , $w$ , $c$ , initial point $\boldsymbol{x}_{1}$ 
+ 2: 
+  Sample $\xi_{1}$ 
+ 3: 
+   $G_{1}\leftarrow\|\nabla f(\boldsymbol{x}_{1},\xi_{1})\|$ 
+ 4: 
+   $\boldsymbol{d}_{1}\leftarrow\nabla f(\boldsymbol{x}_{1},\xi_{1})$ 
+ 5: 
+   $\eta_{0}\leftarrow\frac{k}{w^{1/3}}$ 
+ 6: 
+   for $t=1$ to $T$ do 
+ 7: 
+    $\eta_{t}\leftarrow\frac{k}{(w+\sum_{i=1}^{t}G_{t}^{2})^{1/3}}$ 
+ 8: 
+    $\boldsymbol{x}_{t+1}\leftarrow\boldsymbol{x}_{t}-\eta_{t}\boldsymbol{d}_{t}$ 
+ 9: 
+    $a_{t+1}\leftarrow c\eta_{t}^{2}$ 
+ 10: 
+   Sample $\xi_{t+1}$ 
+ 11: 
+    $G_{t+1}\leftarrow\|\nabla f(\boldsymbol{x}_{t+1},\xi_{t+1})\|$ 
+ 12: 
+    $\boldsymbol{d}_{t+1}\leftarrow\nabla f(\boldsymbol{x}_{t+1},\xi_{t+1})+(1-a_{t+1})(\boldsymbol{d}_{t}-\nabla f(\boldsymbol{x}_{t},\xi_{t+1}))$ 
+ 13: 
+   end for 
+ 14: 
+  Choose $\hat{\boldsymbol{x}}$ uniformly at random from $\boldsymbol{x}_{1},\dots,\boldsymbol{x}_{T}$ . (In practice, set $\hat{\boldsymbol{x}}=\boldsymbol{x}_{T}$ ).
+ 15: 
+   return $\hat{\boldsymbol{x}}$ 
+ We now describe our stochastic optimization algorithm, which we call STOchastic Recursive Momentum ( Storm ). The pseudocode is in Algorithm 1 . As described in the previous section, its basic update is of the form of ( 2 ) and ( 3 ). However, in order to achieve adaptivity to the noise in the gradients, both the stepsize and the momentum term will depend on the past gradients, à la AdaGrad [ 7 ] .
+ The convergence guarantee of Storm is presented in Theorem 1 below.
+ Theorem 1 . 
+ Under the assumptions in Section 3 , for any $b>0$ , we write $k=\frac{bG^{\frac{2}{3}}}{L}$ . Set $c=28L^{2}+G^{2}/(7Lk^{3})=L^{2}(28+1/(7b^{3}))$ and $w=\max\left((4Lk)^{3},2G^{2},\left(\tfrac{ck}{4L}\right)^{3}\right)=G^{2}\max\left((4b)^{3},2,(28b+\frac{1}{7b^{2}})^{3}/64\right)$ . Then, Storm satisfies 
+ $\mathbb{E}\left[\|\nabla F(\hat{\boldsymbol{x}})\|\right]=\mathbb{E}\left[\frac{1}{T}\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|\right]\leq\frac{w^{1/6}\sqrt{2M}+2M^{3/4}}{\sqrt{T}}+\frac{2\sigma^{1/3}}{T^{1/3}},$ 
+ where $M=\frac{8}{k}(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k^{2}}+\frac{k^{2}c^{2}}{2L^{2}}\ln(T+2)$ . 
+ In words, Theorem 1 guarantees that Storm will make the norm of the gradients converge to 0 at a rate of $O(\frac{\ln T}{\sqrt{T}})$ if there is no noise, and in expectation at a rate of $\frac{2\sigma^{1/3}}{T^{1/3}}$ in the stochastic case. We remark that we achieve both rates automatically, without the need to know the noise level nor the need to tune stepsizes.
+Note that the rate when $\sigma\neq 0$ matches the optimal rate [ 3 ] , which was previously only obtained by SVRG-based algorithms that require a “mega-batch” [ 8 , 31 ] .
+ The dependence on $G$ in this bound deserves some discussion - at first blush it appears that if $G\to 0$ , the bound will go to infinity because the denominator in $M$ goes to zero. Fortunately, this is not so: the resolution is to observe that $F(\boldsymbol{x}_{1})-F^{\star}=O(G)$ and $\sigma=O(G)$ , so that the numerators of $M$ actually go to zero at least as fast as the denominator. The dependence on $L$ may be similarly non-intuitive: as $L\to 0$ , $M\to\infty$ . In this case this is actually to be expected: if $L=0$ , then there are no critical points (because the gradients are all the same!) and so we cannot actually find one. In general, $M$ should be regarded as an $O(\log(T))$ term where the constant indicates some inherent hardness level in the problem.
+ Finally, note that here we assumed that each $f(x,\xi)$ is $G$ -Lipschitz in $x$ . Prior variance reduction results (e.g. [ 18 , 8 , 25 ] ) do not make use of this assumption. However, we we show in Appendix B that simply replacing all instances of $G$ or $G_{t}$ in the parameters of Storm with an oracle-tuned value of $\sigma$ allows us to dispense with this assumption while still avoiding all checkpoint gradients.
+ Also note that, as in similar work on stochastic minimization of non-convex functions, Theorem 1 only bounds the gradient of a randomly selected iterate [ 9 ] . However, in practical implementations we expect the last iterate to perform equally well.
+ Our analysis formalizes the intuition developed in the previous section through a Lyapunov potential function. Our Lyapunov function is somewhat non-standard: for smooth non-convex functions, the Lyapunov function is typically of the form $\Phi_{t}=F(\boldsymbol{x}_{t})$ , but we propose to use the function $\Phi_{t}=F(\boldsymbol{x}_{t})+z_{t}\|\boldsymbol{\epsilon}_{t}\|^{2}$ for a time-varying $z_{t}\propto\eta_{t-1}^{-1}$ , where $\boldsymbol{\epsilon}_{t}$ is the error in the update introduced in the previous section. The use of time-varying $z_{t}$ appears to be critical for us to avoid using any checkpoints: with constant $z_{t}$ it seems that one always needs at least one checkpoint gradient. Potential functions of this form have been used to analyze momentum algorithms in order to prove asymptotic guarantees, see, e.g., Ruszczynski and Syski [23] . However, as far as we know, this use of a potential is somewhat different than most variance reduction analyses, and so may provide avenues for further development.
+We now proceed to the proof of Theorem 1 .
+ 5.1 Proof of Theorem 1 
+ First, we consider a generic SGD-style analysis. Most SGD analyses assume that the gradient estimates used by the algorithm are unbiased of $\nabla F(\boldsymbol{x}_{t})$ , but unfortunately $\boldsymbol{d}_{t}$ biased. As a result, we need the following slightly different analysis. For lack of space, the proof of this Lemma and the next one are in the Appendix.
+ Lemma 1 . 
+ Suppose $\eta_{t}\leq\frac{1}{4L}$ for all $t$ . Then 
+ $\mathbb{E}[F(\boldsymbol{x}_{t+1})-F(\boldsymbol{x}_{t})]\leq\mathbb{E}\left[-\eta_{t}/4\|\nabla F(\boldsymbol{x}_{t})\|^{2}+3\eta_{t}/4\|\boldsymbol{\epsilon}_{t}\|^{2}\right]~.$ 
+ The following technical observation is key to our analysis of Storm : it provides a recurrence that enables us to bound the variance of the estimates $\boldsymbol{d}_{t}$ .
+ Lemma 2 . 
+ With the notation in Algorithm 1 , we have 
+ $\mathbb{E}\left[\|\boldsymbol{\epsilon}_{t}\|^{2}/\eta_{t-1}\right]\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+(1-a_{t})^{2}(1+4L^{2}\eta_{t-1}^{2})\|\boldsymbol{\epsilon}_{t-1}\|^{2}/\eta_{t-1}+4(1-a_{t})^{2}L^{2}\eta_{t-1}\|\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right]~.$ 
+ Lemma 2 exhibits a somewhat involved algebraic identity, so let us try to build some intuition for what it means and how it can help us. First, multiply both sides by $\eta_{t-1}$ . Technically the expectations make this a forbidden operation, but we ignore this detail for now. Next, observe that $\sum_{t=1}^{T}G_{t}^{2}$ is roughly $\Theta(T)$ (since the the variance prevents $\|g_{t}\|^{2}$ from going to zero even when $\|\nabla F(\boldsymbol{x}_{t})\|$ does). Therefore $\eta_{t}$ is roughly $O(1/t^{1/3})$ , and $a_{t}$ is roughly $O(1/t^{2/3})$ . Discarding all constants, and observing that $(1-a_{t})^{2}\leq(1-a_{t})$ , the above Lemma is then saying that
+ $\displaystyle\mathbb{E}[\|\boldsymbol{\epsilon}_{t}\|^{2}]$ 
+ $\displaystyle\leq\mathbb{E}\left[\eta_{t-1}^{4}+(1-a_{t})\|\boldsymbol{\epsilon}_{t-1}\|^{2}+\eta_{t-1}^{2}\|\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[t^{-4/3}+\left(1-t^{-2/3}\right)\|\boldsymbol{\epsilon}_{t-1}\|^{2}+t^{-1/3}\|\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right]~.$ 
+ We can use this recurrence to compute a kind of “equilibrium value” for $\mathbb{E}[\|\boldsymbol{\epsilon}_{t}\|^{2}]$ : set $\mathbb{E}[\|\boldsymbol{\epsilon}_{t}\|^{2}]=\mathbb{E}[\|\boldsymbol{\epsilon}_{t-1}\|^{2}]$ and solve to obtain $\|\boldsymbol{\epsilon}_{t}\|^{2}$ is $O(1/t^{2/3}+\|\nabla F(\boldsymbol{x}_{t})\|^{2})$ . This in turn suggests that, whenever $\|\nabla F(\boldsymbol{x}_{t})\|^{2}$ is greater than $1/t^{2/3}$ , the gradient estimate $\boldsymbol{d}_{t}=\nabla F(\boldsymbol{x}_{t})+\boldsymbol{\epsilon}_{t}$ will be a very good approximation of $\nabla F(\boldsymbol{x}_{t})$ so that gradient descent should make very fast progress. Therefore, we expect the “equilibrium value” for $\|\nabla F(\boldsymbol{x}_{t})\|^{2}$ to be $O(1/T^{2/3})$ , since this is the point at which the estimate $\boldsymbol{d}_{t}$ becomes dominated by the error.
+ We formalize this intuition using a Lyapunov function of the form $\Phi_{t}=F(\boldsymbol{x}_{t})+z_{t}\|\boldsymbol{\epsilon}_{t}\|^{2}$ in the proof of Theorem 1 below.
+ Proof of Theorem 1 .
+ Consider the potential $\Phi_{t}=F(\boldsymbol{x}_{t})+\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}$ . We will upper bound $\Phi_{t+1}-\Phi_{t}$ for each $t$ , which will allow us to bound $\Phi_{T}$ in terms of $\Phi_{1}$ by summing over $t$ .
+First, observe that since $w\geq(4Lk)^{3}$ , we have $\eta_{t}\leq\frac{1}{4L}$ . Further, since $a_{t+1}=c\eta_{t}^{2}$ , we have $a_{t+1}\leq\frac{ck}{4Lw^{1/3}}\leq 1$ for all $t$ .
+Then, we first consider $\eta_{t}^{-1}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\eta_{t-1}^{-1}\|\boldsymbol{\epsilon}_{t}\|^{2}$ . Using Lemma 2 , we obtain 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[\eta_{t}^{-1}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\eta_{t-1}^{-1}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t}^{3}G_{t+1}^{2}+\frac{(1-a_{t+1})^{2}(1+4L^{2}\eta_{t}^{2})\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t}}+4(1-a_{t+1})^{2}L^{2}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}-\frac{\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t-1}}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\underbrace{2c^{2}\eta_{t}^{3}G_{t+1}^{2}}_{A_{t}}+\underbrace{\left(\eta_{t}^{-1}(1-a_{t+1})(1+4L^{2}\eta_{t}^{2})-\eta_{t-1}^{-1}\right)\|\boldsymbol{\epsilon}_{t}\|^{2}}_{B_{t}}+\underbrace{4L^{2}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}_{C_{t}}\right]~.$ 
+ Let us focus on the terms of this expression individually. For the first term, $A_{t}$ , observe that $w\geq 2G^{2}\geq G^{2}+G_{t+1}^{2}$ to obtain: 
+ $\displaystyle\sum_{t=1}^{T}A_{t}=\sum_{t=1}^{T}2c^{2}\eta_{t}^{3}G_{t+1}^{2}$ 
+ $\displaystyle=\sum_{t=1}^{T}\frac{2k^{3}c^{2}G_{t+1}^{2}}{w+\sum_{i=1}^{t}G_{i}^{2}}\leq\sum_{t=1}^{T}\frac{2k^{3}c^{2}G_{t+1}^{2}}{G^{2}+\sum_{i=1}^{t+1}G_{i}^{2}}\leq 2k^{3}c^{2}\ln\left(1+\sum_{t=1}^{T+1}\frac{G_{t}^{2}}{G^{2}}\right)$ 
+ $\displaystyle\leq 2k^{3}c^{2}\ln\left(T+2\right),$ 
+ where in the second to last inequality we used Lemma 4 in the Appendix. 
+ For the second term $B_{t}$ , we have 
+ $B_{t}\leq(\eta_{t}^{-1}-\eta_{t-1}^{-1}+\eta_{t}^{-1}(4L^{2}\eta_{t}^{2}-a_{t+1}))\|\boldsymbol{\epsilon}_{t}\|^{2}=\left(\eta_{t}^{-1}-\eta_{t-1}^{-1}+\eta_{t}(4L^{2}-c)\right)\|\boldsymbol{\epsilon}_{t}\|^{2}~.$ 
+ Let us focus on $\frac{1}{\eta_{t}}-\frac{1}{\eta_{t-1}}$ for a minute. Using the concavity of $x^{1/3}$ , we have $(x+y)^{1/3}\leq x^{1/3}+yx^{-2/3}/3$ . Therefore: 
+ $\displaystyle\frac{1}{\eta_{t}}-\frac{1}{\eta_{t-1}}$ 
+ $\displaystyle=\frac{1}{k}\left[\left(w+\sum_{i=1}^{t}G_{i}^{2}\right)^{1/3}-\left(w+\sum_{i=1}^{t-1}G_{i}^{2}\right)^{1/3}\right]\leq\frac{G_{t}^{2}}{3k(w+\sum_{i=1}^{t-1}G_{i}^{2})^{2/3}}$ 
+ $\displaystyle\leq\frac{G_{t}^{2}}{3k(w-G^{2}+\sum_{i=1}^{t}G_{i}^{2})^{2/3}}\leq\frac{G_{t}^{2}}{3k(w/2+\sum_{i=1}^{t}G_{i}^{2})^{2/3}}$ 
+ $\displaystyle\leq\frac{2^{2/3}G_{t}^{2}}{3k(w+\sum_{i=1}^{t}G_{i}^{2})^{2/3}}\leq\frac{2^{2/3}G^{2}}{3k^{3}}\eta_{t}^{2}\leq\frac{2^{2/3}G^{2}}{12Lk^{3}}\eta_{t}\leq\frac{G^{2}}{7Lk^{3}}\eta_{t},$ 
+ where we have used that that $w\geq(4Lk)^{3}$ to have $\eta_{t}\leq\frac{1}{4L}$ . 
+ Further, since $c=28L^{2}+G^{2}/(7Lk^{3})$ , we have 
+ $\eta_{t}(4L^{2}-c)\leq-24L^{2}\eta_{t}-G^{2}\eta_{t}/(7Lk^{3})~.$ 
+ Thus, we obtain $B_{t}\leq-24L^{2}\eta_{t}\|\boldsymbol{\epsilon}_{t}\|^{2}$ . Putting all this together yields: 
+ $\displaystyle\frac{1}{32L^{2}}$ 
+ $\displaystyle\sum_{t=1}^{T}\left(\frac{\|\boldsymbol{\epsilon}_{t+1}\|^{2}}{\eta_{t}}-\frac{\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t-1}}\right)\leq\frac{k^{3}c^{2}}{16L^{2}}\ln\left(T+2\right)+\sum_{t=1}^{T}\left[\frac{\eta_{t}}{8}\|\nabla F(\boldsymbol{x}_{t})\|^{2}-\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]~.$ 
+ (4) 
+ Now, we are ready to analyze the potential $\Phi_{t}$ . Since $\eta_{t}\leq\frac{1}{4L}$ , we can use Lemma 1 to obtain 
+ $\displaystyle\mathbb{E}[\Phi_{t+1}-\Phi_{t}]$ 
+ $\displaystyle\leq\mathbb{E}\left[-\frac{\eta_{t}}{4}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{1}{32L^{2}\eta_{t}}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]~.$ 
+ Summing over $t$ and using ( 4 ), we obtain 
+ $\displaystyle\mathbb{E}[\Phi_{T+1}-\Phi_{1}]$ 
+ $\displaystyle\leq\sum_{t=1}^{T}\mathbb{E}\left[-\frac{\eta_{t}}{4}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{1}{32L^{2}\eta_{t}}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\frac{k^{3}c^{2}}{16L^{2}}\ln\left(T+2\right)-\sum_{t=1}^{T}\frac{\eta_{t}}{8}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]~.$ 
+ Reordering the terms, we have 
+ $\displaystyle\mathbb{E}\left[\sum_{t=1}^{T}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[8(\Phi_{1}-\Phi_{T+1})+k^{3}c^{2}/(2L^{2})\ln\left(T+2\right)\right]$ 
+ $\displaystyle\leq 8(F(\boldsymbol{x}_{1})-F^{\star})+\mathbb{E}[\|\boldsymbol{\epsilon}_{1}\|^{2}]/(4L^{2}\eta_{0})+k^{3}c^{2}/(2L^{2})\ln(T+2)$ 
+ $\displaystyle\leq 8(F(\boldsymbol{x}_{1})-F^{\star})+w^{1/3}\sigma^{2}/(4L^{2}k)+k^{3}c^{2}/(2L^{2})\ln(T+2),$ 
+ where the last inequality is given by the definition of $\boldsymbol{d}_{1}$ and $\eta_{0}$ in the algorithm. 
+ Now, we relate $\mathbb{E}\left[\sum_{t=1}^{T}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ to $\mathbb{E}\left[\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ . First, since $\eta_{t}$ is decreasing, 
+ $\displaystyle\mathbb{E}\left[\sum_{t=1}^{T}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\geq\mathbb{E}\left[\eta_{T}\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]~.$ 
+ Now, from Cauchy-Schwarz inequality, for any random variables $A$ and $B$ we have $\mathbb{E}[A^{2}]\mathbb{E}[B^{2}]\geq\mathbb{E}[AB]^{2}$ . Hence, setting $A=\sqrt{\eta_{T}\sum_{t=1}^{T-1}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}$ and $B=\sqrt{1/\eta_{T}}$ , we obtain 
+ $\displaystyle\mathbb{E}[1/\eta_{T}]\,\mathbb{E}\left[\eta_{T}\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\geq\mathbb{E}\left[\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}\right]^{2}~.$ 
+ Therefore, if we set $M=\frac{1}{k}\left[8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k}+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2)\right]$ , to get 
+ $\displaystyle\mathbb{E}\left[\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}\right]^{2}$ 
+ $\displaystyle\leq\mathbb{E}\left[\frac{8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k}+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2)}{\eta_{T}}\right]$ 
+ $\displaystyle=\mathbb{E}\left[\frac{kM}{\eta_{T}}\right]\leq\mathbb{E}\left[M\left(w+\sum_{t=1}^{T}G_{t}^{2}\right)^{1/3}\right]~.$ 
+ Define $\zeta_{t}=\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t})$ , so that $\mathbb{E}[\|\zeta_{t}\|^{2}]\leq\sigma^{2}$ . Then, we have $G_{t}^{2}=\|\nabla F(\boldsymbol{x}_{t})+\zeta_{t}\|^{2}\leq 2\|\nabla F(\boldsymbol{x}_{t})\|^{2}+2\|\zeta_{t}\|^{2}$ . Plugging this in and using $(a+b)^{1/3}\leq a^{1/3}+b^{1/3}$ we obtain: 
+ $\displaystyle\mathbb{E}\left[\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}\right]^{2}$ 
+ $\displaystyle\leq\mathbb{E}\left[M\left(w+2\sum_{t=1}^{T}\|\zeta_{t}\|^{2}\right)^{1/3}+M2^{1/3}\left(\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right)^{1/3}\right]$ 
+ $\displaystyle\leq M(w+2T\sigma^{2})^{1/3}+\mathbb{E}\left[2^{1/3}M\left(\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}\right)^{2/3}\right]$ 
+ $\displaystyle\leq M(w+2T\sigma^{2})^{1/3}+2^{1/3}M\left(\mathbb{E}\left[\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}\right]\right)^{2/3},$ 
+ where we have used the concavity of $x\mapsto x^{a}$ for all $a\leq 1$ to move expectations inside the exponents. Now, define $X=\sqrt{\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}$ . Then the above can be rewritten as: 
+ $\displaystyle(\mathbb{E}[X])^{2}$ 
+ $\displaystyle\leq M(w+2T\sigma^{2})^{1/3}+2^{1/3}M(\mathbb{E}[X])^{2/3}~.$ 
+ Note that this implies that either $(\mathbb{E}[X])^{2}\leq 2M(w+T\sigma^{2})^{1/3}$ , or $(\mathbb{E}[X])^{2}\leq 2\cdot 2^{1/3}M(\mathbb{E}[X])^{2/3}$ . Solving for $\mathbb{E}[X]$ in these two cases, we obtain 
+ $\displaystyle\mathbb{E}[X]$ 
+ $\displaystyle\leq\sqrt{2M}(w+2T\sigma^{2})^{1/6}+2M^{3/4}~.$ 
+ Finally, observe that by Cauchy-Schwarz we have $\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|/T\leq X/\sqrt{T}$ so that 
+ $\mathbb{E}\left[\sum_{t=1}^{T}\frac{\|\nabla F(\boldsymbol{x}_{t})\|}{T}\right]\leq\frac{\sqrt{2M}(w+2T\sigma^{2})^{1/6}+2M^{3/4}}{\sqrt{T}}\leq\frac{w^{1/6}\sqrt{2M}+2M^{3/4}}{\sqrt{T}}+\frac{2\sigma^{1/3}}{T^{1/3}},$ 
+ where we used $(a+b)^{1/3}\leq a^{1/3}+b^{1/3}$ in the last inequality.
+∎ 
+ 6 Empirical Validation
+ (a) Train Loss vs Iterations 
+ (b) Train Accuracy vs Iterations 
+ (c) Test Accuracy vs Iterations 
+ Figure 1: Experiments on CIFAR-10 with ResNet-32 Network. 
+ In order to confirm that our advances do indeed yield an algorithm that performs well and requires little tuning, we implemented Storm in TensorFlow [ 1 ] and tested its performance on the CIFAR-10 image recognition benchmark [ 14 ] using a ResNet model [ 10 ] , as implemented by the Tensor2Tensor package [ 26 ] 1 1 
+ 1 
+ https://github.com/google-research/google-research/tree/master/storm_optimizer . We compare Storm to AdaGrad and Adam, which are both very popular and successful optimization algorithms. The learning rates for AdaGrad and Adam were swept over a logarithmically spaced grid. For Storm , we set $w=k=0.1$ as a default 2 2 
+ 2 
+ We picked these defaults by tuning over a logarithmic grid on the much-simpler MNIST dataset [ 15 ] . $w$ and $k$ were not tuned on CIFAR10. and swept $c$ over a logarithmically spaced grid, so that all algorithms involved only one parameter to tune. No regularization was employed. We record train loss (cross-entropy), and accuracy on both the train and test sets (see Figure 1 ).
+ These results show that, while Storm is only marginally better than AdaGrad on test accuracy, on both training loss and accuracy Storm appears to be somewhat faster in terms of number of iterations. We note that the convergence proof we provide actually only applies to the training loss (since we are making multiple passes over the dataset). We leave for the future whether appropriate regularization can trade-off Storm ’s better training loss performance to obtain better test performance.
+ 7 Conclusion
+ We have introduced a new variance-reduction-based algorithm, Storm , that finds critical points in stochastic, smooth, non-convex problems. Our algorithm improves upon prior algorithms by virtue of removing the need for checkpoint gradients, and incorporating adaptive learning rates. These improvements mean that Storm is substantially easier to tune: it does not require choosing the size of the checkpoints, nor how often to compute the checkpoints (because there are no checkpoints), and by using adaptive learning rates the algorithm enjoys the same robustness to learning rate tuning as popular algorithms like AdaGrad or Adam. Storm obtains the optimal convergence guarantee, adapting to the level of noise in the problem without knowledge of this parameter. We verified that on CIFAR-10 with a ResNet architecture, Storm indeed seems to be optimizing the objective in fewer iterations than baseline algorithms.
+ Additionally, we point out that Storm ’s update formula is strikingly similar to the standard SGD with momentum heuristic employed in practice. To our knowledge, no theoretical result actually establishes an advantage of adding momentum to SGD in stochastic problems, creating an intriguing mystery. While our algorithm is not precisely the same as the SGD with momentum, we feel that it provides strong intuitive evidence that momentum is performing some kind of variance reduction. We therefore hope that some of the analysis techniques used in this paper may provide a path towards explaining the advantages of momentum.
+ Acknowledgements
+ This material is based upon work supported by the National Science Foundation under grant no. 1925930 “Collaborative Research: TRIPODS Institute for Optimization and Learning”.
+ References
+ [1] 
+M. Abadi, A. Agarwal, P. Barham, E. Brevdo, Z. Chen, C. Citro, G. S. Corrado,
+A. Davis, J. Dean, M. Devin, S. Ghemawat, I. Goodfellow, A. Harp, G. Irving,
+M. Isard, Y. Jia, R. Jozefowicz, L. Kaiser, M. Kudlur, J. Levenberg,
+D. Mané, R. Monga, S. Moore, D. Murray, C. Olah, M. Schuster, J. Shlens,
+B. Steiner, I. Sutskever, K. Talwar, P. Tucker, V. Vanhoucke, V. Vasudevan,
+F. Viégas, O. Vinyals, P. Warden, M. Wattenberg, M. Wicke, Y. Yu, and
+X. Zheng.
+ TensorFlow: Large-scale machine learning on heterogeneous systems,
+2015.
+ [2] 
+Z. Allen-Zhu and E. Hazan.
+ Variance reduction for faster non-convex optimization.
+ In International conference on machine learning , pages
+699–707, 2016.
+ [3] 
+Y. Arjevani, Y. Carmon, J. C. Duchi, D. J. Foster, N. Srebro, and B. Woodworth.
+ Lower bounds for non-convex stochastic optimization.
+ arXiv preprint arXiv:1912.02365 , 2019.
+ [4] 
+A. Cutkosky and R. Busa-Fekete.
+ Distributed stochastic optimization via adaptive SGD.
+ In Advances in Neural Information Processing Systems , pages
+1910–1919, 2018.
+ [5] 
+Aaron Defazio and Léon Bottou.
+ On the ineffectiveness of variance reduced optimization for deep
+learning.
+ In Advances in Neural Information Processing Systems , pages
+1753–1763, 2019.
+ [6] 
+A. Dieuleveut, N. Flammarion, and F. Bach.
+ Harder, better, faster, stronger convergence rates for least-squares
+regression.
+ J. Mach. Learn. Res. , 18(1):3520–3570,
+January 2017.
+ [7] 
+J. C. Duchi, E. Hazan, and Y. Singer.
+ Adaptive subgradient methods for online learning and stochastic
+optimization.
+ Journal of Machine Learning Research , 12:2121–2159,
+2011.
+ [8] 
+C. Fang, C. J. Li, Z. Lin, and T. Zhang.
+ Spider: Near-optimal non-convex optimization via stochastic
+path-integrated differential estimator.
+ In Advances in Neural Information Processing Systems , pages
+689–699, 2018.
+ [9] 
+S. Ghadimi and G. Lan.
+ Stochastic first-and zeroth-order methods for nonconvex stochastic
+programming.
+ SIAM Journal on Optimization , 23(4):2341–2368, 2013.
+ [10] 
+K. He, X. Zhang, S. Ren, and J. Sun.
+ Deep residual learning for image recognition.
+ In Proc. of the IEEE conference on computer vision and pattern
+recognition , pages 770–778, 2016.
+ [11] 
+P. Jain, S. M. Kakade, R. Kidambi, P. Netrapalli, and A. Sidford.
+ Accelerating stochastic gradient descent for least squares
+regression.
+ In S. Bubeck, V. Perchet, and P. Rigollet, editors, Proceedings
+of the 31st Conference On Learning Theory , volume 75 of Proceedings of
+Machine Learning Research , pages 545–604. PMLR, 06–09 Jul 2018.
+ [12] 
+R. Johnson and T. Zhang.
+ Accelerating stochastic gradient descent using predictive variance
+reduction.
+ In Advances in neural information processing systems , pages
+315–323, 2013.
+ [13] 
+D. P. Kingma and J. Ba.
+ Adam: A method for stochastic optimization.
+ In International Conference on Learning Representations
+(ICLR) , 2015.
+ [14] 
+A. Krizhevsky.
+ Learning multiple layers of features from tiny images.
+ Technical report, University of Toronto, 2009.
+ [15] 
+Y. Lecun, L. Bottou, Y. Bengio, and P. Haffner.
+ Gradient-based learning applied to document recognition.
+ Proceedings of the IEEE , 86(11):2278–2324, November 1998.
+ [16] 
+X. Li and F. Orabona.
+ On the convergence of stochastic gradient descent with adaptive
+stepsizes.
+ In Proc. of the 22nd International Conference on Artificial
+Intelligence and Statistics, AISTATS , 2019.
+ [17] 
+M. Mahdavi, L. Zhang, and R. Jin.
+ Mixed optimization for smooth functions.
+ In Advances in neural information processing systems , pages
+674–682, 2013.
+ [18] 
+L. M. Nguyen, J. Liu, K. Scheinberg, and M. Takáč.
+ SARAH: A novel method for machine learning problems using
+stochastic recursive gradient.
+ In Proc. of the 34th International Conference on Machine
+Learning-Volume 70 , pages 2613–2621. JMLR. org, 2017a.
+ [19] 
+L. M. Nguyen, J. Liu, K. Scheinberg, and M. Takáč.
+ Stochastic recursive gradient algorithm for nonconvex optimization.
+ arXiv preprint arXiv:1705.07261 , 2017b.
+ [20] 
+L. M. Nguyen, K. Scheinberg, and M. Takáč.
+ Inexact SARAH algorithm for stochastic optimization.
+ arXiv preprint arXiv:1811.10105 , 2018.
+ [21] 
+S. J. Reddi, A. Hefny, S. Sra, B. Poczos, and A. Smola.
+ Stochastic variance reduction for nonconvex optimization.
+ In International conference on machine learning , pages
+314–323, 2016.
+ [22] 
+S. J. Reddi, S. Kale, and S. Kumar.
+ On the convergence of Adam and beyond.
+ In International Conference on Learning Representations , 2018.
+ [23] 
+A. Ruszczynski and W. Syski.
+ Stochastic approximation method with gradient averaging for
+unconstrained problems.
+ IEEE Transactions on Automatic Control , 28(12):1097–1105, December 1983.
+ [24] 
+T. Tieleman and G. Hinton.
+ Lecture 6.5-rmsprop: Divide the gradient by a running average of its
+recent magnitude.
+ COURSERA: Neural Networks for Machine Learning , 2012.
+ [25] 
+Quoc Tran-Dinh, Nhan H Pham, Dzung T Phan, and Lam M Nguyen.
+ Hybrid stochastic gradient descent algorithms for stochastic
+nonconvex optimization.
+ arXiv preprint arXiv:1905.05920 , 2019.
+ [26] 
+A. Vaswani, S. Bengio, E. Brevdo, F. Chollet, A. N. Gomez, S. Gouws, L. Jones,
+Ł. Kaiser, N. Kalchbrenner, N. Parmar, R. Sepassi, N. Shazeer, and
+J. Uszkoreit.
+ Tensor2tensor for neural machine translation.
+ CoRR , abs/1803.07416, 2018.
+ [27] 
+C. Wang, X. Chen, A. J. Smola, and E. P. Xing.
+ Variance reduction for stochastic gradient optimization.
+ In C. J. C. Burges, L. Bottou, M. Welling, Z. Ghahramani, and K. Q.
+Weinberger, editors, Advances in Neural Information Processing Systems
+26 , pages 181–189. Curran Associates, Inc., 2013.
+ [28] 
+R. Ward, X. Wu, and L. Bottou.
+ AdaGrad stepsizes: Sharp convergence over nonconvex landscapes,
+from any initialization.
+ arXiv preprint arXiv:1806.01811 , 2018.
+ [29] 
+K. Yuan, B. Ying, and A. H. Sayed.
+ On the influence of momentum acceleration on online learning.
+ Journal of Machine Learning Research , 17(192):1–66, 2016.
+ [30] 
+L. Zhang, M. Mahdavi, and R. Jin.
+ Linear convergence with condition number independent access of full
+gradients.
+ In C. J. C. Burges, L. Bottou, M. Welling, Z. Ghahramani, and K. Q.
+Weinberger, editors, Advances in Neural Information Processing Systems
+26 , pages 980–988. Curran Associates, Inc., 2013.
+ [31] 
+D. Zhou, P. Xu, and Q. Gu.
+ Stochastic nested variance reduced gradient descent for nonconvex
+optimization.
+ In Advances in Neural Information Processing Systems , pages
+3921–3932, 2018.
+ Appendix A Extra Lemmas
+ In this section we (re)state and prove some Lemmas.
+ First, we provide the proof of Lemma 1 , restated below for convenience.
+See 1 
+ Proof.
+ Using the smoothness of $F$ and the definition of $\boldsymbol{x}_{t+1}$ from the algorithm, we have 
+ $\displaystyle\mathbb{E}[F(\boldsymbol{x}_{t+1})]$ 
+ $\displaystyle\leq\mathbb{E}\left[F(\boldsymbol{x}_{t})-\nabla F(\boldsymbol{x}_{t})\cdot\eta_{t}\boldsymbol{d}_{t}+\frac{L\eta_{t}^{2}}{2}\|\boldsymbol{d}_{t}\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[F(\boldsymbol{x}_{t})-\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}-\eta_{t}\nabla F(\boldsymbol{x}_{t})\cdot\boldsymbol{\epsilon}_{t}+\frac{L\eta_{t}^{2}}{2}\|\boldsymbol{d}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[F(\boldsymbol{x}_{t})-\frac{\eta_{t}}{2}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{\eta_{t}}{2}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{L\eta_{t}^{2}}{2}\|\boldsymbol{d}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[F(\boldsymbol{x}_{t})-\frac{\eta_{t}}{2}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{\eta_{t}}{2}\|\boldsymbol{\epsilon}_{t}\|^{2}+L\eta_{t}^{2}\|\boldsymbol{\epsilon}_{t}\|^{2}+L\eta_{t}^{2}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[F(\boldsymbol{x}_{t})-\frac{\eta_{t}}{2}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{\eta_{t}}{4}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right],$ 
+ where in the second inequality we used Young’s inequality, the third one uses $\|\boldsymbol{x}+\boldsymbol{y}\|^{2}\leq 2\|\boldsymbol{x}\|^{2}+2\|\boldsymbol{y}\|^{2}$ , and the last one uses $\eta_{t}\leq 1/4L$ .
+∎ 
+ This next Lemma is a technical observation that is important for the proof of Lemma 2 .
+ Lemma 3 . 
+ $\displaystyle\mathbb{E}\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}\right]=0$ 
+ $\displaystyle\mathbb{E}\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-\nabla F(\boldsymbol{x}_{t})+\nabla F(\boldsymbol{x}_{t-1}))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}\right]=0~.$ 
+ Proof.
+ From inspection of the update formula, the hypothesis implies that $\boldsymbol{\epsilon}_{t-1}=\boldsymbol{d}_{t-1}-\nabla F(\boldsymbol{x}_{t-1})$ and $\boldsymbol{x}_{t}$ are both independent of $\xi_{t}$ . Then, by first taking expectation with respect to $\xi_{t}$ and then with respect to $\xi_{1},\dots,\xi_{t-1}$ , we obtain 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}\right]$ 
+ $\displaystyle=\mathbb{E}\left[\mathbb{E}\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}|\xi_{1},\dots,\xi_{t-1}\right]\right]=0~.$ 
+ Analogously, for the second equality we have 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-\nabla F(\boldsymbol{x}_{t})+\nabla F(\boldsymbol{x}_{t-1}))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}\right]$ 
+ $\displaystyle=\mathbb{E}\left[\mathbb{E}\left[(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-(\nabla F(\boldsymbol{x}_{t})-\nabla F(\boldsymbol{x}_{t-1})))\cdot\eta_{t-1}^{-1}(1-a_{t})^{2}\boldsymbol{\epsilon}_{t-1}|\xi_{1},\dots,\xi_{t-1}\right]\right]$ 
+ $\displaystyle=0~.\qed$ 
+ The following Lemma is a standard consequence of convexity.
+ Lemma 4 . 
+ Let $a_{0}>0$ and $a_{1},\dots,a_{T}\geq 0$ . Then 
+ $\sum_{t=1}^{T}\frac{a_{t}}{a_{0}+\sum_{i=1}^{t}a_{i}}\leq\ln\left(1+\frac{\sum_{i=1}^{t}a_{i}}{a_{0}}\right)~.$ 
+ Proof.
+ By the concavity of the log function, we have 
+ $\ln\left(a_{0}+\sum_{i=1}^{t}a_{i}\right)-\ln\left(a_{0}+\sum_{i=1}^{t-1}a_{i}\right)\geq\frac{a_{t}}{a_{0}+\sum_{i=1}^{t}a_{i}}~.$ 
+ Summing over $t=1,\dots,T$ both sides of the inequality, we have the stated bound.
+∎ 
+ A.1 Proof of Lemma 2 
+ In this section we present the deferred proof of Lemma 2 , restating the result below for reference
+See 2 
+ Proof.
+ First, observe that 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[\eta^{3}_{t-1}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[\eta^{3}_{t-1}(\|\nabla f(\boldsymbol{x}_{t},\xi_{t})\|^{2}+\|\nabla F(\boldsymbol{x}_{t})\|^{2}-2\nabla f(\boldsymbol{x}_{t},\xi_{t})\cdot\nabla F(\boldsymbol{x}_{t}))\right]$ 
+ $\displaystyle=\mathbb{E}\left[\eta^{3}_{t-1}\mathbb{E}\left[\|\nabla f(\boldsymbol{x}_{t},\xi_{t})\|^{2}+\|\nabla F(\boldsymbol{x}_{t})\|^{2}-2\nabla f(\boldsymbol{x}_{t},\xi_{t})\cdot\nabla F(\boldsymbol{x}_{t})\middle|\xi_{1},\dots,\xi_{t-1}\right]\right]$ 
+ $\displaystyle=\mathbb{E}\left[\eta^{3}_{t-1}(\|\nabla f(\boldsymbol{x}_{t},\xi_{t})\|^{2}-\|\nabla F(\boldsymbol{x}_{t})\|^{2})\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\eta^{3}_{t-1}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})\|^{2}\right]~.$ 
+ (5) 
+ In the same way, we also have that 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[\eta_{t-1}^{-1}(1-a_{t}^{2})\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-\nabla F(\boldsymbol{x}_{t})+\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\eta_{t-1}^{-1}(1-a_{t}^{2})\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t}))\|^{2}\right]~.$ 
+ (6) 
+ By definition of $\boldsymbol{\epsilon}_{t}$ and the notation in Algorithm 1 , we have $\boldsymbol{\epsilon}_{t}=\boldsymbol{d}_{t}-\nabla F(\boldsymbol{x}_{t})=\nabla f(\boldsymbol{x}_{t},\xi_{t})+(1-a_{t})(\boldsymbol{d}_{t-1}-\nabla f(\boldsymbol{x}_{t-1},\xi_{t}))-\nabla F(\boldsymbol{x}_{t})$ . Hence, we can write 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[\eta_{t-1}^{-1}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]=\mathbb{E}\left[\eta_{t-1}^{-1}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})+(1-a_{t})(\boldsymbol{d}_{t-1}-\nabla f(\boldsymbol{x}_{t-1},\xi_{t}))-\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[\eta_{t-1}^{-1}\|a_{t}(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t}))+(1-a_{t})(\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-\nabla F(\boldsymbol{x}_{t})+\nabla F(\boldsymbol{x}_{t-1}))\right.$ 
+ $\displaystyle\quad\quad\quad\quad+\left.(1-a_{t})(\boldsymbol{d}_{t-1}-\nabla F(\boldsymbol{x}_{t-1}))\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla F(\boldsymbol{x}_{t})\|^{2}+2\eta_{t-1}^{-1}(1-a_{t})^{2}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})-\nabla F(\boldsymbol{x}_{t})+\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right.$ 
+ $\displaystyle\quad\quad\quad\quad\left.+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})\|^{2}+2\eta_{t-1}^{-1}(1-a_{t})^{2}\|\nabla f(\boldsymbol{x}_{t},\xi_{t})-\nabla f(\boldsymbol{x}_{t-1},\xi_{t})\|^{2}+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+2\eta_{t-1}^{-1}(1-a_{t})^{2}L^{2}\|\boldsymbol{x}_{t}-\boldsymbol{x}_{t-1}\|^{2}+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+2(1-a_{t})^{2}L^{2}\eta_{t-1}\|\boldsymbol{d}_{t-1}\|^{2}+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+2(1-a_{t})^{2}L^{2}\eta_{t-1}\|\boldsymbol{\epsilon}_{t-1}+\nabla F(\boldsymbol{x}_{t-1})\|^{2}+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+4(1-a_{t})^{2}L^{2}\eta_{t-1}(\|\boldsymbol{\epsilon}_{t-1}\|^{2}+\|\nabla F(\boldsymbol{x}_{t-1})\|^{2})+\eta_{t-1}^{-1}(1-a_{t})^{2}\|\boldsymbol{\epsilon}_{t-1}\|^{2}\right]$ 
+ $\displaystyle=\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}G_{t}^{2}+\eta_{t-1}^{-1}(1-a_{t})^{2}(1+4L^{2}\eta_{t-1}^{2})\|\boldsymbol{\epsilon}_{t-1}\|^{2}+4(1-a_{t})^{2}L^{2}\eta_{t-1}\|\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right],$ 
+ where in the first inequality we used Lemma 3 (See Appendix A ) and $\|\boldsymbol{x}+\boldsymbol{y}\|^{2}\leq 2\|\boldsymbol{x}\|^{2}+2\|\boldsymbol{y}\|^{2}$ , in the second inequality we used ( 5 ) and ( 6 ), in the third one the Lipschitzness and smoothness of the functions $f$ , and in the last inequality we used again $\|\boldsymbol{x}+\boldsymbol{y}\|^{2}\leq 2\|\boldsymbol{x}\|^{2}+\|\boldsymbol{y}\|^{2}$ .
+∎ 
+ Appendix B Non-adaptive Bound Without Lipschitz Assumption
+ In our analysis of Storm in Theorem 1 we assume that the losses are $G$ -Lipschitz for some known constant $G$ with probability 1. Often this kind of Lipschitz assumption is avoided in other variance-reduction analyses [ 18 , 8 , 25 ] . These works also require oracle knowlede of the parameter $\sigma$ . It turns out that our use of this assumption is actually only necessary in order to facilitate our adaptive analysis - in fact even for ordinary (non-variance-reduced) gradient descent methods the Lipschitz assumption seems to be a common thread in adaptive analyses [ 16 , 28 ] . If we are given access to the true value of $\sigma$ , then we can choose a deterministic learning rate schedule in order to avoid requiring a Lipschitz bound. All that needs be done is replace all instances of $G$ or $G_{t}$ in Storm with the oracle-tuned value $\sigma$ , which we outline in Algorithm 2 below.
+ Algorithm 2 Storm without Lipschitz Bound 
+ 1: 
+   Input: Parameters $k$ , $w$ , $c$ , initial point $\boldsymbol{x}_{1}$ 
+ 2: 
+  Sample $\xi_{1}$ 
+ 3: 
+   $G_{1}\leftarrow\|\nabla f(\boldsymbol{x}_{1},\xi_{1})\|$ 
+ 4: 
+   $\boldsymbol{d}_{1}\leftarrow\nabla f(\boldsymbol{x}_{1},\xi_{1})$ 
+ 5: 
+   $\eta_{0}\leftarrow\frac{k}{w^{1/3}}$ 
+ 6: 
+   for $t=1$ to $T$ do 
+ 7: 
+    $\eta_{t}\leftarrow\frac{k}{(w+\sigma^{2}t)^{1/3}}$ 
+ 8: 
+    $\boldsymbol{x}_{t+1}\leftarrow\boldsymbol{x}_{t}-\eta_{t}\boldsymbol{d}_{t}$ 
+ 9: 
+    $a_{t+1}\leftarrow c\eta_{t}^{2}$ 
+ 10: 
+   Sample $\xi_{t+1}$ 
+ 11: 
+    $G_{t+1}\leftarrow\|\nabla f(\boldsymbol{x}_{t+1},\xi_{t+1})\|$ 
+ 12: 
+    $\boldsymbol{d}_{t+1}\leftarrow\nabla f(\boldsymbol{x}_{t+1},\xi_{t+1})+(1-a_{t+1})(\boldsymbol{d}_{t}-\nabla f(\boldsymbol{x}_{t},\xi_{t+1}))$ 
+ 13: 
+   end for 
+ 14: 
+  Choose $\hat{\boldsymbol{x}}$ uniformly at random from $\boldsymbol{x}_{1},\dots,\boldsymbol{x}_{T}$ . (In practice, set $\hat{\boldsymbol{x}}=\boldsymbol{x}_{T}$ ).
+ 15: 
+   return $\hat{\boldsymbol{x}}$ 
+ The convergence guarantee of Algorithm 2 is presented in Theorem 2 below, which is nearly identical to Theorem 1 but losses adaptivity to $\sigma$ in exchange for removing the $G$ -Lipschitz requirement.
+ Theorem 2 . 
+ Under the assumptions in Section 3 , for any $b>0$ , we write $k=\frac{b\sigma^{\frac{2}{3}}}{L}$ . Set $c=28L^{2}+\sigma^{2}/(7Lk^{3})=L^{2}(28+1/(7b^{3}))$ and $w=\max\left((4Lk)^{3},2\sigma^{2},\left(\tfrac{ck}{4L}\right)^{3}\right)=\sigma^{2}\max\left((4b)^{3},2,(28b+\frac{1}{7b^{2}})^{3}/64\right)$ . Then, Algorithm 2 satisfies 
+ $\frac{1}{T}\mathbb{E}\left[\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]\leq\frac{M\frac{w^{1/3}}{k}}{T}+\frac{M\frac{w\sigma^{2/3}}{k}}{T^{2/3}},$ 
+ where $M=8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k}+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2)$ . 
+ In order to prove this Theorem, we need a non-adaptive analog of Lemma 2 :
+ Lemma 5 . 
+ With the notation in Algorithm 2 , we have 
+ $\mathbb{E}\left[\frac{\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t-1}}\right]\leq\mathbb{E}\left[2c^{2}\eta_{t-1}^{3}\sigma^{2}+\frac{(1-a_{t})^{2}(1+4L^{2}\eta_{t-1}^{2})\|\boldsymbol{\epsilon}_{t-1}\|^{2}}{\eta_{t-1}}+4(1-a_{t})^{2}L^{2}\eta_{t-1}\|\nabla F(\boldsymbol{x}_{t-1})\|^{2}\right]~.$ 
+ Proof.
+ The proof is nearly identical to that of Lemma 2 : the only difference is that instead of using the identity $\mathbb{E}[\eta_{t-1}^{3}\|\nabla f(x_{t},\xi_{t})-\nabla F(x_{t})\|^{2}]\leq\mathbb{E}[\eta_{t-1}^{3}\|\nabla f(x_{t},\xi_{t})\|^{2}]=\mathbb{E}[\eta_{t-1}^{3}G_{t}^{2}]$ , we directly use the value of $\sigma$ : $\mathbb{E}[\eta_{t-1}^{3}\|\nabla f(x_{t},\xi_{t})-\nabla F(x_{t})\|^{2}]\leq\eta_{t-1}^{3}\sigma^{2}$ .
+∎ 
+ Now we can prove Theorem 2 :
+ Proof of Theorem 2 .
+ This proof is also nearly identical to the analogous adaptive result of Theorem 1 . 
+ Again, we consider the potential $\Phi_{t}=F(\boldsymbol{x}_{t})+\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}$ and upper bound $\Phi_{t+1}-\Phi_{t}$ for each $t$ . 
+ Since $w\geq(4Lk)^{3}$ , we have $\eta_{t}\leq\frac{1}{4L}$ . Further, since $a_{t+1}=c\eta_{t}^{2}$ , we have $a_{t+1}\leq\frac{ck}{4Lw^{1/3}}\leq 1$ for all $t$ .
+Then, we first consider $\eta_{t}^{-1}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\eta_{t-1}^{-1}\|\boldsymbol{\epsilon}_{t}\|^{2}$ . Using Lemma 5 , we obtain 
+ $\displaystyle\mathbb{E}$ 
+ $\displaystyle\left[\eta_{t}^{-1}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\eta_{t-1}^{-1}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[2c^{2}\eta_{t}^{3}\sigma^{2}+\frac{(1-a_{t+1})^{2}(1+4L^{2}\eta_{t}^{2})\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t}}+4(1-a_{t+1})^{2}L^{2}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}-\frac{\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t-1}}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\underbrace{2c^{2}\eta_{t}^{3}\sigma^{2}}_{A_{t}}+\underbrace{\left(\eta_{t}^{-1}(1-a_{t+1})(1+4L^{2}\eta_{t}^{2})-\eta_{t-1}^{-1}\right)\|\boldsymbol{\epsilon}_{t}\|^{2}}_{B_{t}}+\underbrace{4L^{2}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}}_{C_{t}}\right]~.$ 
+ Let us focus on the terms of this expression individually. For the first term, $A_{t}$ , observe that $w\geq 2\sigma^{2}$ to obtain: 
+ $\sum_{t=1}^{T}A_{t}=\sum_{t=1}^{T}2c^{2}\eta_{t}^{3}\sigma^{2}=\sum_{t=1}^{T}\frac{2k^{3}c^{2}\sigma^{2}}{w+t\sigma^{2}}\leq\sum_{t=1}^{T}\frac{2k^{3}c^{2}}{t+1}\leq 2k^{3}c^{2}\ln\left(T+2\right)~.$ 
+ For the second term $B_{t}$ , we have 
+ $B_{t}\leq(\eta_{t}^{-1}-\eta_{t-1}^{-1}+\eta_{t}^{-1}(4L^{2}\eta_{t}^{2}-a_{t+1}))\|\boldsymbol{\epsilon}_{t}\|^{2}=\left(\eta_{t}^{-1}-\eta_{t-1}^{-1}+\eta_{t}(4L^{2}-c)\right)\|\boldsymbol{\epsilon}_{t}\|^{2}~.$ 
+ Let us focus on $\frac{1}{\eta_{t}}-\frac{1}{\eta_{t-1}}$ for a minute. Using the concavity of $x^{1/3}$ , we have $(x+y)^{1/3}\leq x^{1/3}+yx^{-2/3}/3$ . Therefore: 
+ $\displaystyle\frac{1}{\eta_{t}}-\frac{1}{\eta_{t-1}}$ 
+ $\displaystyle=\frac{1}{k}\left[\left(w+t\sigma^{2}\right)^{1/3}-\left(w+(t-1)\sigma^{2}\right)^{1/3}\right]\leq\frac{\sigma^{2}}{3k(w+(t-1)\sigma^{2})^{2/3}}$ 
+ $\displaystyle\leq\frac{\sigma^{2}}{3k(w-\sigma^{2}+t\sigma^{2})^{2/3}}\leq\frac{\sigma^{2}}{3k(w/2+t\sigma^{2})^{2/3}}$ 
+ $\displaystyle\leq\frac{2^{2/3}\sigma^{2}}{3k(w+t\sigma^{2})^{2/3}}\leq\frac{2^{2/3}\sigma^{2}}{3k^{3}}\eta_{t}^{2}\leq\frac{2^{2/3}\sigma^{2}}{12Lk^{3}}\eta_{t}\leq\frac{\sigma^{2}}{7Lk^{3}}\eta_{t},$ 
+ where we have used that that $w\geq(4Lk)^{3}$ to have $\eta_{t}\leq\frac{1}{4L}$ . 
+ Further, since $c=28L^{2}+\sigma^{2}/(7Lk^{3})$ , we have 
+ $\eta_{t}(4L^{2}-c)\leq-24L^{2}\eta_{t}-\sigma^{2}\eta_{t}/(7Lk^{3})~.$ 
+ Thus, we obtain $B_{t}\leq-24L^{2}\eta_{t}\|\boldsymbol{\epsilon}_{t}\|^{2}$ . Putting all this together yields: 
+ $\displaystyle\frac{1}{32L^{2}}$ 
+ $\displaystyle\sum_{t=1}^{T}\left(\frac{\|\boldsymbol{\epsilon}_{t+1}\|^{2}}{\eta_{t}}-\frac{\|\boldsymbol{\epsilon}_{t}\|^{2}}{\eta_{t-1}}\right)\leq\frac{k^{3}c^{2}}{16L^{2}}\ln\left(T+2\right)+\sum_{t=1}^{T}\left[\frac{\eta_{t}}{8}\|\nabla F(\boldsymbol{x}_{t})\|^{2}-\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]~.$ 
+ (7) 
+ Now, we analyze the potential $\Phi_{t}$ . This analysis is completely identical to that of Theorem 1 , and is only reproduced here for convenience. Since $\eta_{t}\leq\frac{1}{4L}$ , we can use Lemma 1 to obtain 
+ $\displaystyle\mathbb{E}[\Phi_{t+1}-\Phi_{t}]$ 
+ $\displaystyle\leq\mathbb{E}\left[-\frac{\eta_{t}}{4}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{1}{32L^{2}\eta_{t}}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]~.$ 
+ Summing over $t$ and using ( 7 ), we obtain 
+ $\displaystyle\mathbb{E}[\Phi_{T+1}-\Phi_{1}]$ 
+ $\displaystyle\leq\sum_{t=1}^{T}\mathbb{E}\left[-\frac{\eta_{t}}{4}\|\nabla F(\boldsymbol{x}_{t})\|^{2}+\frac{3\eta_{t}}{4}\|\boldsymbol{\epsilon}_{t}\|^{2}+\frac{1}{32L^{2}\eta_{t}}\|\boldsymbol{\epsilon}_{t+1}\|^{2}-\frac{1}{32L^{2}\eta_{t-1}}\|\boldsymbol{\epsilon}_{t}\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[\frac{k^{3}c^{2}}{16L^{2}}\ln\left(T+2\right)-\sum_{t=1}^{T}\frac{\eta_{t}}{8}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]~.$ 
+ Reordering the terms, we have 
+ $\displaystyle\mathbb{E}\left[\sum_{t=1}^{T}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\leq\mathbb{E}\left[8(\Phi_{1}-\Phi_{T+1})+\frac{k^{3}c^{2}}{2L^{2}}\ln\left(T+2\right)\right]$ 
+ $\displaystyle\leq 8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{1}{4L^{2}\eta_{0}}\mathbb{E}[\|\boldsymbol{\epsilon}_{1}\|^{2}]+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2)$ 
+ $\displaystyle\leq 8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k}+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2),$ 
+ where the last inequality is given by the definition of $\boldsymbol{d}_{1}$ and $\eta_{0}$ in the algorithm. 
+ At this point the rest of the proof could proceed in an identical manner to that of Theorem 1 . However, since $\eta_{t}$ is now idependent of $\nabla F(x_{t})$ by virtue of being deterministic, we can simplify the remainder of the proof somewhat by avoiding the use of Cauchy-Schwarz inequality. 
+ Since $\eta_{t}$ is deterministic, we have $\mathbb{E}\left[\sum_{t=1}^{T}\eta_{t}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]\geq\eta_{T}\mathbb{E}\left[\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ . Then divide by $T\eta_{T}$ to conclude 
+ $\displaystyle\frac{1}{T}\mathbb{E}\left[\sum_{t=1}^{T}\|\nabla F(\boldsymbol{x}_{t})\|^{2}\right]$ 
+ $\displaystyle\leq\frac{M\frac{w^{1/3}}{k}}{T}+\frac{M\frac{w\sigma^{2/3}}{k}}{T^{2/3}},$ 
+ where we have used the definition $M=8(F(\boldsymbol{x}_{1})-F^{\star})+\frac{w^{1/3}\sigma^{2}}{4L^{2}k}+\frac{k^{3}c^{2}}{2L^{2}}\ln(T+2)$ and the identity $(a+b)^{1/3}\leq a^{1/3}+b^{1/3}$ 
+∎ 
+ Experimental support, please
+ view the build logs 
+ for errors. Generated by
+ L
+ A 
+ T
+ E 
+ xml 
+ .
+ Instructions for reporting errors
+ We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile
+ support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the
+ methods listed below:
+ Click the "Report Issue" ( 
+ ) button, located in the page header.
+ Tip: You can select the relevant text first, to include it in your report.
+ Our team has already identified the following issues . We appreciate your time reviewing and reporting rendering errors we
+ may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability
+ should not be a barrier to accessing research. Thank you for your continued support in championing open access for
+ all.
+ Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion , and welcome developer contributions .
+ We gratefully acknowledge support from
+ our major funders ,
+ member institutions , ,
+ and all contributors.
+ About 
+ · 
+ Help 
+ · 
+ Contact 
+ · 
+ Subscribe 
+ · 
+ Copyright 
+ · 
+ Privacy 
+ · 
+ Accessibility 
+ · 
+ Operational Status (opens in new tab) 
+ Major funding support from

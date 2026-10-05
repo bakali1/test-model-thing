@@ -1,0 +1,1334 @@
+Periodical Moving Average Accelerates Gradient Accumulation for Post-Training
+
+
+
+          Yumou Liu* 1               An Li1             Chaojie Li1              Fei Yu1              Benyou Wang †1
+
+                                                    1
+                                                   School of Data Science
+                                       The Chinese University of Hong Kong, Shenzhen
+                                                     Shenzhen, China
+
+
+
+
+                          Abstract                                 1    INTRODUCTION
+
+  High gradient variance presents a significant ob-                Scaling large language models (LLMs) has consistently pro-
+  stacle to efficient post-training of large language              pelled advances in model capability and generalization [Rad-
+  models (LLMs) on memory-constrained devices.                     ford et al., 2019, Kaplan et al., 2020, Brown et al., 2020,
+  Existing practical strategiessuch as reducing batch              Hoffmann et al., 2022, Zhang et al., 2022, Touvron et al.,
+  sizes or adopting gradient accumulation (GA)suf-                 2023a,b, Achiam et al., 2023, Bi et al., 2024]. Modern post-
+  fer from an inherent trade-off: smaller batches ex-              training stages—including supervised fine-tuning (SFT)
+  acerbate convergence issues due to increased gradi-              and reinforcement learning from human feedback [Ope-
+  ent noise, while GA substantially prolongs training              nAI, 2024]—exert substantial computational and memory
+  time owing to its sequential processing. In this                 burdens, typically necessitating powerful multi-GPU clus-
+  work, we reveal that the Exponential Moving Av-                  ters [Lee and Sengupta, 2022]. However, scaling intensifies
+  erage (EMA) in momentum-based optimizers ex-                     GPU memory constraints, presenting major challenges for
+  ponentially discounts historical gradients, thereby              training or adaptation on memory-limited devices.
+  limiting their effectiveness in stabilizing parameter            Practical strategies for training LLMs under memory con-
+  updates, especially during post-training when pa-                straints are hampered by efficiency limitations. Simple batch
+  rameter drift is minimal. Motivated by this, we pro-             size reduction increases gradient variance, significantly
+  pose integrating the core idea of GA directly into               slowing convergence. Alternatively, gradient accumulation
+  momentum updates via a novel Periodical Moving                   (GA) alleviates memory bottlenecks by splitting a large
+  Average (PMA) mechanism, which structures train-                 batch into multiple smaller updates, accumulating gradients
+  ing into fixed periods and replaces EMA with a                   over several micro-batches before a single parameter up-
+  uniform moving average within each period. We in-                date. While GA emulates large-batch training, it transforms
+  stantiate PMA within AdamW and Lion, resulting                   parallel computation into sequential updates, substantially
+  in the AdamW-PMA and Lion-PMA optimizers.                        elongating training time.
+  Theoretical analysis establishes that AdamW-PMA
+  matches the convergence guarantees of standard                   In this work, we introduce the Periodical Moving Average
+  Adam. Extensive empirical evaluation on super-                   (PMA), a novel momentum update scheme tailored to accel-
+  vised fine-tuning and direct preference optimiza-                erate post-training of LLMs on memory-limited hardware
+  tion tasks demonstrates that PMA-based methods                   by addressing both variance and computational overhead.
+  achieve approximately 2× faster training com-                    Existing approaches involve a fundamental trade-off: GA
+  pared to GA, while yielding consistently better                  cannot interleave parameter updates within accumulation pe-
+  performance on downstream evaluations.                           riods without losing memory efficiency, while small-batch
+                                                                   training suffers from high variance and unstable parameter
+                                                                   updates. Our central insight is that, during post-training,
+                                                                   LLM parameters evolve gradually due to low learning rates,
+                                                                   leading to consecutive gradients with highly similar expec-
+                                                                   tations. This motivates rethinking the exponential moving
+  * yumouliu@link.cuhk.edu.cn                                      average (EMA): while EMA discounts historical gradients
+  †
+      Benyou is the corresponding author                           exponentially and thus rapidly forgets useful information, a
+
+
+           Proceedings of the 41st Conference on Uncertainty in Artificial Intelligence (UAI 2025), PMLR 244:2748–2768.
+(a) AdamW vs. AdamW-PMA          (b) Lion vs. Lion-PMA on         (c) AdamW vs. AdamW-PMA             (d) Lion vs. Lion-PMA on
+on SFT.                          SFT.                             on DPO.                             DPO.
+
+Figure 1: Optimizers with PMA achieve approximately 2× speedup compared to EMA-based optimizers. (1a, 1b) show SFT
+validation loss on Phi-2 2.7B with Alpaca; (1c, 1d) show DPO validation loss on Phi-2 2.7B with HH-RLHF.
+
+
+properly designed moving average can better utilize recent                  PMA and Lion-PMA), our method stabilizes training
+history for stabilization.                                                  and reduces training time and data requirements, with-
+                                                                            out incurring extra per-step memory or computation.
+PMA partitions training into discrete periods of K steps each.
+Within each period, it replaces EMA with a simple moving              • We provide comprehensive empirical validation across
+average in the momentum update, uniformly weighting re-                 models ranging from 0.1B to 7B parameters and for
+cent gradients to reduce variance. Between periods, it resets           both SFT and DPO settings. PMA-based optimizers
+to standard EMA, thus preserving rapid convergence and                  realize up to 2× speedup over GA, consistently outper-
+optimizer stability. This hybrid mechanism achieves a favor-            forming baselines in downstream evaluation 1 .
+able trade-off between memory efficiency and convergence              • We theoretically analyze the convergence of AdamW-
+speed.                                                                  PMA, highlighting the effectiveness of the dynamic
+                                                                        learning rate strategy and establishing regret guarantees
+A notable challenge with PMA is trajectory deviation,
+                                                                        on par with standard Adam.
+wherein uniform averaging within a period may cause pa-
+rameter updates to diverge from the ideal optimization path,
+due to lack of access to the true gradient expectation. To        2         PRELIMINARIES
+mitigate this, we employ a periodic learning rate decay:
+the learning rate linearly decreases within each period and       2.1       BACKGROUND: FIRST-ORDER
+resets at period boundaries, ensuring that parameter updates                OPTIMIZATION
+remain stable and aligned with the underlying optimization
+trajectory.                                                       Adam [Kingma and Ba, 2014, Reddi et al., 2019] and
+                                                                  AdamW [Loshchilov and Hutter, 2017] are among the most
+We instantiate PMA within AdamW [Loshchilov and Hutter,
+                                                                  widely used optimizers for large language model (LLM)
+2017] and Lion [Chen et al., 2023], resulting in AdamW-
+                                                                  training, integrating adaptive learning rates and momentum-
+PMA and Lion-PMA, respectively. We thoroughly evaluate
+                                                                  based techniques. Given an objective function f : Rd → R,
+these variants across SFT and Direct Preference Optimiza-
+                                                                  at iteration t, let the stochastic gradient be gt = ∇f (xt ).
+tion (DPO) [Rafailov et al., 2023] tasks on a range of mod-
+                                                                  Adam maintains exponential moving averages of the first
+els, including GPT-2 [Brown et al., 2020], Phi-2 [Javaheripi
+                                                                  and second moments: mt = β1 mt−1 + (1 − β1 )gt and
+et al., 2023], Qwen1.5 [Team, 2024a], Qwen2 [Yang et al.,
+                                                                  vt = β2 vt−1 + (1 − β2 )gt2 , where β1 and β2 are hyper-
+2024], and Llama2 [Touvron et al., 2023b]. Our experiments
+                                                                  parameters, and all operations are element-wise. A small
+show that AdamW-PMA and Lion-PMA achieve approxi-
+                                                                  constant  > 0 is typically added to vt for numerical sta-
+mately 2× speedup over traditional EMA-based optimizers,
+                                                                  bility. To correct the bias introduced at initialization, the
+while attaining better downstream task performance. We fur-
+                                                                  moment estimates are debiased: m̂t = mt /(1 − β1t ) and
+ther provide theoretical analysis of the learning rate strategy
+                                                                  v̂t = vt /(1 − β2t ). Since historical gradients receive expo-
+and regret bound, establishing that AdamW-PMA retains the
+                                                                  nentially decaying weights, these averages are referred to
+convergence guarantees of Adam.
+                                                                  as exponentially weighted moving averages (EMAs). The
+Our key contributions are:                                        parameter update is then
+                                                                                                          m̂t
+   • We propose Periodical Moving Average (PMA), a mo-                                 xt+1 ← xt − γ √           ,            (1)
+     mentum update mechanism that accelerates large-batch                                                v̂t + 
+     emulation for LLM post-training on memory-limited                  1
+                                                                     Implementation available at https://github.com/
+     devices. When applied to AdamW and Lion (AdamW-              liuyumou/periodical-moving-average.git
+
+
+                                                             2749
+where γ is the learning rate. All operations are performed           solution. GA divides a large batch into K smaller micro-
+element-wise. AdamW decouples weight decay from the                  batches processed sequentially, accumulating gradients com-
+gradient update. More recently, Lion [Chen et al., 2023] has         puted on each without exceeding the device memory limit.
+been proposed, which relies solely on the first moment and           After accumulating gradients over the K micro-batches, the
+updates parameters using EMA.                                        optimizer averages them to approximate the gradient over
+                                                                     the full batch and performs a parameter update. Notably, the
+Despite their effectiveness, Adam-based methods encounter
+                                                                     gradient accumulated via GA is mathematically equivalent
+difficulties in high-variance settings, particularly under
+                                                                     to that obtained from a large batch.
+memory constraints. Training LLMs is intrinsically a high-
+variance optimization problem [McCandlish et al., 2018].             Despite its statistical soundness, GA presents substantial
+To mitigate variance, practitioners commonly increase the            practical drawbacks, primarily in terms of increased wall-
+batch size using high-performance clusters [Touvron et al.,          clock time. That is, GA achieves memory efficiency by
+2023a]. Conversely, reducing batch size further amplifies            trading off parallelism for serial computation: on resource-
+the stochasticity of gradient estimates, slowing convergence         limited devices, each parameter update requires K succes-
+and degrading optimization, especially in memory-limited             sive forward and backward passes, leading to lower compu-
+environments [Yuan et al., 2016, Bottou et al., 2018, Kunst-         tational efficiency than if the large batch could be processed
+ner et al., 2023, Fu et al., 2023].                                  in parallel. Recent variants such as Pham et al. [2023] fur-
+                                                                     ther reduce memory usage in GA, but do not alleviate the
+                                                                     increased training time on memory-constrained hardware.
+2.2       THEORETICAL SOLUTION: VARIANCE
+          REDUCTION IN SGD
+                                                                     2.4   THE DILEMMA
+Here we review representative approaches for reduc-
+ing gradient variance in stochastic optimization [Bottou             The discussions in Section 2.2 and Section 2.3 reveal a
+et al., 2018], alongside their limitations. Variance reduc-          fundamental dilemma between theoretically grounded and
+tion techniques typically reuse historical information to            practically feasible approaches for high-variance optimiza-
+construct lower-variance gradient estimates. For instance,           tion under GPU memory constraints. On the one hand,
+SVRG [Johnson and Zhang, 2013] maintains a snapshot                  state-of-the-art variance reduction methods frequently incur
+parameter θk (with k < t) and leverages it for gradient              prohibitive memory costs, rendering them unsuitable for
+correction. The iterate averaging method [Polyak, 1991]              resource-limited environments. On the other hand, practical
+averages the iterates across steps to yield a final estimate.        strategies either converge slowly due to elevated gradient
+Recent advances such as SARAH [Nguyen et al., 2017]                  variance or require substantially increased training time,
+and STORM [Cutkosky and Orabona, 2019] adopt recursive               as in the case of the sequential computations inherent to
+update rules that avoid explicit storage of past gradients.          gradient accumulation (GA). Crucially, this dilemma stems
+                                                                     from the persistence of high variance in stochastic gradi-
+However, these variance reduction methods exhibit practical
+                                                                     ents. Therefore, there is a pressing need for novel methods
+deficiencies in the LLM context. Approaches like SAGA
+                                                                     that can reduce the variance of parameter updates without
+incur prohibitive memory costs by requiring storage of a gra-
+                                                                     incurring additional memory or computational overhead.
+dient for every data sample, with memory usage scaling with
+dataset size. Iterate averaging demands storing all historical
+parameter vectors, incurring memory overhead proportional            3     METHODOLOGY: PERIODICAL
+to the number of steps. SVRG relies on large-batch compu-                  MOVING AVERAGE
+tations at each snapshot, increasing memory requirements.
+Although SARAH and STORM mitigate storage needs by                   To address the dilemma identified in Section 2.4, we propose
+not retaining past gradients explicitly, they require multiple       PMA as an enhancement of the exponential moving average
+backpropagation passes per parameter update, which sub-              (EMA) process to more effectively reduce gradient variance.
+stantially increases computational cost during LLM training.         Section 3.1 presents the high-level design and intuition un-
+                                                                     derlying PMA, including its connections and distinctions to
+2.3       PRACTICAL SOLUTION: GRADIENT                               existing work. Section 3.2 provides detailed implementa-
+          ACCUMULATION                                               tion, with an emphasis on dynamics of β and learning rate
+                                                                     scheduling, while Section 3.3 describes the integration of
+To address high gradient variance under memory constraints,          PMA with AdamW and Lion.
+gradient accumulation (GA)2 provides a straightforward
+
+      2
+     While memory-efficient optimizers such as those proposed
+in [Shazeer and Stern, 2018, Luo et al., 2023, Zhao et al., 2024,
+Zhang et al., 2024] are also viable, we argue that GA remains more   practical for our scenario. Detailed discussion appears in § 6.
+
+
+                                                                 2750
+3.1       HIGH-LEVEL IDEA                                                the update, the first and second momenta are scaled by K.
+                                                                         This design both reduces the variance of the momentum
+Mimicking GA in Momentum Updates. At a high level,                       estimates and, after K steps, ensures the accumulated gradi-
+PMA simulates the variance reduction of gradient accumu-                 ents receive equal weighting, consistent with the behavior
+lation (GA) within momentum-based optimizers. Unlike                     of GA.
+standard EMA, which exponentially discounts past gradi-
+ents, our method maintains uniform weighting for recent                  Small Update Steps: Uniform Moving Average via Dy-
+gradients within fixed periods. By partitioning training iter-           namic Weights. For subsequent small steps within the
+ations into periods and employing a vanilla moving average               period (τ = 1, . . . , K − 1), the momentum is updated as
+for momentum updates within each period, PMA mimics the
+effect of GA, providing moment estimates of lower vari-                                             τ         1 − β1
+                                                                                          mt ←         mt−1 +        gt .
+ance analogous to those obtained by EMA-based optimizers                                          τ +1        τ +1
+using GA (§3.2.1).                                                       This procedure, in essence, replaces the EMA with a vanilla
+                                                                         moving average, ensuring that the gradients from each small
+From Pure Accumulation to Progressive Updates.                           step contribute equally in mt,K−1 . Notably, in mt,K−1 ,
+Whereas standard GA does not update parameters until the                 mt−1,K−1 receives weight 1 − β1 , and each gt,τ (for all
+end of each accumulation period, PMA interleaves updates
+                                                                         τ ) is weighted by 1−β1
+                                                                                             K , conforming with the GA weighting
+within each period. Specifically, PMA alternates between
+                                                                         scheme.
+steps with large and small learning rates: we designate the
+former as large update steps, typically at the culmination
+                                                                         Algorithm 1: AdamW with Periodical Moving Average
+of a period, and the latter as small update steps. Each large
+                                                                         (AdamW-PMA)
+update step, taken after K small update steps, emulates the
+                                                                         Input:   Learning rate γ; coefficients (β1 , β2 );
+behavior of EMA-based optimizers with GA, while the inter-
+                                                                                 Initial params θ0 ; objective f (θ);
+vening small update steps facilitate faster convergence. By
+                                                                                 Epsilon ; weight decay λ;
+judiciously choosing a reduced learning rate for these small                     Period length K (# microsteps per period)
+steps, we seek to accelerate optimization without destabiliz-            Data: m0 ← 0, v0 ← 0
+ing the variance reduction effect (§3.2.2).
+                                                                    1  for t = 1, 2, . . . do
+                                                                     2      gt ← ∇θ ft (θt−1 );
+3.2       DETAILED DESIGN                                            3      τ ← t mod K;
+                                                                     4      if τ = 0 and t > 0 then // Large update step
+We now describe the update rules governing the first moment                   every K iterations
+(momentum) as an illustrative example.                               5           γt ← γ;
+                                                                     6           mt ← β1 mt−1 + (1 − β1 ) gKt // Divide by K
+                                                                                  for stability
+3.2.1      Momentum Update: Dynamics of β                            7
+                                                                                                             g2
+                                                                                    vt ← β2 vt−1 + (1 − β2 ) Kt ;
+                                                                     8       else            √
+Unlike conventional EMA, where β is fixed, PMA employs 9                            γt ← γ/ K // Small update: reduced
+a dynamically adjusting β to achieve a uniform moving av-                            LR
+erage within each accumulation period.3 Uniform weighting 10                        mt ← τ +1τ
+                                                                                                mt−1 + 1−β    1
+                                                                                                                g // Moving
+                                                                                                          τ +1 t
+requires systematically decaying β during each period so                             average update
+that each historical gradient within the period contributes 11                             τ
+                                                                                    vt ← τ +1  vt−1 + 1−β   2 2
+                                                                                                             g ;
+                                                                                                       τ +1 t
+equally.
+                                                                            // Debiasing (adjust for
+We describe momentum updates for both the large and small                        initialization bias)
+update steps. See Fig. 2a for a visualization.                      12      m̂t ← mt /(1 − β1
+                                                                                                 t//K
+                                                                                                       );
+                                                                                               t//K
+                                                                    13      v̂t ← vt /(1 − β2       );
+Large Update Step: Low Gradient Weight for Variance                         // Apply weight decay
+Control. At the first small update step following a large 14                θ̄t ← (1 − γt λ)θt−1 ;
+update step (τ = 0), the momentum update is                                 // Update parameter
+                                                                                                  √
+                                          gt               15               θt ← θ̄t − γt m̂t /( v̂t + );
+              mt ← β1 mt−1 + (1 − β1 ) ,                                    if τ = 0 and t > 0 then        // Rescale after
+                                          K                16
+
+where K denotes the accumulation length. Unlike EMA,                          large update step
+                                                           17                    m̂t ← K m̂t ;
+here the current gradient is scaled down by 1/K and, after
+                                                                    18           v̂t ← K v̂t ;
+      3
+     Here, β denotes the weight of the previous momentum; 1 − β
+is the weight of the current gradient. For clarity, we retain the   19   return θt
+notation β throughout.
+
+
+                                                                2751
+                                                                 4     THEORETICAL ANALYSIS
+
+                                                                 In this section, we provide theoretical guarantees for
+                                                                 AdamW-PMA, demonstrating that it achieves a convergence
+                                                                 rate comparable to Adam, with similar resource overhead.
+
+
+                                                                 4.1   CONVERGENCE ANALYSIS
+(a) Dynamic β (K = 8, β =       (b) Learning rate schedule
+0.9)                            (K = 8, γ = 1)                   We analyze the convergence properties of AdamW-PMA un-
+                                                                 der the same assumptions as Kingma and Ba [2014]. As a
+Figure 2: Illustrations of dynamic β and learning rate
+                                                                 performance metric, we consider the regret:
+scheduling.
+                                                                                          T
+                                                                                          X
+3.2.2    Learning Rate Schedule                                               Rτ (T ) =         [f (xt,τ ) − f (x∗ )] ,     (2)
+                                                                                          t=1
+
+Complementing the momentum update, we design a learn-            where τ denotes the index of the small update steps. This
+ing rate schedule that distinguishes between small and large     quantity measures the cumulative sub-optimality of the iter-
+update steps. Specifically, small update steps employ a lin-     ates xt,τ compared to the global optimum x∗ over T periods.
+early decaying learning rate rather than a fixed schedule.
+As shown in Fig. 2b, this mitigates the risk of excessive        For the analysis, we modify the notational convention so
+parameter advancement that could undermine the variance          that the index τ of the small update steps ranges from 1
+reduction effect intended by GA-mimicking. For step τ , the      to K. The large update step, corresponding to τ = K,
+effective learning rate is given by                              transitions from xt,K to xt+1,1 ; the remaining cases τ ∈
+                                 η                               [K − 1] correspond to the small update steps. We define
+                        ητ =        ,                            gt,τ = ∇f (xt,τ ), with gt,τ,i denoting its ith component.
+                               τ +1
+where η is the base learning rate. Such linear decay ensures     Theorem 1. Suppose the objective f is convex, with
+that later small steps cause less drift from the virtual GA      k∇f (x)k2 ≤ G and k∇f (x)k∞ ≤ G∞ for all x. As-
+reference point, preserving the intended statistical behavior.   sume that, for any (t1 , τ1 ), (t2 , τ2 ) ∈ [T ] × [K], the pa-
+                                                                 rameter differences satisfy kxt1 ,τ1 − xt2 ,τ2 k2 ≤ D and
+                                                                 kxt1 ,τ1 − xt2 ,τ2 k√∞ ≤ D∞ . Further suppose the hyperpa-
+3.3     CASE STUDY                                                                    1−β2
+                                                                 rameters satisfy 1−β   1
+                                                                                           ≤ 1. Then, for any T ≥ 1, AdamW-
+3.3.1    From AdamW to AdamW-PMA                                 PMA achieves:
+                                                                                    √           d
+To obtain AdamW-PMA, we substitute the EMA used in                                    KD2 X p
+                                                                       RK (T ) ≤                   T v̂T,K,i
+AdamWs first and second moment estimators with the peri-                           2γ(1 − β1 ) i=1
+odical moving average scheme detailed above. The pseudo-                                              d
+code is provided in Algorithm 1. Both momenta are scaled                             (1 + γ)K 3/2 G∞ X                      (3)
+                                                                                   +                     kg1:KT,i k2
+at large update steps, while
+                           √ at small steps, the learning rate                          2(1 − β1 )   i=1
+is effectively scaled by 1/ K, owing to the combination of                              2
+                                                                                       D∞  G∞ (K − 1)
+momentum and learning rate scaling. All remaining compo-                           +                  .
+                                                                                          2(1 − β1 )
+nents of AdamW remain unchanged.
+
+                                                                 The proof of Theorem 1 is provided in Appendix C. This
+3.3.2    From Lion to Lion-PMA
+                                                                 result√
+                                                                       establishes that AdamW-PMA attains a regret bound
+                                                                 of O( T ), matching the order obtained for Adam [Kingma
+A similar modification applies to Lion. The vanilla mov-
+                                                                 and Ba, 2014], and confirming its convergence guarantee in
+ing average with dynamic scheduling replaces the EMA
+                                                                 the convex setting.
+rule. Because Lion lacks a second moment estimate, √      the
+small step learning rate is decayed by 1/K, not 1/ K as in       Additionally, Theorem 1 reveals that, for fixed T , the cu-
+AdamW. This aligns with the rescaled momentum at large           mulative regret increases as K (the number of small steps)
+update steps, ensuring a linearly decreasing learning rate as    increases. This reflects a fundamental trade-off: larger K
+described above. All other Lion components are retained          can result in faster initial convergence, but overly large K
+unchanged. Pseudocode for Lion-PMA is presented in Ap-           may cause the update trajectory to deviate from that of
+pendix A.                                                        Adam, potentially leading to larger regret in the long term.
+
+
+                                                             2752
+4.2   RESOURCE OVERHEAD ANALYSIS                                Metrics. For SFT, we report validation loss and model
+                                                                performance on the MMLU benchmark [Hendrycks et al.,
+We now discuss the computational and memory overhead of         2020]. For DPO, we report validation loss and classification
+AdamW-PMA. Since AdamW-PMA is based on AdamW, we                accuracy (distinguishing accepted from rejected responses).
+focus on a comparison with AdamW employing gradient             For classification, we regard a prediction as correct if the
+accumulation.                                                   model assigns higher probability to the accepted response.
+AdamW-PMA does not incur any additional memory over-
+                                                                Methodology of Comparison. To compare optimizer effi-
+head compared to AdamW or AdamW with gradient accu-
+                                                                ciency, we adopt two metrics: (1) data efficiency, measured
+mulation. The memory required by AdamW-PMA consists
+                                                                by the amount of training data processed to reach a target
+of the storage for model parameters, gradients, and the run-
+                                                                metric value, accounting for batch size differences; and (2)
+ning estimates of the first and second moments—identical
+                                                                FLOPs, representing the computation required to reach a
+to Adam and AdamW. When the same micro-batch size is
+                                                                target metric value and reflecting training speed.
+used, the memory footprint of AdamW-PMA and AdamW
+with GA are equivalent.
+                                                                5.2    SUPERVISED FINE-TUNING
+
+5     EVALUATION
+                                                                                                     MMLU(Zero-Shot)
+                                                                   Algorithm     Val Loss
+                                                                                            Hums.   STEM Social Other    Avg.
+5.1   EXPERIMENTAL SETUP                                           AdamW-4       0.9212      15.4    28.3  26.7   24.3   24.4
+                                                                   AdamW-8       0.9408      19.2    22.8  26.7   25.0   23.3
+Tasks. We evaluate AdamW-PMA and Lion-PMA on lan-                  AdamW-PMA-4   0.9352      16.9    22.8  25.0   22.7   21.9
+                                                                   AdamW-PMA-8   0.9078      16.2    28.3  30.1   35.0   27.7
+guage modeling tasks, specifically supervised fine-tuning          Lion-4        0.9227      13.1    23.3  24.2   25.7   21.8
+(SFT) and direct preference optimization (DPO) [Rafailov           Lion-8        0.9486      20.8    22.2  24.2   25.0   23.0
+et al., 2023]. Additional experiments, including pre-training      Lion-PMA-4    0.9136      13.1    23.3  24.2   25.7   21.8
+                                                                   Lion-PMA-8    0.9373      17.7    22.2  22.5   26.4   22.3
+and learning rate scheduler ablation, are presented in Ap-
+pendix E due to space constraints. Table 1 summarizes the
+                                                                Table 2: Comparison of the validation loss and the perfor-
+experimental settings.
+                                                                mance after one epoch training on zero-shot MMLU for
+                                                                various algorithms. With limited space, we only demon-
+ Dataset               Model              Results
+                                                                strate four representative categories.
+ Alpaca                Phi-2-2.7B         Tab. 2
+ DuReader_Robust       Llama2-7B-base     Fig. 8
+                       Phi2-2.7B          Fig. 3,5,6            Table 2 shows that AdamW-PMA and Lion-PMA improve
+                       Qwen1.5-0.5B       Fig. 6                SFT performance compared to their baseline counterparts.
+ HH-RLHF-harmless                                               For validation loss, AdamW-PMA-8 achieves the best result
+                       Qwen2-0.5B         Fig. 4
+                       GPT2-medium        Fig. 7                among AdamW variants, while Lion-PMA-4 is best in the
+                                                                Lion family.
+              Table 1: Summary of Settings.
+                                                                For MMLU zero-shot tasks, PMA variants outperform their
+                                                                EMA counterparts in all categories except Humanities, at-
+                                                                tributable to input length limitations on Phi-2. PMA-based
+Baselines. We compare AdamW-PMA and Lion-PMA to
+                                                                optimizers consistently achieve higher average scores; e.g.,
+AdamW and Lion, respectively. For each optimizer with
+                                                                AdamW-PMA-8 obtains an average of 27.7, outperforming
+period length K and batch size B, we denote the settings
+                                                                AdamW.
+as AdamW-PMA-K and AdamW-K (similarly for Lion).
+AdamW-K refers to AdamW with K-step gradient accumu-
+lation, resulting in effective batch size KB. All optimizers    5.3    DIRECT PREFERENCE OPTIMIZATION
+within each comparison group share identical hyperparame-
+ters. For the AdamW-PMA and Lion-PMA groups, we set             PMA improves accuracy and reduces overfitting. Fig-
+lr = 2e−6 and betas to (0.9, 0.95) and (0.95, 0.98), respec-    ure 3 compares the validation accuracy across flops and
+tively, following Chen et al. [2023].                           training samples for K = 8 and K = 16. AdamW is con-
+                                                                sistently the slowest and least accurate, while PMA-based
+Implementation. Experiments are conducted on a server           optimizers yield marked improvements in both convergence
+equipped with 8× NVIDIA A40 GPUs (each with 48GB                speed and final accuracy. With larger K, AdamW-PMA
+memory). We use the Swift framework [Team, 2024b] and           achieves convergence speeds that surpass AdamW and ri-
+PyTorch [Paszke et al., 2019]. SFT experiments use K = 8,       val Lion, while Lion-PMA delivers the strongest overall
+B = 32; DPO tasks use K = 16, B = 16.                           performance.
+
+
+                                                            2753
+(a) Validation accuracy on       (b) Validation accuracy on       (c) Validation accuracy on      (d) Validation accuracy on
+flops (K = 8)                    flops (K = 16)                   number of samples (K=8)         number of samples (K=16)
+
+Figure 3: The accuracy of classifying the accepted and rejected responses on the validation dataset for DPO task. Compared
+to AdamW and Lion, AdamW-PMA and Lion-PMA exhibit faster convergence rates and higher accuracy.
+
+
+
+
+Figure 4: Validation loss of training        Figure 5: Runtime to achieve the           Figure 6: The speedup factor of
+more epochs on DPO task.                     same loss on DPO task..                    AdamW-PMA compared to AdamW
+                                                                                        under different K.
+
+
+Figure 4 presents validation loss across multiple epochs for      strates that PMA yields consistently lower update variance
+Qwen2-0.5B on DPO. PMA-based optimizers sustain lower             for the same loss and over training time, compared to EMA.
+validation loss and are less prone to overfitting compared to
+EMA-based counterparts.                                           PMA scales to large models. On Llama2-7B trained with
+                                                                  SFT on DuReader_Robust [Tang et al., 2020], AdamW-
+PMA reduces runtime. Figure 5 demonstrates that PMA-              PMA consistently achieves lower validation loss than
+based optimizers reach a given loss target in less wall-clock     AdamW throughout training (see Fig. 8), demonstrating
+time than EMA-based optimizers. Furthermore, PMA can              effectiveness at scale.
+utilize remaining data to achieve even higher accuracy once
+that target is met.                                               PMA incurs minimal extra per-step overhead. Al-
+                                                                  though PMA introduces more frequent updates and slightly
+PMA is sensitive to K. We study the effect of K on                more communication in distributed settings, per-iteration
+speedup in DPO experiments with both Phi-2 and Qwen1.5            time increases are modest: on a 7B model, AdamW-PMA is
+models (see Fig. 6). For small K, PMA approximates stan-          only about 2% slower per iteration than AdamW.
+dard AdamW, and variance reduction is minimal. For exces-
+sively large K, aggressive learning rate reduction can dimin-
+ish acceleration. In practice, an intermediate K achieves the     6   RELATED WORK
+best trade-off between speed and stability.
+                                                                  First-Order Adaptive Optimizers. First-order adaptive
+                                                                  methods form the backbone of modern deep learning opti-
+5.4   ADDITIONAL PROPERTIES                                       mization. Algorithms such as AdaGrad [Duchi et al., 2011]
+                                                                  adapt learning rates for each parameter based on historical
+PMA reduces update variance. We measure update vari-              gradient information, assigning larger updates to infrequent
+ance using GPT-2 medium on the Alpaca dataset with                features. RMSProp [Hinton et al., 2012] extends AdaGrad
+K = 16, comparing algorithms with identical configura-            by maintaining an exponential moving average of squared
+tions. Following [Ash et al., 2019, Mirzasoleiman et al.,         gradients. Adam [Kingma and Ba, 2014], which further
+2020, Killamsetty et al., 2021], we use the last layer gradient   introduces an EMA of the first moment, and its variant
+as a proxy for model gradient variance. Figure 7 demon-           with decoupled weight decay, AdamW [Loshchilov and
+
+
+                                                              2754
+                  (a) Variance vs Training loss                                    (b) Variance vs Time
+
+                    Figure 7: Comparison of the magnitude in variance w.r.t the training loss and time.
+
+
+                                                                (e.g., CAME saves 12.1% over Adam per Luo et al. [2023]),
+                                                                which remains inadequate for training LLMs under stringent
+                                                                memory constraints. Thus, techniques like gradient accu-
+                                                                mulation (GA) remain indispensable in memory-limited set-
+                                                                tings, further motivating acceleration of these approaches.
+
+                                                                Variance Reduction. Variance reduction techniques in
+                                                                SGD are essential for accelerating convergence. Among
+                                                                these, dynamic sampling, gradient aggregation, and iterate
+                                                                averaging have received particular attention [Bottou et al.,
+                                                                2018]. SVRG [Johnson and Zhang, 2013] and SAGA [De-
+                                                                fazio et al., 2014] leverage historical gradient or parameter
+Figure 8: Validation loss of SFT on Llama2-7B.AdamW-
+                                                                states to construct lower-variance stochastic gradient esti-
+PMA consistently attains a much lower loss than AdamW.
+                                                                mators, albeit at increased memory or computational costs.
+                                                                Iterate averaging [Polyak, 1991] returns the average of pa-
+Hutter, 2017], are now the predominant optimizers for large-    rameters across SGD iterates; Nesterov’s accelerated tech-
+scale neural networks, especially Transformers [Vaswani         niques [Nesterov, 2013] further establish O(1/t) conver-
+et al., 2017]. Numerous subsequent methods build on this        gence for such schemes. However, the practical application
+foundation, including variants such as AdaFactor [Shazeer       of these methods to LLMs is limited by their overhead in
+and Stern, 2018], Adam with Nesterov momentum [Dozat,           storage or per-iteration computation.
+2016], Adabelief [Zhuang et al., 2020], Adan [Xie et al.,
+2022], Lion [Chen et al., 2023], and GrAMS [Cao et al.,
+2024]. Despite their effectiveness, these algorithms often      7   CONCLUSION
+incur high memory costs due to storing additional first and
+second moment estimates, posing significant challenges for      We tackled the challenge of high-variance stochastic opti-
+training large models on memory-limited devices.                mization for post-training large language models (LLMs) on
+                                                                GPU-memory-constrained devices. Our analysis revealed
+Memory-Efficient Optimizers. To address memory bot-             that the slow convergence of existing momentum-based opti-
+tlenecks, several optimizers have been proposed. AdaFac-        mizers is largely attributable to the EMA scheme, which in-
+tor [Shazeer and Stern, 2018] approximates the second-          adequately exploits information from historical gradients to
+moment matrix using row and column factors. LOMO [Lv            stabilize parameter updates. To remedy this, we introduced
+et al., 2023] streamlines the update and gradient com-          PMA, a novel momentum update framework that partitions
+putation to reduce transient storage. CAME [Luo et al.,         training into periods and applies a moving average within
+2023] employs residual-based adaptive updating, and Ga-         each period. We integrated PMA into AdamW and Lion to
+Lore [Zhao et al., 2024] applies low-rank gradient projec-      obtain AdamW-PMA and Lion-PMA, respectively. Exten-
+tions to save memory. Adam-mini [Zhang et al., 2024] fur-       sive experiments on SFT and DPO tasks across various
+ther trims learning rate-related state in Adam. However,        models demonstrate that PMA yields at least a 2× speedup
+most of these methods entail a trade-off, sacrificing conver-   in training and consistently improves downstream task per-
+gence rates or providing only moderate memory reduction         formance.
+
+
+                                                            2755
+LIMITATIONS                                                    Xiangning Chen, Chen Liang, Da Huang, Esteban Real,
+                                                                 Kaiyuan Wang, Yao Liu, Hieu Pham, Xuanyi Dong,
+While PMA offers substantial training acceleration, it can       Thang Luong, Cho-Jui Hsieh, et al. Symbolic dis-
+incur increased communication overhead in multi-GPU set-         covery of optimization algorithms. arXiv preprint
+tings, particularly for large K. Specifically, since AdamW-      arXiv:2302.06675, 2023.
+PMA performs K times as many parameter update commu-
+                                                               Ashok Cutkosky and Francesco Orabona. Momentum-based
+nications as AdamW with GA, its communication cost can
+                                                                 variance reduction in non-convex sgd. NeurIPS, 32, 2019.
+scale linearly with K. In addition, we have not yet eval-
+uated PMA in large-scale distributed experiments; further      Aaron Defazio, Francis R. Bach, and Simon Lacoste-Julien.
+investigation in such settings is warranted.                     SAGA: A fast incremental gradient method with support
+                                                                 for non-strongly convex composite objectives. In NIPS,
+                                                                 pages 1646–1654, 2014.
+ACKNOWLEDGEMENT
+                                                               Timothy Dozat. Incorporating nesterov momentum into
+This work was supported by the Shenzhen Science and Tech-        adam. ICLR Workshop, 2016.
+nology Program (JCYJ20220818103001002), Shenzhen
+                                                               John Duchi, Elad Hazan, and Yoram Singer. Adaptive sub-
+Doctoral Startup Funding (RCBS20221008093330065),
+                                                                 gradient methods for online learning and stochastic opti-
+Tianyuan Fund for Mathematics of National Natural Sci-
+                                                                 mization. Journal of machine learning research, 12(7),
+ence Foundation of China (NSFC) (12326608), Shenzhen
+                                                                 2011.
+Science and Technology Program (Shenzhen Key Labora-
+tory Grant No. ZDSYS20230626091302006), and Shen-              Jingwen Fu, Bohan Wang, Huishuai Zhang, Zhizheng
+zhen Stability Science Program 2023, Shenzhen Key Lab of          Zhang, Wei Chen, and Nanning Zheng. When and why
+Multi-Modal Cognitive Computing.                                  momentum accelerates sgd: An empirical study. arXiv
+                                                                  preprint arXiv:2306.09000, 2023.
+
+References                                                     Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+                                                                 Mantas Mazeika, Dawn Song, and Jacob Steinhardt. Mea-
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ah-            suring massive multitask language understanding. arXiv
+  mad, Ilge Akkaya, Florencia Leoni Aleman, Diogo                preprint arXiv:2009.03300, 2020.
+  Almeida, Janko Altenschmidt, Sam Altman, Shyamal
+                                                               Geoffrey Hinton, Nitish Srivastava, and Kevin Swersky.
+  Anadkat, et al. Gpt-4 technical report. arXiv preprint
+                                                                 Neural networks for machine learning lecture 6a overview
+  arXiv:2303.08774, 2023.
+                                                                 of mini-batch gradient descent. Cited on, 14(8):2, 2012.
+Jordan T Ash, Chicheng Zhang, Akshay Krishnamurthy,            Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch,
+  John Langford, and Alekh Agarwal. Deep batch ac-               Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+  tive learning by diverse, uncertain gradient lower bounds.     de Las Casas, Lisa Anne Hendricks, Johannes Welbl,
+  arXiv preprint arXiv:1906.03671, 2019.                         Aidan Clark, et al. Training compute-optimal large lan-
+                                                                 guage models. arXiv preprint arXiv:2203.15556, 2022.
+Xiao Bi, Deli Chen, Guanting Chen, Shanhuang Chen,
+  Damai Dai, Chengqi Deng, Honghui Ding, Kai Dong,             Mojan Javaheripi, Sébastien Bubeck, et al. Phi-2: The
+  Qiushi Du, Zhe Fu, et al. Deepseek llm: Scaling open-         surprising power of small language models. URL
+  source language models with longtermism. arXiv preprint       https://www. microsoft. com/en-us/research/blog/phi-2-
+  arXiv:2401.02954, 2024.                                       the-surprising-power-of-small-language-models, 2023.
+                                                               Rie Johnson and Tong Zhang. Accelerating stochastic gradi-
+Léon Bottou, Frank E Curtis, and Jorge Nocedal. Optimiza-
+                                                                 ent descent using predictive variance reduction. In NIPS,
+  tion methods for large-scale machine learning. SIAM
+                                                                 pages 315–323, 2013.
+  review, 60(2):223–311, 2018.
+                                                               Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Sub-               Brown, Benjamin Chess, Rewon Child, Scott Gray,
+  biah, Jared D Kaplan, Prafulla Dhariwal, Arvind Nee-           Alec Radford, Jeffrey Wu, and Dario Amodei. Scal-
+  lakantan, Pranav Shyam, Girish Sastry, Amanda Askell,          ing laws for neural language models. arXiv preprint
+  et al. Language models are few-shot learners. NeurIPS,         arXiv:2001.08361, 2020.
+  33:1877–1901, 2020.
+                                                               Krishnateja Killamsetty, Durga Sivasubramanian, Ganesh
+Yang Cao, Xiaoyu Li, and Zhao Song. Grams: Gradient              Ramakrishnan, and Rishabh Iyer. Glister: Generaliza-
+  descent with adaptive momentum scaling. arXiv preprint         tion based data subset selection for efficient and robust
+  arXiv:2412.17107, 2024.                                        learning. In AAAI, volume 35, pages 8110–8118, 2021.
+
+
+                                                           2756
+Diederik P Kingma and Jimmy Ba. Adam: A method for            Boris Polyak. New method of stochastic approximation
+  stochastic optimization. arXiv preprint arXiv:1412.6980,      type. Autom. Remote Control, 7:937–946, 01 1991.
+  2014.
+                                                              Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario
+Frederik Kunstner, Jacques Chen, Jonathan Wilder Laving-        Amodei, Ilya Sutskever, et al. Language models are unsu-
+  ton, and Mark Schmidt. Noise is not the main factor be-       pervised multitask learners. OpenAI blog, 1(8):9, 2019.
+  hind the gap between sgd and adam on transformers, but
+                                                              Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Er-
+  sign descent might be. arXiv preprint arXiv:2304.13960,
+                                                                mon, Christopher D Manning, and Chelsea Finn. Direct
+  2023.
+                                                                preference optimization: Your language model is secretly
+Kevin Lee and Shubho Sengupta. Introducing the ai research      a reward model. arXiv preprint arXiv:2305.18290, 2023.
+  supercluster metas cutting-edge ai supercomputer for
+                                                              Sashank J Reddi, Satyen Kale, and Sanjiv Kumar. On
+  ai research, 2022. URL https://ai.meta.com/
+                                                                the convergence of adam and beyond. arXiv preprint
+  blog/ai-rsc/.
+                                                                arXiv:1904.09237, 2019.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay      Noam Shazeer and Mitchell Stern. Adafactor: Adaptive
+   regularization. arXiv preprint arXiv:1711.05101, 2017.       learning rates with sublinear memory cost. In ICML,
+Yang Luo, Xiaozhe Ren, Zangwei Zheng, Zhuo Jiang,               pages 4596–4604, 2018.
+  Xin Jiang, and Yang You. Came: Confidence-guided            Hongxuan Tang, Hongyu Li, Jing Liu, Yu Hong, Hua Wu,
+  adaptive memory efficient optimization. arXiv preprint        and Haifeng Wang. Dureader_robust: A chinese dataset
+  arXiv:2307.02047, 2023.                                       towards evaluating robustness and generalization of ma-
+Kai Lv, Yuqing Yang, Tengxiao Liu, Qinghui Gao, Qipeng          chine reading comprehension in real-world applications.
+  Guo, and Xipeng Qiu. Full parameter fine-tuning for large     arXiv preprint arXiv:2004.11142, 2020.
+  language models with limited resources. arXiv preprint      Qwen Team. Introducing qwen1.5, February 2024a. URL
+  arXiv:2306.09782, 2023.                                      https://qwenlm.github.io/blog/qwen1.
+                                                               5/.
+Sam McCandlish, Jared Kaplan, Dario Amodei, and Ope-
+  nAI Dota Team. An empirical model of large-batch train-     The ModelScope Team. Swift:scalable lightweight in-
+  ing. arXiv preprint arXiv:1812.06162, 2018.                   frastructure for fine-tuning. https://github.com/
+                                                                modelscope/swift, 2024b.
+Baharan Mirzasoleiman, Jeff Bilmes, and Jure Leskovec.
+  Coresets for data-efficient training of machine learning    Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Mar-
+  models. In ICML, pages 6950–6960, 2020.                       tinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste
+                                                                Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al.
+Yurii Nesterov. Introductory lectures on convex optimiza-       Llama: Open and efficient foundation language models.
+  tion: A basic course, volume 87. Springer Science &           arXiv preprint arXiv:2302.13971, 2023a.
+  Business Media, 2013.
+                                                              Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,
+Lam M Nguyen, Jie Liu, Katya Scheinberg, and Martin            Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,
+  Takáč. Sarah: A novel method for machine learning            Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al.
+  problems using stochastic recursive gradient. In ICML,        Llama 2: Open foundation and fine-tuned chat models.
+  pages 2613–2621, 2017.                                        arXiv preprint arXiv:2307.09288, 2023b.
+OpenAI. Learning to reason with llms. https://ope-            Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-
+  nai.com/index/learning-to-reason-with-llms/, 2024.            reit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and
+                                                                Illia Polosukhin. Attention is all you need. NIPS, 30,
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer,
+                                                                2017.
+ James Bradbury, Gregory Chanan, Trevor Killeen, Zem-
+  ing Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch:   Xingyu Xie, Pan Zhou, Huan Li, Zhouchen Lin, and
+ An imperative style, high-performance deep learning li-        Shuicheng Yan. Adan: Adaptive nesterov momentum al-
+  brary. NeurIPS, 32, 2019.                                     gorithm for faster optimizing deep models. arXiv preprint
+                                                                arXiv:2208.06677, 2022.
+Hieu Pham, Zihang Dai, Golnaz Ghiasi, Kenji Kawaguchi,
+  Hanxiao Liu, Adams Wei Yu, Jiahui Yu, Yi-Ting Chen,         An Yang, Baosong Yang, Binyuan Hui, Bo Zheng, Bowen
+  Minh-Thang Luong, Yonghui Wu, et al. Combined scal-          Yu, Chang Zhou, Chengpeng Li, Chengyuan Li, Dayiheng
+  ing for zero-shot transfer learning. Neurocomputing, 555:     Liu, Fei Huang, et al. Qwen2 technical report. arXiv
+  126658, 2023.                                                 preprint arXiv:2407.10671, 2024.
+
+
+                                                          2757
+Kun Yuan, Bicheng Ying, and Ali H Sayed. On the influence
+  of momentum acceleration on online learning. Journal of
+  Machine Learning Research, 17(192):1–66, 2016.
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe,
+  Moya Chen, Shuohui Chen, Christopher Dewan, Mona
+  Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-
+  trained transformer language models. arXiv preprint
+  arXiv:2205.01068, 2022.
+Yushun Zhang, Congliang Chen, Ziniu Li, Tian Ding, Chen-
+  wei Wu, Yinyu Ye, Zhi-Quan Luo, and Ruoyu Sun. Adam-
+  mini: Use fewer learning rates to gain more. arXiv
+  preprint arXiv:2406.16793, 2024.
+Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang,
+   Anima Anandkumar, and Yuandong Tian. Galore:
+   Memory-efficient llm training by gradient low-rank pro-
+   jection. arXiv preprint arXiv:2403.03507, 2024.
+
+Juntang Zhuang, Tommy Tang, Yifan Ding, Sekhar C
+  Tatikonda, Nicha Dvornek, Xenophon Papademetris, and
+  James Duncan. Adabelief optimizer: Adapting step-
+  sizes by the belief in observed gradients. NeurIPS, 33:
+  18795–18806, 2020.
+
+
+
+
+                                                         2758
+     Perodical Moving Average Accelerates Gradient Accumulation for Post-Training
+                              (Supplementary Material)
+
+
+
+                    Yumou Liu§1                   An Li1          Chaojie Li1          Fei Yu1       Benyou Wang ¶1
+
+                                                              1
+                                                               School of Data Science
+                                                   The Chinese University of Hong Kong, Shenzhen
+                                                                 Shenzhen, China
+
+
+
+
+     A        EXTRA PSEUDO-CODE
+
+     Algorithm 2: Lion-PMA
+ 1 for t = 1 → . . . do
+ 2       gt ← ∇θ ft (θt−1 );
+ 3       τ ← t%K;
+ 4       if τ = 0 and t > 0 then
+ 5            γt ← γ;
+ 6            ut ← β1 mt−1 + (1 − β1 )gt /K;
+ 7            ut ← sign(ut );
+ 8        else
+ 9                 γt ← γ/K;
+                          τ          1−β1
+10                 ut ← τ +1 mt +     τ +1 gt ;
+11                 ut ← sign(ut );
+                          τ          1−β2 2
+12                 mt ← τ +1 vt +     τ +1 gt ;
+
+13        θ̂t ← (1 − γt λ)θt−1 ;
+14        θt = θ̂t − γt ut ;
+15        if τ = 0 and t > 0 then
+16             m̂t ← K m̂t ;
+
+17   return θt ;
+
+
+     Algorithm 2 presents the pseudo-code of Lion-PMA. Lines 4-8 illustrate the large update steps, while lines 9-13 demonstrate
+     the small update steps. We incorporate Lion-PMA as an adaptation of AdamW-PMA to AdamW. The main difference
+     between the adaptation of AdamW and Lion lies in the implementation   √ of the learning rate strategy. In Lion-PMA, we
+     decay the learning rate by 1/K at the small update steps instead of 1/ K in AdamW-PMA.
+
+
+     B ADDITIONAL THEORETICAL ANALYSIS
+     In this section, we provide a theoretical analysis on the convergence property of AdamW-PMA. Specifically, we focus on the
+     convergence properties concerning the number of large update steps. This focus is due to the time cost between two large
+     steps being approximately equal to the time between two updates of Adam with GA. During the analysis, we slightly modify
+     the notations for ease of analysis. Unlike Algorithm 1, where the index of small update steps ranges from 0 to K − 1, in
+     the subsequent analysis, this index ranges from 1 to K. Specifically, when τ = K, the update step from xt,K to xt+1,1 is
+     considered a large update step for all t. For the other τ ∈ [K − 1], the subsequent update step is a small step.
+
+          * yumouliu@link.cuhk.edu.cn
+          †
+            Benyou is the corresponding author
+          §
+            yumouliu@link.cuhk.edu.cn
+          ¶
+            Benyou is the corresponding author
+
+
+                                                                       2759
+Firstly, we can show the average regret of AdamW-PMA converges based on Theorem 1,
+Corollary 1. Assume that the optimization objective f is convex and has bounded gradients, k∇f (x)k2 ≤ G, k∇f (x)k∞ ≤
+G∞ , and the distance between any parameter generated by AdamW-PMA√ is bounded, kxt1 ,τ1 − xt2 ,τ2 k2 ≤ D, kxt1 ,τ1 −
+                                                                               1−β2
+xt2 ,τ2 k∞ ≤ D∞ for any t1 , t2 ∈ [T ] and τ1 , τ2 ∈ [K], and β1 , β2 satisfy 1−β1
+                                                                                    ≤ 1. AdamW-PMA achieves the following
+regret guarantee, for all T ≥ 1.                                         
+                                                     RK (T )           1
+                                                             =O √            .
+                                                       T                T
+
+Then, we provide the update size between two large update steps in general non-convex settings.
+Theorem 2. Assume that the objective function f is L-smooth, the step size between two large update steps is bounded by
+
+                                                      γ 2 L (1 − β1 )2
+                                                                              
+                                        2     2
+                        kxt+1,1 − xt,1 k ≤        1+ √                 (K + 1) · ζ̄(2a)2t−2 ,                       (4)
+                                             L           K 1 − β2
+                                                             c                 β (1−β1 )
+where ζ̄ and a are constants, and ζ̄(2a)2t−2 ≥ ζ(2a)2t−2 + 1−4a     2
+                                                               2 + K , and a =
+                                                                               p1
+                                                                                β (1−β )
+                                                                                         · √1K .
+                                                                                            2    2
+
+
+
+Theorem 2 indicates that the distance between two large update steps is bounded and converges to 0. Despite having K
+small updates with varying momentum averaging √      weights, the step sizes still converge rapidly , suggesting the validity of
+setting the learning rate of the small steps to be γ/ K. Furthermore, the exponential term decreases with K, aligning with
+the intuition that more small update steps lead to faster convergence.
+
+
+C    PROOF OF THEOREM 2
+Before the analysis, we slightly modify the notations to simplify the analysis. The large step update takes the xt,K as input
+and outputs xt+1,1 . Then, AdamW-PMAuses small step update to obtain xt+1,2 , . . . , xt+1,K . It is noteworthy that the indexes
+of small step updates in Algorithm 1 range from 0 to K − 1, while in the following analysis, they will range from 1 to K.
+Before the analysis, we start with some important lemmas. Firstly, we consider the size of small step updates between two
+large step updates. To start with, we bound the size of every small step update using Lemma 1.
+Lemma 1. When τ ≥ 2,                                                                 
+                                         mt,τ       1 − β1    1         mt,1
+                                         √        ≤√        ·√          √      + τ − 1  .                                    (5)
+                                           vt,τ      1 − β2    τ          vt,1
+
+Proof.
+                    mt,τ          τ −1
+                                         mt,τ −1 + 1−β
+                                                    τ gt,τ −1
+                                                      1
+
+                    √        = qτ
+                      vt,τ          τ −1          1−β2 2
+                                      τ vt,τ −1 +  τ gt,τ −1
+                                                       Pτ
+                               1 − β1    1    mt,1 + σ=2 gt,σ
+                             ≤√        ·√ · q
+                                1 − β2    τ             Pτ
+                                                 vt,1 + σ=2 gt,σ 2
+
+                                                                                            
+                                              τ
+                               1 − β1    1 X               gt,σ                  mt,1
+                             ≤√        ·√           q                     + q                
+                                1 − β2    τ σ=2               Pτ
+                                                      vt,1 + ρ=2 gt,ρ  2
+                                                                                   Pτ    2
+                                                                             vt,1 + σ=2 gt,σ
+                                                                        
+                                                            τ
+                               1 − β1    1      mt,1              g
+                                                                 qt,σ 
+                                                           X
+                             ≤√        ·√  √          +
+                                1 − β2    τ      vt,1     σ=2
+                                                                     2
+                                                                    gt,σ
+                                                                
+                               1 − β1    1     mt,1
+                             =√        ·√     √        +  τ −  1
+                                1 − β2    τ      vt,1
+
+
+
+Then, we bound the squared size of the small step update.
+
+
+                                                             2760
+Corollary 2.                                                                                                          !
+                                                           2                                             2
+                                                mt,τ              (1 − β1 )2 2              mt,1                  2
+                                                √               ≤           ·               √                +τ           .                         (6)
+                                                  vt,τ             1 − β2     τ               vt,1
+
+Proof. Since (a + b)2 = a2 + b2 + 2ab ≤ 2(a2 + b2 ),
+                                                                                                          
+                                                mt,τ         1 − β1    1                    mt,1
+                                                √          ≤√        ·√                    √         +τ −1
+                                                  vt,τ        1 − β2    τ                     vt,1
+                                                                                                         !
+                                                                                                   2
+                                                                 (1 − β1 )2 2              mt,1
+                                                           ≤               ·               √         + τ2 .
+                                                                  1 − β2     τ               vt,1
+
+
+
+Then, we bound the sum of the squared size of small step updates between two large step updates.
+Corollary 3.
+                             −1                                        τ −2
+                           τ
+                                                                                                                 !
+                                                 2                                              2                                   2
+                           X           mt,σ            (1 − β1 )2 X 2                  mt,1                  2         mt,1
+                                       √             ≤                                 √             +σ              + √                .           (7)
+                           σ=1
+                                         vt,σ           1 − β2 σ=1 σ                     vt,1                            vt,1
+
+Proof.
+               τ −1            2       τ −2                2                       2
+               X      mt,σ             X        mt,σ              mt,τ −1
+                      √            =            √               + √
+               σ=1
+                        vt,σ           σ=1
+                                                  vt,σ              vt,τ −1
+                                                           −2
+                                                         τ
+                                                                                                                                                !
+                                                                           2                                                    2
+                                                         X       mt,σ       (1 − β1 )2     2          mt1                                   2
+                                   Corollary 2                   √        +            ·        ·     √                             + (τ − 1)
+                                         ≤               σ=1
+                                                                   vt,σ       1 − β2     τ −1           vt,1
+                                                         τ −2
+                                                                                  !
+                                                                            2                     2
+                                       (1 − β1 )2 X 2                mt,1                 mt,1
+                                   ≤                                 √        + σ2 + √              .
+                                        1 − β2 σ=1 σ                   vt,1                 vt,1
+
+
+
+After bounding the small steps between two large update steps, we consider the size of a large update step and K following
+small steps. To start with, we assume that the update size of the first large step is bounded.
+                                                                               
+Assumption 1. Let a = pββ1 (1−β   1)
+                               (1−β )
+                                      · √1 and b = √1−β1 · √1 · 1 + β
+                                         K            1−β       K
+                                                                            √1 K .
+                                                                              β
+                               2         2                                 2                         2
+
+
+
+                                                                  m1,1              b
+                                                                  √            ≤       + α.                                                         (8)
+                                                                    v1,1           1−a
+
+Then, we make some assumptions on the weight of the momentum.
+Assumption 2. For all t,                                             p
+                                                                        1 − β2t
+                                                                                ≤ 1.
+                                                                       1 − β1t
+
+If we take β1 = 0.9, β2 = 0.99 as the default configuration of Adam, this assumption holds.
+Then, we bound the size of a large update step.
+Lemma 2. By tuning the hyper-parameters β1 and β2 , let a ≤ 1/2. Then
+
+                                                                    mt,1
+                                                                    √           ≤ ᾱ · at−1 ,                                                       (9)
+                                                                      vt,1
+                                                           b
+where ᾱ > α is a constant to make ᾱ · at−1 ≥ α · at−1 + 1−a + K.
+
+
+                                                                               2761
+Proof.
+                   mt,1        β1 mt−1,K + 1−βK gt,1
+                                               1
+
+                   √         = q
+                     vt,1        β2 vt−1,K + 1−β 2 2
+                                              K gt,1
+
+                               β1 mt−1,K     1 − β1    1   gt,1
+                             ≤ p           +√        ·√ · q
+                                 β2 vt−1,K    1 − β2   K      2
+                                                            gt,1
+
+                               β1 mt−1,K     1 − β1     1
+                             = p           +√         ·√
+                                 β2 vt−1,K    1 − β 2    K
+                                                                                                                       
+                                           1 − β1    1  β1  1 − β1    1                                mt−1,1
+                            Lem. 1        √        ·√ +√ ·√         ·√ ·                              √          + K − 1
+                               ≤            1 − β2   K   β2  1 − β2   K                                 vt−1,1
+                                                                                                                  
+                                β1 (1 − β1 )    1   mt−1,1                             1 − β1     1           β1 K
+                             ≤p               ·√ · √                                +√         · √ · 1+ √
+                                 β2 (1 − β2 )   K    vt−1,1                             1 − β2    K             β2
+                              |         {z        }                                  |              {z             }
+                                              :=a                                                        :=b
+
+           m
+Let xt =   √ t,1   , then
+            vt,1
+                                                                                        
+                                                                                   b              b
+                                                     xt ≤ at−1 x1 −                          +
+                                                                                  1−a            1−a
+Then, by Assumption 1
+                                                    mt,1                             b
+                                                    √         ≤ α · at−1 +              ≤ ᾱ · at−1 .
+                                                      vt,τ                          1−a
+
+
+
+Similar to the above approach, we assume the bounded squared first large step and prove the bounded squared large steps.
+                                          2β12 K 2
+                               2
+                                                  
+Assumption 3. Let c = (1−β   1)   2
+                          1−β2 · K 1 +      β2           2
+
+                                                                        2
+                                                             m1,1                   c
+                                                             √              ≤            +ζ                                        (10)
+                                                               vt,1              1 − 4a2
+Corollary 4.
+                                                                            2
+                                                              mt,1
+                                                              √                 ≤ ζ̄(2a)2t−2 ,                                     (11)
+                                                                vt,1
+                                                              c
+where ζ̄ > ζ is a constant to make ζ̄(2a)2t−2 ≥ ζ(2a)2t−2 + 1−4a     2
+                                                                2 + K .
+
+
+
+Proof.
+                                     2                              2
+                            mt,1            β1 mt−1,K                       (1 − β1 )2 2
+                            √            ≤2 p                           +             ·
+                              vt,1            β2 vt−1,K                      1 − β2     K
+                                                                                                                               !
+                                                                                                                  2
+                                           (1 − β1 )2 2    4 (1 − β1 )2 β12                            mt−1,1              2
+                                         ≤           ·   +  ·               ·                          √              +K
+                                            1 − β2     K   K (1 − β2 )β2                                 vt−1,1
+                                                                2
+                                               mt−1,1
+                                         = 4a2 √                    + c.
+                                                 vt−1,1
+Then,                                                                                              !
+                                               2                                     2
+                                     mt,1                    2t−2  m1,1         c                              c
+                                     √              ≤ (2a)         √       −                            +
+                                       vt,1                          v1,1    1 − 4a2                        1 − 4a2
+                                                                       c
+                                                    ≤ ζ(2a)2t−2 +
+                                                                   1 − 4a2
+                                                    ≤ ζ̄(2a)2t−2 .
+
+
+
+                                                                            2762
+Before proving Theorem 2, we need more assumptions on the objective function and the initial point. First, we assume that
+f has Lipschitz continuous gradient.
+
+Assumption 4 (L-smoothness). A function f : Rd → R is differentiable and for any x1 , x2 ∈ Rd ,
+
+                                                    k∇f (x1 ) − ∇f (x2 )k ≤ Lkx1 − x2 k,
+
+where L is a constant.
+
+Now, by putting everything together, we are ready to prove Theorem 2.
+
+Proof of Theorem 2. Let T = L2 kxt+1,1 − xt k2 . At the beginning, we assume that the AdamW-PMA does not employ the
+bias correction shown in Line 12-13 in Algorithm 1.
+
+                                                L
+                                        T =       kxt+1,1 − xt.1 k2
+                                                2
+                                                  K−1
+                                                L X                        L
+                                              ≤        kxt,τ +1 − xt,τ k2 + kxt+1,1 − xt,K k2
+                                                2 τ =1                     2
+                                                     K−1                    2                       2
+                                                   L X     γ m̂                  L      m̂t,K
+                                              =           √ p t,τ               +     γ·p
+                                                   2 τ =1  K v̂t,τ               2        v̂t,K
+                                                        K−1                2        √                   2
+                                                γ 2 L X mt,τ                   γ 2 L K mt,K
+                                              = √       √                    +           √                  .
+                                               2 K τ =1   vt,τ                      2        vt,K
+
+             K−1                 2        √                         2
+       γ 2 L X mt,τ                    γ2L K           mt,K
+   T ≤ √         √                   +                 √
+      2 K τ =1     vt,τ                   2              vt,K
+                         K−1
+                                                                                                        !
+                                               2                                             2
+                   γ 2 L X mt,τ                      γ 2 L (1 − β1 )2   2           mt,1
+   Corollary 2     √         √                     +                  ·√            √            + K2
+        ≤         2 K τ =1     vt,τ                    2 1 − β2          K            vt,1
+             K−1
+                                                                                    !
+                             2                                              2
+      γ 2 L X mt,τ                γ 2 L (1 − β1 )2                    mt,1
+    = √       √                  +√ ·              ·                  √       + K2
+     2 K τ =1   vt,τ                 K   1 − β2                         vt,1
+                                         K−2
+                                                                            !                                                       !
+                                                                    2                    2                             2
+                   γ 2 L (1 − β1 )2 X 2          mt,1                     2     mt,1  γ 2 L (1 − β1 )2        mt,1              2
+   Corollary 3     √                            √                     +σ + √       +√ ·                  ·    √            +K
+       ≤          2 K 1 − β2 σ=1 σ                 vt,1                          vt,1    K     1 − β2           vt,1
+                                                ! 
+                                         2                                                  2
+      γ 2 L (1 − β1 )2                                       γ 2 L (1 − β1 )2                                     2
+                                                                              
+                                 mt,1                                               mt,1               3 (1 − β1 )
+   ≤√                    K· √              + K2 + 1 + √                            √          + γ 2 LK 2
+         K 1 − β2                 vt,1                          K 1 − β2             vt,1                  1 − β2
+                                                     2
+             γ 2 L (1 − β1 )2                                                  2
+                                       
+                                             mt,1                  3 (1 − β1 )
+   = 1+ √                     (K + 1) · √               + 2γ 2 LK 2
+                K 1 − β2                       vt,1                   1 − β2
+                         γ 2 L (1 − β1 )2                                                  2
+                                                   
+                                                                                3 (1 − β1 )
+   Corollary 4       1+ √                  (K + 1) · ζ̄(2a)2t−2 + 2γ 2 LK 2
+       ≤                    K 1 − β2                                               1 − β2
+                       2              2
+                                               
+                      γ L (1 − β1 )
+   Larger ζ̄      1+ √                  (K + 1) · ζ̄(2a)2t−2 .
+      ≤                 K     1 − β 2
+
+Thus,
+                                                                      γ 2 L (1 − β1 )2
+                                                                                             
+                                                           2
+                            kxt+1,1 − xt,1 k2 ≤                    1+ √                (K + 1) · ζ̄(2a)2t−2 .
+                                                           L             K 1 − β2
+
+Then, we consider the bias correction
+                             q
+                                      shown in Linw 12-13 in Algorithm 1. By the bias correction, the learning rate at time
+                                     1−β2t
+step t can be viewed as γt =     1−β1        γ ≤ γ by Assumption 2. Then, with the bias correction operation, this bound still holds.
+
+
+
+
+                                                                         2763
+D    PROOF OF THEOREM 1
+
+Before the analysis, we assume that the variable is bounded, as assumed in Kingma and Ba [2014].
+
+
+Assumption 5. We assume that the distance between the variable and the optimal point is bounded during the optimization
+process, such that kxt,τ − x∗ k2 ≤ D, kxi,j − xk,l k∞ ≤ D∞ .
+
+
+
+
+Proof of Theorem 1. Since the objective function f is convex,
+
+
+                                                                               d
+                                                                               X
+                          f (xt,K ) − f (x∗ ) ≤ h∇f (xt,K ), xt,K − θ∗ i =           gt,K,i (xt,K,i − x∗i ).
+                                                                               i=1
+
+
+
+Using the update method defined in Algorithm 1, we can get
+
+
+                                            m̂t,K,i
+                      xt+1,1,i = xt,K,i − γ p
+                                              v̂t,K,i
+                                                                                                           !
+                                             γ             K −1                 1 − β1
+                                = xt,K,i −                √ √       mt,K−1,i + √ √       gt,K,i                .
+                                           1 − β1t         K vt,K,i             K vt,K,i
+
+
+
+                                                                                                                    !
+                    ∗ 2                             2γ                       K −1                 1 − β1
+       (xt+1,1,i − x )    = (xt,K,i − x∗i )2 −            (xt,K,i − x∗i )   √ √       mt,K−1,i + √ √       gt,K,i
+                                                  1 − β1t                    K vt,K,i             K vt,K,i
+                                                2
+                                      mt,K,i
+                          + γ2K       √               .
+                                        vt,K,i
+
+
+Rearrange the equation above,
+
+                                                  √ √
+                                        (1 − β1t ) K vt,K,i
+                  gt,K,i (xt,K,i − x∗i ) =                       (xt+1,K,i − x∗i )2 − (xt,K,i − x∗i )2
+                                                                                                       
+                                             2γ(1 − β1 )
+                                                                    3√
+                                                       (1 − β1t )γK 2 vt,K,i mt,K,i 2
+                                                                                          
+                    K −1                          ∗
+                  +        mt,K−1,i (xt,K,i − xi ) +                              √
+                    1 − β1                                   2(1 − β1 )             vt,K,i
+                    √ √
+                      K vt,K,i
+                                   (xt+1,K,i − x∗i )2 − (xt,K,i − x∗i )2
+                                                                         
+                  ≤
+                    2γ(1 − β1 )
+                                                                              3
+                                                                                   m2t,K,i
+                                                                 
+                    K −1                  √           mt,K−1,i             γK 2
+                  +        (xt,K,i − x∗i ) vt,K−1 √                 +              √
+                    1 − β1                              vt,K−1,i       2(1 − β1 ) vt,K,i
+                    √ √
+                      K vt,K,i
+                                   (xt+1,K,i − x∗i )2 − (xt,K,i − x∗i )2
+                                                                         
+                  ≤
+                    2γ(1 − β1 )
+                                                                                             3
+                      K −1                      √            K − 1 m2t,K−1,i             γK 2     m2t,K,i
+                  +            (xt,K,i − x∗ )2 · vt,K,i +               √           +            √        .
+                    2(1 − β1 )                              2(1 − β1 ) vt,K−1,i        2(1 − β1 ) vt,K,i
+
+                                                                2764
+Figure 9: Runtime to achieve the same loss on DPO task.             Figure 10: Validation loss of AdamW without learning
+PMA can reduce the training time cost than EMA.                     rate scheduler and AdamW with a PMA-like lr sched-
+                                                                    uler.
+
+
+
+                          T X
+                          X d
+              RK (T ) ≤             gt,K,i (xt,K,i − x∗i )
+                          t=1 i=1
+                          d X
+                            T
+                                √ √                             √ √
+                          X      K vt,K,i                 ∗ 2
+                                                                 K vt,K,i
+                      ≤                      (xt+1,K,i − xi ) −              (xt,K,i − x∗i )2
+                        i=1 t=1
+                                2γ(1 − β 1 )                    2γ(1 − β 1 )
+                                                                                                3
+                         K −1                      √            K − 1 m2t,K−1,i         γK 2    m2t,K,i
+                     +            (xt,K,i − x∗ )2 · vt,K,i +             √          +           √
+                       2(1 − β1 )                              2(1 − β1 ) vt,K−1,i    2(1 − β1 ) vt,K,i
+                                   √          d                               d    T
+                                     KD2 X p                    D2 (K − 1) X X √
+                     Lemma 2                        T v̂T,K,i + ∞           ·          vT,K,i
+                        ≤      2γ(1 − β1 ) i=1                   2(1 − β1 ) i=1 t=1
+                                      3        d
+                        (1 + γ)K 2 G∞ X
+                      +                   kg1:KT,i k2
+                           2(1 − β1 ) i=1
+                          √          d                        3    d
+                            KD2 X p                 (1 + γ)K 2 G∞ X                D2 G∞ (K − 1)
+                      ≤                 T v̂T,K,i +                   kg1:KT,i k2 + ∞            .
+                        2γ(1 − β1 ) i=1                2(1 − β1 ) i=1                2(1 − β1 )
+
+
+
+
+E ADDITIONAL EXPERIMENTS
+
+E.1 PRE-TRAINING
+
+Although PMA is designed for post-training, we also evaluate its performance on pre-training task. Specifically, we train a
+randomly-initialized nanoGPT model on WikiPedia dataset. Figure 9 shows the validation loss of AdamW-PMA and AdamW.
+EMA-based AdamW achieves a lower validation loss than AdamW-PMA. This is because PMA, especially the small update
+step, is designed for post-training tasks where the distance between the original and trained parameters is small. Large
+distance of updates, such as pre-training, can make the update direction deviate too much from the direction of AdamW,
+leading to a slow training.
+
+
+E.2 ABLATION ON LEARNING RATE SCHEDULER
+
+To evaluate how the learning rate scheduler introduced in Sec. 3.2.2, we conduct an experiment on Qwen2-0.5B, comparing
+AdamW without a scheduler and with a PMA-like scheduler. The other settings are the same as the experiment in Fig. 4. We
+evaluate the tuned model every 120 steps, and the statistics are shown in Fig. 10. The PMA-like scheduler slows down the
+
+
+                                                             2765
+                                (b)   AdamW-PMA v.s.
+(a) AdamW-PMA v.s. AdamW        AdamW on number of              (c) Lion-PMA v.s. Lion on       (d) Lion-PMA v.s. Lion on
+on flops                        samples                         flops                           number of samples
+
+Figure 11: From the perspectives of total flops and number of steps, AdamW-PMA and Lion-PMA achieved speedups of
+1.8x and 1.4x respectively, compared to AdamW and Lion when K = 1.
+
+
+
+
+(a) AdamW-PMA v.s. AdamW        (b)   AdamW-PMA v.s.            (c) Lion-PMA v.s. Lion on       (d) Lion-PMA v.s. Lion on
+on Flops                        AdamW on Number of              Flops                           Number of Samples
+                                Samples
+
+Figure 12: We evaluate the optimizers by comparing the total flops and number of samples needed to achieve the same
+validation loss level. AdamW-PMA and Lion-PMA achieved approximately 12x and 2x speedup, respectively, relative to
+AdamW and Lion.
+
+
+training process if the other components of PMA are not applied. This result indicates the necessity of the joint design of
+each component in AdamW-PMA.
+
+
+E.3 SFT
+
+The improvement in validation loss brought by PMA can be translated into a reduction of the number of steps or total
+compute. In Figure 11, we evaluate the optimizers by comparing the number of steps or total flops needed to achieve the
+same validation loss level, setting K to 4. As can be observed in Figure 12, AdamW-PMA and Lion-PMA achieve a 12x and
+2x speedup compared with AdamW and Lion.
+
+
+E.4 DPO
+
+Figure 13 and Figure 14 illustrate the validation loss of the DPO task on Phi-2 and HH-RLHF-harmless dataset, using four
+different optimizers. We compare the total flops and number of samples needed to achieve the same validation loss across
+vanilla AdamW and AdamW-PMA, Lion and Lion-PMA. The corresponding accuracy graph for this experiment can be
+found in Figure 3 of Section 5.3 in the main text.
+
+
+E.5 HYPER-PARAMETER SENSITIVITY
+
+We do experiments on DPO task with the Phi-2-2.7B model and Qwen1half-0.5B-chat model to explore the sensitivity of
+the PMA method’s speedup factor with hyper-parameter K on AdamW. In experiment of Phi-2 model, we set K to be 8, 16,
+32, 64 to explore the optimal K value. For Qwen1.5-0.5B model, the K is set to be 4, 8, 16, 32, which are relatively smaller
+
+
+                                                           2766
+(a) AdamW-PMA v.s. AdamW        (b)   AdamW-PMA v.s.             (c) Lion-PMA v.s. Lion on        (d) Lion-PMA v.s. Lion on
+on flops                        AdamW on number of               flops                            number of samples
+                                samples
+
+                  Figure 13: Validation loss of the DPO task on Phi-2 and HH-RLHF-harmless dataset.
+
+
+
+
+(a) AdamW-PMA v.s. AdamW        (b)   AdamW-PMA v.s.             (c) Lion-PMA v.s. Lion on        (d) Lion-PMA v.s. Lion on
+on flops                        AdamW on number of               flops                            number of samples
+                                samples
+
+Figure 14: We evaluate the optimizers by comparing the total flops and number of samples needed to achieve the same DPO
+validation loss level, with K setting to be 16. AdamW-PMA and Lion-PMA achieved approximately 4x and 5x speedup,
+respectively, relative to AdamW and Lion.
+
+
+since the model is smaller. The results of experiments can be seen in Figure 15 and 16. This part is the supplement results of
+Section 5.4 in the main text.
+
+
+
+
+                                                            2767
+         (a)                          (b)                           (c)                            (d)
+
+     Figure 15: The sensitivity of PMA’s speedup factor with hyper-parameter K on Phi-2 model using AdamW
+
+
+
+
+               (a)                                   (b)                                     (c)
+
+Figure 16: The sensitivity of PMA’s speedup factor with hyper-parameter K on Qwenhalf1-0.5B model using AdamW
+
+
+
+
+                                                    2768
+

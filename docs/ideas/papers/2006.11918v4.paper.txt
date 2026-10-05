@@ -1,0 +1,890 @@
+ 
+ MaxVA: Fast Adaptation of Step Sizes by Maximizing Observed Variance of Gradients 
+ Report GitHub Issue
+ × 
+ Title: 
+ Content selection saved. Describe the issue below:
+ Description: 
+ Submit without GitHub 
+ Submit in GitHub 
+ arXiv is now an independent nonprofit! 
+ Learn more 
+ × 
+ Back to arXiv 
+ Why HTML? 
+ Report Issue 
+ Back to Abstract 
+ Download PDF 
+ Abstract 
+ 1 Introduction 
+ 2 Preliminary and Definitions 
+ 3 Maximizing the Variance of Running Estimations 
+ 4 Experiments on Synthetic Data 
+ 4.1 Convergence with Stochastic Gradients 
+ 4.2 Convergence in the Noisy Quadratic Model 
+ 5 Experiments on Practical Datasets 
+ 5.1 Image Classification 
+ 5.2 Neural Machine Translation 
+ 5.3 General Language Understanding Evaluation (GLUE) 
+ 5.4 Large-batch Pretraining for BERT 
+ 6 Related Work 
+ 7 Conclusion 
+ References 
+ 0.A Deriving the closed form solution Eq. 
+ 0.B Convergence Proof 
+ Proof of Theorem 1. 
+ 0.C Practical notes of $\beta_{t}$ 
+ Claims and arguments: 
+ 0.D AdaBound might fail on Transformers? 
+ 0.E Experimental Details on the Synthetic Finite-sample Experiment 
+ 0.F Details and Additional Experimental Results on the Noisy Quadratic Model 
+ Details of experimental settings 
+ Additional Results 
+ 0.G Details of Experiments on Image Classification 
+ Model, larning rate schedules and data augmentations 
+ Hyperparameters of CIFAR10 
+ Hyperparameters for CIFAR100 
+ Hyperparameters for ImageNet 
+ 0.H Additional Experimental Results and Details on Machine Translation 
+ Additional Experimental Results and analysis 
+ Hyperparameters for IWSLT’14 
+ Hyperparameters for WMT’16 
+ 0.I Additional Details of Experiments on the GLUE benchmark 
+ License: arXiv.org perpetual non-exclusive license
+arXiv:2006.11918v4 [cs.LG] 04 Jul 2021
+ MaxVA: Fast Adaptation of Step Sizes by Maximizing Observed Variance of Gradients
+ Chen Zhu
+ Affiliation: University of Maryland 
+ E-mail {chenzhu,furongh,tomg}@umd.edu 
+ Yu Cheng
+ Affiliation: Microsoft
+ E-mail {yu.cheng,zhe.gan,jingjl}@microsoft.com 
+ Zhe Gan
+ Affiliation: Microsoft
+ E-mail {yu.cheng,zhe.gan,jingjl}@microsoft.com 
+ Furong Huang
+ Affiliation: University of Maryland 
+ E-mail {chenzhu,furongh,tomg}@umd.edu 
+ Jingjing Liu
+ Affiliation: Tsinghua University 
+ E-mail jjliu@air.tsinghua.edu.cn 
+ Tom Goldstein
+ Affiliation: University of Maryland 
+ E-mail {chenzhu,furongh,tomg}@umd.edu 
+ Abstract
+ Adaptive gradient methods such as RMSprop and Adam use exponential moving estimate of the squared gradient to compute adaptive step sizes, achieving better convergence than SGD in face of noisy objectives. However, Adam can have undesirable convergence behaviors due to unstable or extreme adaptive learning rates. Methods such as AMSGrad and AdaBound have been proposed to stabilize the adaptive learning rates of Adam in the later stage of training, but they do not outperform Adam in some practical tasks such as training Transformers [ 38 ] . In this paper, we propose an adaptive learning rate principle, in which the running mean of squared gradient in Adam is replaced by a weighted mean, with weights chosen to maximize the estimated variance of each coordinate.
+This results in a faster adaptation to the local gradient variance, which leads to more desirable empirical convergence behaviors than Adam .
+We prove the proposed algorithm converges under mild assumptions for nonconvex stochastic optimization problems, and demonstrate the improved efficacy of our adaptive averaging approach on machine translation, natural language understanding and large-batch pretraining of BERT. The code is available at https://github.com/zhuchen03/MaxVA .
+ 1 Introduction
+ Stochastic Gradient Descent (SGD) and its variants are commonly used for training deep neural networks because of their effectiveness and efficiency. In their simplest form, gradient methods train a network by iteratively moving each parameter in the direction of the negative gradient (or the running average of gradients) of the loss function on a randomly sampled mini-batch of training data. A scalar learning rate is also applied to control the size of the update.
+In contrast, adaptive stochastic gradient methods use coordinate-specific learning rates, which are inversely proportional to the square root of the running mean of squared gradients [ 37 , 12 , 19 ] . Such methods are proposed to improve the stability of SGD on non-stationary problems, and have achieved success in different fields across Speech, Computer Vision, and Natural Language Processing.
+ Large pretrained Transformer-based language models have achieved remarkable successes in various language tasks [ 10 , 25 , 20 , 31 , 5 ] .
+The original Transformer architecture (Post-LN Transformers) often demonstrates better performance than its Pre-LN variant [ 24 ] , but its gradient has high variance during training. A warmup learning rate schedule or small initial adaptive learning rates [ 23 ] are required for its convergence.
+ [ 49 ] shows that SGD fails to train Transformers without gradient clipping, and adaptivity is important for stabilizing optimization under the heavy-tailed noise in Transformer’s gradients.
+This indicates that the strategy of AdaBound [ 27 ] , which is to transition from Adam into SGD, may fail on Post-LN Transformers (see Appendix 0.D for instance).
+However, the adaptive learning rate of Adam can be unstable in the later stage of training, and such instability sometimes leads to sub-optimal solutions or even non-convergent behavior on some simple problems [ 33 , 27 ] .
+ AMSGrad [ 33 ] was proposed to deal with this issue by computing the adaptive learning rate with an update rule that guarantees monotonically decaying adaptive learning rates for each coordinate, but to our knowledge, it has not been widely deployed to enhance Adam for training Transformer-based language models.
+ In this work, we explore a different approach to improving the stability of adaptive learning rates.
+We propose Maximum Variation Averaging (MaxVA), which computes the running average of squared gradients using dynamic, rather than constant, coordinate-wise weights. These weights are chosen so that the estimated variance of gradients is maximized, to enable a faster adaptation to the changing variance of gradients.
+The MaxVA weights for maximizing this variance have a simple closed-form solution that requires little storage or computational cost.
+With MaxVA, the adaptive optimizer
+1) takes a smaller step size when abnormally large gradient is present, to improve stability;
+2) takes a larger step size when abnormally small gradient is prevent, to avoid spurious minima and achieve better generalization [ 22 ] ;
+3) takes a steady step size when gradients are stable and within estimated deviation, to ensure convergence [ 33 ] .
+In the large-batch setting of BERT pretraining, where the total number of iterations is sharply reduced and a faster adaptation in each step is more important, MaxVA achieves faster convergence and obtain models with better test performance on downstream tasks than both Adam and Lamb [ 45 ] .
+Extensive experiments on both synthetic and practical datasets demonstrate that MaxVA leads to an improved adaptability and stability for Adam , yielding better test set performance than Adam on a variety of tasks.
+We also prove MaxVA converges under mild assumptions in the nonconvex stochastic optimization setting.
+ 2 Preliminary and Definitions
+ By default, all vector-vector operators are element-wise in the following sections.
+Let ${\theta}\in{\mathbb{R}}^{d}$ be the parameters of the network to be trained, $\ell({x};{\theta})$ is the loss of the model with parameters ${\theta}$ evaluated at ${x}$ .
+Our goal is to minimize the expected risk on the data distribution defined as:
+ $f(\theta)=\mathbb{E}_{{x}\sim\mathcal{D}}\left[\ell({x};{\theta})\right].$ 
+ (1) 
+ In most deep learning problems, only a finite number of potentially noisy samples can be used to approximate Eq. 1 , and the gradients are computed on randomly sampled minibatches during training.
+Stochastic regularizations such as Dropout [ 36 ] are commonly used for training Transformer-based language models [ 38 , 51 ] , which further adds to the randomness of the gradients.
+Thus, it is important to design optimizers that tolerate noisy gradients.
+ Adam [ 19 ] is an effective optimizer that adapts to such noisy gradients.
+It keeps exponential moving averages ${m}_{t}$ and ${v}_{t}$ of past gradients $g_{1},...,g_{t-1}$ , defined as:
+ where $\alpha,\beta\in[0,1]$ , $g_{t}=\nabla_{\theta}\ell(x_{t};\theta_{t})$ is the gradient of the $t$ -th minibatch $x_{t}$ , ${\tilde{m}}_{0}={\tilde{v}}_{0}={0}$ , and $m_{t},v_{t}$ corrects this zero-initialization bias of $\tilde{m}_{t},\tilde{v}_{t}$ [ 19 ] . Adam updates the parameters with the estimated moments as ${\theta}_{t+1}={\theta}_{t}-\eta_{t}\frac{{m}_{t}}{\sqrt{{v}_{t}}+\epsilon}$ , where $\epsilon>0$ is a small constant for numerical stability.
+ If we assume that the distribution of the stochastic gradient is constant within the effective horizon of the running average, then $m_{t}$ and $v_{t}$ will be estimates of the first and second moments of the gradient $g_{t}$ [ 2 ] .
+Same as other adaptive methods such as Adam and the recently proposed AdaBelief [ 52 ] , we adopt this assumption throughout training.
+With this assumption, at time $t$ , we assume $\mathbb{E}[{m}_{t}]\approx\nabla f_{t}$ , $\mathbb{E}[{v}_{t}]\approx\nabla f_{t}^{2}+\sigma_{t}^{2}$ , where $\sigma_{t}^{2}$ is the variance of $g_{t}$ .
+ Adam , RMSprop and other variants that divide the update steps by $\sqrt{{v}_{t}}$ can be seen as adapting to the gradient variance under this assumption when $m_{t}$ is small.
+These adaptive methods take smaller step sizes when the estimated variance ${\sigma}_{t}^{2}=v_{t}-m_{t}^{2}$ is high.
+Higher local gradient variance indicates higher local curvature, and vice versa.
+In certain quadratic approximations to the loss function, this variance is proportional to the curvature [ 34 ] (Eq. 12 of our paper).
+Therefore, like a diagonal approximation to Newton’s method, such adaptative learning rates adapt to the curvature and can accelerate the convergence of first-order methods.
+ However, the adaptive learning rate $\eta_{t}/(\sqrt{{v}_{t}}+\epsilon)$ of Adam and RMSprop can take extreme values, causing convergence to undesirable solutions [ 42 , 8 ] .
+ [ 33 ] gave one such counter example where gradients in the correct direction are large but occur at a low frequency, and Adam converges to the solution of maximum regret.
+They solve this issue by keeping track of the maximum ${v}_{t}$ for each coordinate throughout training with a new variable $\hat{{v}}_{t}$ , and replace the adaptive learning rate with $\eta_{t}/\sqrt{\hat{{v}}_{t}}$ to enforce monotonically descreasing learning rates.
+Extremely small adaptive learning rates can also cause undesirable convergence behavior, as demonstrated by a counter example from [ 27 ] .
+ 3 Maximizing the Variance of Running Estimations
+ Figure 1: An illustrative example of MaxVA. It adopts a smaller adaptive learning rate when an abnormally large gradient appears at $\theta_{2}$ by choosing a smaller $\beta$ , to prevent overshooting to $\theta_{3}^{\prime}$ . When the gradient is more stable near convergence at $\theta_{5}$ , it uses a larger $\beta$ for the slowest change in adaptive learning rate, to prevent overshooting to $\theta_{6}^{\prime}$ . 
+ Motivation. We propose to mitigate the undesirable convergence issue of Adam by changing the constant running average coefficient $\beta$ for the second moment into an adaptive one.
+The idea is to allow $\beta_{t}$ to adopt the value that maximizes the estimated variance of the gradient at each iteration $t$ .
+As a result, our method will assign a higher coefficient $(1-\beta_{t})$ to $g_{t}$ when it deviates too much from the estimated mean, resulting in a smaller step size when the gradient is too large to avoid overshooting, and a larger step size when the gradient is abnormally small to avoid spurious local minima. By contrast, if the gradient is stable and close to the estimated mean, which often happens near a flat minimum, our method will assign minimum coefficient to $g_{t}$ to maintain the value of $v_{t}$ and take steady steps towards the minimum.
+Therefore, our method can use $\beta_{t}$ as the adaptive running average coefficient to take steps that are cautious enough to avoid instability and spurious minima but aggressive enough to make progress. An illustrative example is given in Figure 1 .
+ Maximum Variation Averaging. Formally, we estimate the variance of the gradient at each coordinate by keeping track of the zeroth, first, and second moments of the gradient as functions of the adaptive running average coefficient $\beta_{t}$ , denoted as $w_{t}(\beta_{t}),~\tilde{{u}}_{t}(\beta_{t})$ and $\tilde{v}_{t}(\beta_{t})$ , respectively:
+ $\displaystyle w_{t}(\beta_{t})$ 
+ $\displaystyle=\beta_{t}w_{t-1}(\beta_{t-1})+(1-\beta_{t}),$ 
+ (2) 
+ $\displaystyle\tilde{{u}}_{t}(\beta_{t})$ 
+ $\displaystyle=\beta_{t}\tilde{{u}}_{t-1}(\beta_{t-1})+(1-\beta_{t}){g}_{t},$ 
+ (3) 
+ $\displaystyle\tilde{{v}}_{t}(\beta_{t})$ 
+ $\displaystyle=\beta_{t}\tilde{{v}}_{t-1}(\beta_{t-1})+(1-\beta_{t}){g}_{t}^{2}.$ 
+ (4) 
+ The zeroth moment $w_{t}(\beta_{t})$ is used to normalize $\tilde{u}_{t}(\beta_{t})$ and $\tilde{v}_{t}(\beta_{t})$ to achieve bias-corrected estimates $u_{t}(\beta_{t})=\tilde{u}_{t}(\beta_{t})/w_{t}(\beta_{t})$ and $v_{t}(\beta_{t})=\tilde{v}_{t}(\beta_{t})/w_{t}(\beta_{t})$ for the first and second moments, so that the estimates are not biased towards zero ( $\tilde{m}_{0}=\tilde{v}_{0}=0$ ) [ 19 ] .
+ Under our assumptions, the bias-corrected local estimate of the gradient variance is ${{\sigma}}_{t}^{2}=\tilde{{v}}_{t}(\beta_{t})/w_{t}(\beta_{t})-[\tilde{{u}}_{t}(\beta_{t})/w_{t}(\beta_{t})]^{2}$ .
+Taking the arg max for ${{\sigma}}_{t}^{2}$ , we find the $\beta_{t}$ that achieves the maximal variance for each coordinate $i$ :
+ $\beta_{t,i}=\argmax_{\beta}{{\sigma}}_{t,i}^{2}=\argmax_{\beta}{v}_{t,i}(\beta)-[{u}_{t,i}(\beta)]^{2}.$ 
+ (5) 
+ We call our approach to finding adaptive running average coefficient $\beta_{t}$ Maximum Variation Averaging (MaxVA).
+We plug MaxVA into Adam and its variant LaProp [ 53 ] , which results in two novel algorithms, MAdam and LaMAdam , listed in Algorithm 1 and Algorithm 2 (in the Appendix).
+Different from Adam , LaProp uses $v_{t}$ to normalize the gradients before taking the running average, which results in higher empirical stability under various hyperparameters.
+Note, we only apply the adaptive $\beta_{t}$ to the second moment $u_{t}(\beta_{t})$ used for scaling the learning rate; $m_{t}$ is still an exponential moving average with a constant coefficient $\alpha$ of the gradient for MAdam or the normalized gradient for LaMAdam .
+ Algorithm 1 MAdam 
+ 1: 
+ Input: Learning rate $\{\eta_{t}\}_{t=1}^{T}$ , parameter $0 , $0 , $\epsilon>0$ 
+ 2: 
+ Set $\tilde{m}_{0}=\tilde{u}_{0}=\tilde{v}_{0}=w_{0}=0$ 
+ 3: 
+ for $t=1$ to $T$ do 
+ 4: 
+   Draw samples $S_{t}$ from training set
+ 5: 
+   Compute $g_{t}=\frac{1}{|S_{t}|}\sum_{x_{k}\in\mathcal{S}_{t}}\nabla\ell(x_{k};\theta_{t})$ 
+ 6: 
+    $\tilde{m}_{t}=\alpha\tilde{m}_{t-1}+(1-\alpha)g_{t}$ 
+ 7: 
+    $\tilde{\beta}_{t}={\arg\max}_{\beta}v_{t}(\beta)-u_{t}^{2}(\beta)$ $\triangleright$ see Eq 6 
+ 8: 
+    $\beta_{t}=\max(\underline{\beta},\min(\bar{\beta},\tilde{\beta}_{t}))$ 
+ 9: 
+    $\tilde{u}_{t}=\beta_{t}\tilde{u}_{t-1}+(1-\beta_{t})g_{t}$ 
+ 10: 
+    $\tilde{v}_{t}=\beta_{t}\tilde{v}_{t-1}+(1-\beta_{t})g^{2}_{t}$ 
+ 11: 
+    $w_{t}=\beta_{t}w_{t-1}+(1-\beta_{t})$ 
+ 12: 
+    $\theta_{t}=\theta_{t-1}-\eta_{t}\frac{\sqrt{w_{t}}}{1-\alpha^{t}}\frac{\tilde{m}_{t}}{\sqrt{\tilde{v}_{t}}+\epsilon}$ 
+ Finding $\beta_{t}$ via a Closed-form Solution. The maximization for $\beta_{t}$ in Eq. 5 is quadratic and has a relatively simple closed-form solution that produces maximal ${\sigma}_{t}^{2}$ for each coordinate:
+ (6) 
+ where all variables are vectors and all the operations are elementwise, $\Delta g_{t}=(g_{t}-u_{t-1})$ is the deviation of the gradient $g_{t}$ from the estimated mean $u_{t-1}$ , ${\sigma}_{t-1}^{2}=v_{t-1}-u_{t-1}^{2}$ is the estimated variance, and we have abbreviated $u_{t-1}(\beta_{t-1})$ , $v_{t-1}(\beta_{t-1})$ and $w_{t-1}(\beta_{t-1})$ into ${u}_{t-1},{v}_{t-1}$ and $w_{t-1}$ . We use this abbreviation in the following sections, and defer the derivation of Eq. 6 to Appendix 0.A .
+ Implementation Notes. 
+We apply MaxVA in every step except for the first step, where the gradient variance one can observe is zero.
+So for Algorithm 1 and Algorithm 2 we define:
+ $\tilde{u}_{1}=(1-\beta_{1})g_{1},\tilde{v}_{1}=(1-\beta_{1})g_{1}^{2},w_{1}=1-\beta_{1}.$ 
+ (7) 
+ The coefficient $\beta_{1}$ for $t=1$ is set to a constant that is the same as typical values for Adam .
+To obtain a valid running average, we clip $\beta_{t}$ so that $\underline{\beta}\leq\beta_{t}\leq\bar{\beta}$ , where the typical values are $\underline{\beta}=0.5,0.98\leq\bar{\beta}\leq 1$ .
+For convenience, we set $\beta_{1}=\bar{\beta}$ by default.
+For $t>1,~\text{since }0 0$ in Eq. 6 , we have $\beta_{t}\in[1/(1+w_{t-1}),1/(1-w_{t-1})]$ .
+As a result, the lower bound that we use ( $\underline{\beta}=0.5$ ) is tight and does not really change the value of $\beta_{t}$ , and as $t\rightarrow\infty$ , $w_{t}\rightarrow 1$ and $\beta_{t}\in[0.5,\infty]$ .
+We have a special case at $t=2$ , where $\beta_{t}$ is a constant $1/(2-\beta_{1})$ .
+ In practice, we also add a small coefficient $\delta>0$ to the denominator of Eq. 6 to prevent division by zero, which will have negligible effect on the value of $\beta_{t}$ and does not violate the maximum variation objective (Eq. 5 ).
+All the derivations for these conclusions are deferred to Appendix 0.C .
+ Effect of Maximum Variation Averaging. 
+By definition, we have $\sigma_{t-1}^{2}\geq 0$ , but in most cases $\sigma_{t-1}^{2}>0$ .
+When $\sigma_{t-1}^{2}>0$ , we define a new variable $R_{t}=\Delta g_{t}^{2}/\sigma_{t-1}^{2}$ , which represents the degree of deviation of gradient $g_{t}$ from the current estimated average. Then, we can rewrite:
+ $\beta_{t}=\frac{R_{t}+1}{(1+w_{t})R_{t}+1-w_{t}}.$ 
+ (8) 
+ From Eq. 8 , we can see $\beta_{t}$ monotonically decreases from $1/(1-w_{t})$ to $1/(1+w_{t})$ as $R_{t}$ increases from 0 to $\infty$ , and equals to 1 when $R_{t}=1$ .
+As a result, for each coordinate, if $R_{t}\gg 1$ , $g_{t}$ deviates much more than ${\sigma}_{t-1}$ from $u_{t-1}$ , and MaxVA will find a smaller $\beta_{t}$ and therefore a higher weight $(1-\beta_{t})$ on $g_{t}^{2}$ to adapt to the change faster.
+This helps to avoid overshooting when abnormally large gradient is present (see Figure 1 ), and avoids spurious sharp local minima where gradients are abnormally small.
+With a faster response to abnormal gradients, MaxVA is better at handling the heavy-tailed distribution of gradients in the process of training Transformers [ 49 ] .
+In practice, $v_{t}$ tends to be larger than Adam / LaProp using a constant $\bar{\beta}$ , but as we will show in the experiments, using a larger learning rate counters such an effect and achieves better results.
+ On the other hand, if $R_{t} AMSGrad .
+Note that MaxVA and AMSGrad can be complementary approaches if applied together, which we have found helpful for Image Classification on CIFAR10/100.
+ Convergence Analysis.   We prove the convergence of MaxVA in the nonconvex stochastic optimization setting.
+For the sake of simplicity, we analyze the case where $\alpha=0$ , which is effectively applying MaxVA to RMSprop . We leave the analysis for $\alpha\neq 0$ for future research.
+We assume the function $\ell$ is $L$ -smooth in $\theta$ , i.e., there exists a constant $L$ such that for all $\theta_{1},\theta_{2}\in\mathbb{R}^{d},x\in\mathcal{X}$ ,
+ $\lVert\nabla_{\theta}\ell(x;\theta_{1})-\nabla_{\theta}\ell(x;\theta_{2})\rVert\leq L\lVert\theta_{1}-\theta_{2}\rVert.$ 
+ (9) 
+ This automatically implies that $f(\theta)=\mathbb{E}[\ell(x;\theta)]$ is $L$ -smooth.
+Such a smoothness assumption holds for networks with smooth activation functions, e.g., Transformers that use the GELU activation [ 17 ] .
+We also need to assume function $\ell$ has bounded gradient, i.e., $\lVert\nabla_{\theta}\ell(x;\theta)\rVert_{\infty}\leq G$ for all $\theta\in\mathbb{R}^{d},x\in\mathcal{X}$ .
+As typically used in the analysis of stochastic first-order methods [ 46 , 13 ] ,
+we assume the stochastic gradient has bounded variance: $\mathbb{E}[[\nabla_{\theta}\ell(x;\theta)]_{i}-[\nabla_{\theta}f(\theta)]_{i}]^{2}\leq\sigma^{2}$ for all $\theta\in\mathbb{R}^{d}$ .
+Further, we assume the batch size increases with time as $b_{t}=t$ , which is also adopted in the analysis of signSGD [ 4 ] , and holds in our large batch experiments.
+Theorem 3.1 gives a “worst-case” convergence rate of MaxVA to a stationary point under these assumptions, where the dependence of $\beta_{t}$ on $g_{t}$ is ignored and we only consider the worst-case of $\beta_{t}$ in each step.
+The proof is given in Appendix 0.B .
+ Theorem 3.1 
+ Define $w_{0}=1$ . Let $\eta_{t}=\eta$ and $b_{t}=t$ for all $t\in[T]$ . Furthermore, we assume $\epsilon,\underline{\beta},\bar{\beta},\eta$ are chosen such that $\eta\leq\frac{\epsilon}{2L}\text{, }1-\underline{\beta}\leq\frac{\epsilon^{2}}{16G^{2}}\text{, and }\bar{\beta}\leq 2\underline{\beta}$ . Then for $\theta_{t}$ generated using MAdam , we have the following bound: 
+ $\mathbb{E}\lVert\nabla f(\theta_{a})\rVert^{2}\leq O\left(\frac{f(\theta_{1})-f(\theta^{*})}{\eta T}+\frac{2\sigma dG}{\epsilon\sqrt{T}}\right),$ 
+ (10) 
+ where $\theta^{*}$ is an optimal solution to minimize the objective in Eq. 1 , and $\theta_{a}$ is an iterate uniformly randomly chosen from $\{\theta_{1},...,\theta_{T}\}$ . 
+ 4 Experiments on Synthetic Data
+ For a quantitative control of the stochasticity and data distribution, which affects the difficulty of the problem and the efficacy of the optimizers, we compare MAdam and the baselines in two sets of synthetic data, and demonstrate the efficacy of MaxVA with statistical significance on a large number of instances.
+The first dataset simulates prevalent machine learning settings, where mini-batch stochastic gradient methods are applied on a finite set of samples, on which we show MAdam fixes the nonconvergence issue of Adam and achieves faster convergence rate than AMSGrad .
+The second dataset evaluates the algorithms under different curvatures and gradient noise levels, where we show MAdam achieves both lower loss and variance than fine-tuned Adam at convergence.
+ 4.1 Convergence with Stochastic Gradients
+ Figure 2: Median and standard error (100 runs) of objective value ( $f(\theta)$ ), accumulated update size ( $\sum_{t=1}^{T}||g_{t}/\sqrt{v_{t}}||^{2}$ ) and total change in adaptive learning rate ( $\sum_{t=1}^{T}||\frac{1}{\sqrt{v_{t}}}-\frac{1}{\sqrt{v_{t-1}}}||_{1}$ ) for Adam , AMSGrad , MAdam on the problem in Eq. 11 . 
+ Since MaxVA maximizes the variance and the gradient converges to zero in most cases, MAdam biases towards larger $v_{t}$ than Adam but does not require $v_{t}$ to be monotonically increasing, which is like an adaptive version of AMSGrad . To highlight the difference, we compare Adam , MAdam and AMSGrad on the synthetic dataset from [ 8 ] simulating training with stochastic mini batches on a finite set of samples.
+Formally, let $\mathbbm{1}_{[\cdot]}$ be the indicator function. We consider the problem $\min_{\theta}f(\theta)=\sum_{i=1}^{11}\ell_{i}(\theta)$ where
+ (11) 
+ At every step, a random index $i$ is sampled uniformly from $i\in[11]$ , and the gradient $\nabla\ell_{i}(\theta)$ is used by the optimizer.
+The only stationary point where $\nabla f(\theta)=0$ is $\theta=0$ .
+We set $\alpha=0,\beta=0.9$ for Adam and AMSGrad . For MAdam , we set $\alpha=0,(\underline{\beta},\bar{\beta})=(0.5,1)$ . We select the best constant learning rates for the three algorithms, see Appendix 0.E for details.
+ We plot the median and standard error of the objective ( $f(\theta)$ ), accumulated update size ( $S_{1}=\sum_{t=1}^{T}||g_{t}/\sqrt{v_{t}}||^{2}$ ), and total change in adaptive step size ( $S_{2}=\sum_{t=1}^{T}||\frac{1}{\sqrt{v_{t}}}-\frac{1}{\sqrt{v_{t-1}}}||_{1}$ ) over 100 runs in Figure 11 .The optimal learning rates for these optimziers are different, so for fair comparisons, we have ignored the constant learning rate in $S_{1}$ and $S_{2}$ .
+From the curves of $f(\theta)$ , we can see Adam diverges, and MAdam converges faster than AMSGrad in the later stage.
+As shown by the $S_{2}$ curves, the adaptive step sizes of MAdam and AMSGrad all converged to some constant values after about 10 steps, but MAdam converges faster on both $f(\theta)$ and $S_{1}$ , indicating the adaptive step size found by MAdam fits the geometry of the problem better than AMSGrad .
+This also shows $S_{1}+S_{2}$ of MAdam has a smaller slope than AMSGrad in the log-scale plots after 10 iterations, leading to a faster theoretical convergence rate in the bound given by [ 8 ] .
+The slightly larger variation in adaptive step sizes of MAdam at the beginning of training, shown by the larger $S_{2}$ values, demonstrates MAdam adapts faster to the changing gradients than AMSGrad , achieved by dynamically selecting $\beta 
+ 4.2 Convergence in the Noisy Quadratic Model
+ Figure 3: Results on NQM. The left figure shows the mean and standard error of the loss under different learning rates $\eta$ , computed over 100 runs at each point. We select the best $\beta$ for Adam at each $\eta$ . The best results (mean and variance) of Adam and MAdam are 1.84e-3 (2.51e-4) and 4.05e-3 (4.84e-4) respectively. Figure on the right gives a qualitative example of the trajectories of two approaches. 
+ We analyze the ability of MAdam to adapt to curvature and gradient noise on the simple but illustrative Noisy Quadratic Model (NQM), which has been widely adopted for analyzing optimization dynamics [ 34 , 43 , 48 , 50 ] .
+The loss function is defined as $f(\theta)=\mathbb{E}_{x\sim{\mathcal{N}}(0,\sigma^{2}I)}\left[\frac{1}{2}\sum_{i=1}^{d}h_{i}(\theta_{i}-x_{i})^{2}\right]$ ,
+where $x$ is a noisy observation of the ground-truth parameter $\theta^{*}=0$ , simulating the gradient noise in stochastic optimization, and $h_{i}$ represents the curvature of the system in $d$ dimensions.
+In each step, the optimizers use the following noisy gradient for coordinate $i$ , from which we can see the gradient’s variance is proportional to the curvature $h_{i}^{2}$ :
+ $\nabla_{\theta_{i}}\ell(\sigma\epsilon_{i};\theta_{i})=h_{i}(\theta_{i}-\sigma\epsilon_{i}),\epsilon_{i}\sim{\mathcal{N}}(0,1).$ 
+ (12) 
+ To validate the effectiveness of MaxVA, we compare MAdam with Adam under a variety of different curvatures $h$ and noise level $\sigma$ on an NQM with $d=2$ .
+For each setting of $h$ and $\sigma$ , we test both algorithms on a variety of learning rates. For Adam , we additionally choose the best $\beta$ and report the best results. See Appendix 0.F for details. We run each setting 100 times to report the mean and standard error.
+ MAdam consistently achieves 30-40% lower average loss with smaller standard error in all settings.
+Figure 3 shows the results for one of the settings, from which we find the best result of MAdam is better than Adam under any choice of $\beta$ and learning rate, confirming the advantage of MaxVA.
+From the qualitative example, MaxVA also demonstrates smaller variance near convergence, enabled by a quicker response to impede the noise with a smaller $\beta_{t}$ .
+More experimental results under other settings are provided in Appendix 0.F .
+ 5 Experiments on Practical Datasets
+ In this section, we evaluate MAdam and LaMAdam on a variety of tasks against well-calibrated baselines: IWSLT’14 DE-EN/WMT’16 EN-DE for neural machine translation, the GLUE benchmark for natural language understanding, and pretraining the BERT-Base model.
+We also provide results on image classification.
+We use the decoupled weight decay [ 26 ] in all our experiments. Across all the plots in this section, we define the average step size at time $t$ as the average of $|\eta_{t}m_{t}/(\sqrt{v_{t}}+\epsilon)|$ for Adam / MAdam and $|\eta_{t}m_{t}|$ for LaProp / LaMAdam over all the entries.
+ 5.1 Image Classification
+ Model 
+ CIFAR-10 
+ CIFAR-100 
+ ImageNet 
+ SGD 
+ 95.44 (.04) 
+ 79.62 (.07) 
+ 70.18 
+ Adam 
+ 95.37 (.03) 
+ 78.77 (.07) 
+ 66.54 
+ LaProp 
+ 95.34 (.03) 
+ 78.36 (.07) 
+ 70.02 
+ AdaBelief 
+ 95.30 ∗ 
+ 77.30 ∗ 
+ 70.08 
+ MAdam (ours) 
+ 95.51 (.09) 
+ 79.32 (.08) 
+ 69.96 
+ LaMAdam (ours) 
+ 95.38 (.11) 
+ 79.21 (.11) 
+ 70.16 
+ Table 1: Comparing adaptive methods with exhaustively fine-tuned SGD on CIFAR10/100 and ImageNet. CIFAR10/100 experiments are the median (standard error) over 4 runs. ∗ : The results of AdaBelief are from their paper [ 52 ] with a ResNet34, while our results are with ResNet18. 
+ To evaluate the effectiveness of MaxVA for image classification, we compare with SGD, Adam , LaProp [ 53 ] and AdaBelief [ 52 ] in training ResNet18 [ 16 ] on CIFAR10, CIFAR100 and ImageNet.
+On all the datasets, we perform a grid search for the learning rate and weight decay, and report the best results for each method in Table 1 .
+For CIFAR10/100, we train ResNet18 with a batch size of 128 for 200 epochs.
+We also find AMSGrad [ 33 ] improves the classification accuracy of all adaptive methods evaluated on CIFAR10/100, so we apply AMSGrad in all experiments with adaptive methods.
+On ImageNet, we use the implementation from torchvision and the default multi-step learning rate schedule. We do not use AMSGrad in this case. Further details are in Appendix 0.G .
+ Despite achieving a marginal improvement on CIFAR10, adaptive methods often underperforms carefully tuned SGD on CIFAR100 and ImageNet when training popular architectures such as ResNet, as confirmed by [ 42 , 50 , 23 ] .
+Nevertheless, with the proposed MaxVA, we shrink the gap between adaptive methods and carefully tuned SGD on these image classification datasets, and achieve top-1 accuracy very close to SGD on ImageNet.
+Note our results with ResNet18 is better than the recent AdaBelief’s results with ResNet34 on CIFAR10/CIFAR100 (95.51/79.32 vs. 95.30/77.30 approximately), as well as AdaBelief with ResNet18 on ImageNet (70.16 vs. 70.08) [ 52 ] .
+ 5.2 Neural Machine Translation
+ Method 
+ IWSLT’14 DE-EN 
+ WMT’16 EN-DE 
+ RAdam 
+ 35.51 
+ - 
+ AdaBelief 
+ 35.90 
+ - 
+ LaProp (ours) 
+ 35.98 (0.06) 
+ 27.02 
+ LaMAdam (ours) 
+ 36.09 (0.04) 
+ 27.11 
+ Table 2: BLEU score for training transformers on machine translation datasets. We report the median and standard error for IWSLT’14 over 5 runs. Results of other meethods are from the AdaBelief paper [ 52 ] . 
+ We train Transformers from scratch with LaProp and LaMAdam on IWSLT’14 German-to-English (DE-EN) translation [ 6 ] and WMT’16 English-to-German (EN-DE) translation, based on the implementation of fairseq. 1 1 
+ 1 
+ https://github.com/pytorch/fairseq 
+We do not compare with SGD, since it is unstable for Transformers [ 49 ] .
+We also show in Appendix 0.D that AdaBound cannot achieve any good result without degenerating into Adam .
+More details are in Appendix 0.H .
+ IWSLT’14 DE-EN has 160k training examples, on which we use a Transformer with 512-dimensional word embeddings and 1024 FFN dimensions.
+We train it for 60k iterations, with up to 4096 tokens in each minibatch. Results are listed in Table 2 . Note the baseline’s BLEU score is already 1.22 higher than the best results reported in [ 23 ] using the same model.
+As shown in Appendix 0.H , LaMAdam uses much smaller update size than LaProp , and it is not able for LaProp to achieve better results even when we scale its learning rate to get similar update sizes as LaMAdam , indicating MaxVA helps to find a better minimum not achievable by using constant $\beta$ .
+ WMT’16 EN-DE has 4.5M training examples, where same as [ 29 ] , we use a larger Transformer with 1024-dimensional word embeddings and 4096 FFN dimensions.
+Each batch has up to 480k tokens. We train for 32k iterations using the same inverse square root learning rate schedule as [ 38 ] .
+We evaluate the single model BLEU on newstest2013, unlike [ 23 ] where models in the last 20 epochs are averaged to get the results.
+As shown in Table 2 , LaMAdam also achieves better results.
+ 5.3 General Language Understanding Evaluation (GLUE)
+ Method 
+ MNLI 
+ QNLI 
+ QQP 
+ RTE 
+ SST-2 
+ MRPC 
+ CoLA 
+ STS-B 
+ (Acc) 
+ (Acc) 
+ (Acc) 
+ (Acc) 
+ (Acc) 
+ (Acc) 
+ (Mcc) 
+ (Pearson) 
+ Reported 
+ 87.6 
+ 92.8 
+ 91.9 
+ 78.7 
+ 94.8 
+ 90.2 
+ 63.6 
+ 91.2 
+ Adam 
+ 87.70 (.03) 
+ 92.85 (.06) 
+ 91.80 (.03) 
+ 79.25 (.71) 
+ 94.75 (.08) 
+ 88.50 (.24) 
+ 61.92 (1.1) 
+ 91.17 (.13) 
+ LaProp 
+ 87.80 (.04) 
+ 92.85 (.13) 
+ 91.80 (.03) 
+ 78.00 (.46) 
+ 94.65 (.11) 
+ 89.20 (.20) 
+ 63.01 (.61) 
+ 91.17 (.06) 
+ MAdam 
+ 87.90 (.08) 
+ 92.95 (.07) 
+ 91.85 (.03) 
+ 79.60 (.66) 
+ 94.85 (.12) 
+ 89.70 (.17) 
+ 63.33 (.60) 
+ 91.28 (.03) 
+ LaMAdam 
+ 87.80 (.03) 
+ 93.05 (.05) 
+ 91.85 (.05) 
+ 80.15 (.64) 
+ 95.15 (.15) 
+ 90.20 (.20) 
+ 63.84 (.85) 
+ 91.36 (.04) 
+ Table 3: Results (median and variance) on the dev sets of GLUE based on finetuning the RoBERTa-base model ( [ 25 ] ), from 4 runs with the same hyperparameter but different random seeds. 
+ Figure 4: Training loss, validation accuracy and step size of various optimization methods on SST-2. All optimizers here use $\lambda=0.1$ . Adam and LaProp use ( $\eta,\beta$ )=(1e-5, 0.98), MAdam and LaMAdam use ( $\eta,\underline{\beta},\bar{\beta}$ )=(4e-5, 0.5, 0.98), Adam - $\eta^{\prime}$ and LaProp - $\eta^{\prime}$ use ( $\eta,\beta$ )=(1.6e-5, 0.98). 
+ To evaluate MaxVA for transfer learning, we fine-tune pre-trained RoBERTa-base model [ 25 ] on 8 of the 9 tasks of the GLEU benchmark [ 39 ] .
+Following prevalent validation settings [ 10 , 20 , 31 ] , we report the median and standard error for fine-tuning the RoBERTa-base model [ 25 ] over 4 runs where only the random seeds are changed. The results are in Table 3 .
+ MAdam and LaMAdam give better scores than the corresponding baselines in the 8 tasks.
+More experimental details are in Appendix 0.I .
+ To highlight the difference of the optimizers, we compare the training loss, dev set accuracy and the average step size on SST-2, as shown in Figure 4 .
+Different from Machine Translation experiments where we train the Transformers from scratch, the adaptive step size of MAdam / LaMAdam is higher in this transfer learning setting. The ratio of the learning rate and step size of MaxVA to non-MaxVA optimizers are 4 and 1.8 respectively on GLUE, while on IWSLT’14 the two ratios are 2 and (approximately) 0.875.
+Because we start from a pre-trained model, the heavy tail of the gradient is alleviated, just as the BERT model in the later stage of training as shown by [ 49 ] , and the curvature of the loss landscape should be smaller.
+Therefore, MaxVA selects larger adaptive step sizes for better convergence.
+Same as in the Machine Translation experiments, the highest test accuracy of Adam / LaProp cannot reach the same value as MAdam / LaMAdam by simply scaling the base learning rate $\eta$ to reach similar step sizes as MAdam / LaMAdam .
+ 5.4 Large-batch Pretraining for BERT
+ We use the NVIDIA BERT pretraining repository to perform large-batch pretraining for BERT-Base model on the Wikipedia Corpus only. 2 2 
+ 2 
+ Note the results from the repository are for BERT-Large trained with additional data from BookCorpus. 
+Each run takes about 52 hours on 8 V100 GPUs.
+Training is divided into two phases: the first phase uses a batch size of 64K with input sequence length 128 for 7,038 steps; the second phase uses a batch size 32K with input sequence length 512 for 1563 steps. The total of steps is significantly smaller than the 1,000,000 steps used in the small-batch training of [ 10 ] .
+Therefore, a faster adaptation to curvature in each step is more important.
+ Figure 5: Training losses of Adam , Lamb and MAdam on Wikipedia Corpus in the two training phases. 
+ This point is validated by the faster convergence of MAdam in both phases, as shown in the training loss curves in Figure 5 .
+Contrary to the observation by [ 45 ] , Adam even converges faster than Lamb in the earlier iterations.
+ [ 45 ] only explored weight decay of up to 0.01 for Adam , but we find using larger weight decay of 0.1 together with gradient clipping ( $\lVert g_{t}\rVert_{2}\leq 1$ , same as Lamb ) stabilizes Adam .
+We inherit this setting for MAdam .
+For MAdam and Adam , we do a grid search on the learning rate of phase 1 while keeping the ratios of learning rate in phase 1 and phase 2 to the same as Lamb .
+We use $\bar{\beta}=0.999,\underline{\beta}=0.5$ for MAdam .
+For Lamb , we use the default setting from the aforementioned repository.
+ The faster adaptation of MaxVA improves the stability, which enables MAdam to use a much larger learning rate to achieve faster convergence than Adam .
+The best learning rate for MAdam is 3.4e-3. We tried learning rates in {7e-4, 8e-4, 9e-4, 1e-3} for Adam , and find it always diverges when the learning rate is higher or equal to 9e-4. The best result of Adam is achieved with learning rate 8e-4.
+ MAdam achieves a training loss of 1.492, while Lamb achieves a training loss of 1.507, and Adam has the worst training loss 1.568.
+The test scores of the models pretrained with MAdam / Lamb / Adam are 88.53/87.60/88.07 (F1) and 82.10/81.40/80.78 (Accuracy) on SQuAD v1.1 and MNLI, respectively.
+ 6 Related Work
+ Various adaptive methods have been proposed and broadly applied in deep learning [ 19 , 12 , 37 , 47 ] .
+ [ 33 ] proposed to compute the adaptive learning rate with the coordinate-wise maximum value of $v_{t}$ so that the adaptive learning rate does not increase.
+ AdaBound [ 27 ] clips the adaptive learning rate of Adam with a decreasing upper bound and an increasing lower bound. Lookahead [ 50 ] computes weight updates by looking ahead at the sequence of “fast weights” generated by another optimizer.
+Padam [ 7 ] improves the generalization of adaptive methods by choosing a proper exponent for the $v_{t}$ of AMSGrad . LAPROP [ 53 ] uses local running estimation of the variance to normalize the gradients, resulting in higher empirical stability.
+RAdam [ 23 ] was recently invented to free Adam from the warmup schedule for training Transformers. [ 28 ] found that using a linear warmup over $2\cdot(1-\beta_{2})^{-1}$ iterations for Adam achieves almost the same convergence as RAdam.
+ [ 44 ] proposes Layer-wise Adaptive Rate Scaling (LARS), and scales the batch size to 16,384 for training ResNet50.
+LAMB [ 45 ] applies a similar layer-wise learning rate on Adam to improve LARS on training BERT.
+Starting from a similar motivation of adapting to the curvature, the recent work AdaBelief [ 52 ] directly estimates the exponential running average of the gradient deviation to compute the adaptive step sizes.
+Our approach finds the averaging coefficients $\beta_{t}$ automatically by maximizing the estimated variance for a faster adaptation to the curvature, which could be complementary to all the aforementioned methods, and is the first to explore in this direction to our knowledge.
+ 7 Conclusion
+ In this paper, we present Maximum Variation Averaging (MaxVA), a novel adaptive learning rate scheme that replaces the exponential running average of squared gradient with an adaptive weighted mean.
+In each step, MaxVA chooses the weight $\beta_{t}$ for each coordinate, such that the esimated gradient variance is maximized.
+This enables MaxVA to: (1) take smaller steps when large curvatures or abnormally large gradients are present, which leads to more desirable convergence behaviors in face of noisy gradients; (2) adapt faster to the geometry of the objective, achieving faster convergence in the large-batch setting.
+We illustrate how our method improves convergence by a better adaptation to variance, and demonstrate strong empirical results on a wide range of tasks.
+We prove MaxVA converges in the nonconvex stochastic optimization setting under mild assumptions.
+ References
+ [1] 
+Agirre, E., M‘arquez, L., Wicentowski, R. (eds.): Proceedings of the Fourth
+International Workshop on Semantic Evaluations (SemEval-2007). ACL (2007)
+ [2] 
+Balles, L., Hennig, P.: Dissecting adam: The sign, magnitude and variance of
+stochastic gradients. In: ICML. pp. 404–413 (2018)
+ [3] 
+Bentivogli, L., Dagan, I., Dang, H.T., Giampiccolo, D., Magnini, B.: The fifth
+PASCAL recognizing textual entailment challenge. In: TAC (2009)
+ [4] 
+Bernstein, J., Wang, Y.X., Azizzadenesheli, K., Anandkumar, A.: signsgd:
+Compressed optimisation for non-convex problems. In: ICML. pp. 560–569
+(2018)
+ [5] 
+Brown, T.B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P.,
+Neelakantan, A., Shyam, P., Sastry, G., Askell, A., et al.: Language models
+are few-shot learners. arXiv preprint arXiv:2005.14165 (2020)
+ [6] 
+Cettolo, M., Niehues, J., Stüker, S., Bentivogli, L., Federico, M.: Report
+on the 11th iwslt evaluation campaign, iwslt 2014. In: IWSLT. vol. 57 (2014)
+ [7] 
+Chen, J., Zhou, D., Tang, Y., Yang, Z., Gu, Q.: Closing the generalization gap
+of adaptive gradient methods in training deep neural networks.
+arXiv:1806.06763 (2018)
+ [8] 
+Chen, X., Liu, S., Sun, R., Hong, M.: On the convergence of a class of
+adam-type algorithms for non-convex optimization. ICLR (2019)
+ [9] 
+Dagan, I., Glickman, O., Magnini, B.: The PASCAL recognising textual
+entailment challenge. In: Machine learning challenges. evaluating predictive
+uncertainty, visual object classification, and recognising tectual
+entailment. Springer (2006)
+ [10] 
+Devlin, J., Chang, M.W., Lee, K., Toutanova, K.: Bert: Pre-training of deep
+bidirectional transformers for language understanding. In: NAACL. pp.
+4171–4186 (2019)
+ [11] 
+Dolan, W.B., Brockett, C.: Automatically constructing a corpus of sentential
+paraphrases. In: Proceedings of the International Workshop on Paraphrasing
+(2005)
+ [12] 
+Duchi, J., Hazan, E., Singer, Y.: Adaptive subgradient methods for online
+learning and stochastic optimization. JMLR (2011)
+ [13] 
+Ghadimi, S., Lan, G.: Stochastic first-and zeroth-order methods for nonconvex
+stochastic programming. SIAM Journal on Optimization 23 (4),
+2341–2368 (2013)
+ [14] 
+Giampiccolo, D., Magnini, B., Dagan, I., Dolan, B.: The third PASCAL
+recognizing textual entailment challenge. In: Proceedings of the ACL-PASCAL
+workshop on textual entailment and paraphrasing (2007)
+ [15] 
+Haim, R.B., Dagan, I., Dolan, B., Ferro, L., Giampiccolo, D., Magnini, B.,
+Szpektor, I.: The second pascal recognising textual entailment challenge. In:
+Proceedings of the Second PASCAL Challenges Workshop on Recognising Textual
+Entailment (2006)
+ [16] 
+He, K., Zhang, X., Ren, S., Sun, J.: Deep residual learning for image
+recognition. In: CVPR. pp. 770–778 (2016)
+ [17] 
+Hendrycks, D., Gimpel, K.: Gaussian error linear units (gelus). arXiv preprint
+arXiv:1606.08415 (2016)
+ [18] 
+Iyer, S., Dandekar, N., Csernai, K.: First quora dataset release: Question
+pairs (2017),
+ https://www.quora.com/q/quoradata/First-Quora-Dataset-Release-Question-Pairs 
+ [19] 
+Kingma, D.P., Ba, J.: Adam: A method for stochastic optimization. In: Bengio,
+Y., LeCun, Y. (eds.) ICLR (2015)
+ [20] 
+Lan, Z., Chen, M., Goodman, S., Gimpel, K., Sharma, P., Soricut, R.: Albert: A
+lite bert for self-supervised learning of language representations. ICLR
+(2020)
+ [21] 
+Levesque, H.J., Davis, E., Morgenstern, L.: The Winograd schema challenge.
+In: AAAI Spring Symposium: Logical Formalizations of Commonsense Reasoning
+(2011)
+ [22] 
+Li, H., Xu, Z., Taylor, G., Studer, C., Goldstein, T.: Visualizing the loss
+landscape of neural nets. In: Advances in neural information processing
+systems. pp. 6389–6399 (2018)
+ [23] 
+Liu, L., Jiang, H., He, P., Chen, W., Liu, X., Gao, J., Han, J.: On the
+variance of the adaptive learning rate and beyond. ICLR (2020)
+ [24] 
+Liu, L., Liu, X., Gao, J., Chen, W., Han, J.: Understanding the difficulty of
+training transformers. arXiv:2004.08249 (2020)
+ [25] 
+Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D., Levy, O., Lewis, M.,
+Zettlemoyer, L., Stoyanov, V.: Roberta: A robustly optimized bert pretraining
+approach. arXiv:1907.11692 (2019)
+ [26] 
+Loshchilov, I., Hutter, F.: Decoupled weight decay regularization. In: ICLR
+(2018)
+ [27] 
+Luo, L., Xiong, Y., Liu, Y., Sun, X.: Adaptive gradient methods with dynamic
+bound of learning rate. ICLR (2019)
+ [28] 
+Ma, J., Yarats, D.: On the adequacy of untuned warmup for adaptive
+optimization. arXiv:1910.04209 (2019)
+ [29] 
+Ott, M., Edunov, S., Grangier, D., Auli, M.: Scaling neural machine
+translation. In: WMT. pp. 1–9 (2018)
+ [30] 
+Park, D.S., Chan, W., Zhang, Y., Chiu, C.C., Zoph, B., Cubuk, E.D., Le, Q.V.:
+Specaugment: A simple data augmentation method for automatic speech
+recognition. Interspeech pp. 2613–2617 (2019)
+ [31] 
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou,
+Y., Li, W., Liu, P.J.: Exploring the limits of transfer learning with a
+unified text-to-text transformer. arXiv:1910.10683 (2019)
+ [32] 
+Rajpurkar, P., Zhang, J., Lopyrev, K., Liang, P.: SQuAD: 100,000+ questions
+for machine comprehension of text. In: EMNLP (2016)
+ [33] 
+Reddi, S.J., Kale, S., Kumar, S.: On the convergence of adam and beyond. ICLR
+(2018)
+ [34] 
+Schaul, T., Zhang, S., LeCun, Y.: No more pesky learning rates. In: ICML. pp.
+343–351 (2013)
+ [35] 
+Socher, R., Perelygin, A., Wu, J., Chuang, J., Manning, C.D., Ng, A., Potts,
+C.: Recursive deep models for semantic compositionality over a sentiment
+treebank. In: EMNLP (2013)
+ [36] 
+Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., Salakhutdinov, R.:
+Dropout: a simple way to prevent neural networks from overfitting. JMLR
+(2014)
+ [37] 
+Tieleman, T., Hinton, G.: Lecture 6.5—RmsProp: Divide the gradient by a
+running average of its recent magnitude. COURSERA (2012)
+ [38] 
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N.,
+Kaiser, L., Polosukhin, I.: Attention is all you need. In: NeurIPS (2017)
+ [39] 
+Wang, A., Singh, A., Michael, J., Hill, F., Levy, O., Bowman, S.R.: Glue: A
+multi-task benchmark and analysis platform for natural language
+understanding. EMNLP (2018)
+ [40] 
+Warstadt, A., Singh, A., Bowman, S.R.: Neural network acceptability judgments.
+arXiv preprint 1805.12471 (2018)
+ [41] 
+Williams, A., Nangia, N., Bowman, S.R.: A broad-coverage challenge corpus for
+sentence understanding through inference. In: NAACL (2018)
+ [42] 
+Wilson, A.C., Roelofs, R., Stern, M., Srebro, N., Recht, B.: The marginal value
+of adaptive gradient methods in machine learning. In: Neurips. pp. 4148–4158
+(2017)
+ [43] 
+Wu, Y., Ren, M., Liao, R., Grosse, R.: Understanding short-horizon bias in
+stochastic meta-optimization. arXiv:1803.02021 (2018)
+ [44] 
+You, Y., Gitman, I., Ginsburg, B.: Scaling SGD batch size to 32k for imagenet
+training. CoRR abs/1708.03888 (2017)
+ [45] 
+You, Y., Li, J., Reddi, S., Hseu, J., Kumar, S., Bhojanapalli, S., Song, X.,
+Demmel, J., Keutzer, K., Hsieh, C.J.: Large batch optimization for deep
+learning: Training bert in 76 minutes. In: ICLR (2020)
+ [46] 
+Zaheer, M., Reddi, S., Sachan, D., Kale, S., Kumar, S.: Adaptive methods for
+nonconvex optimization. In: NeurIPS. pp. 9793–9803 (2018)
+ [47] 
+Zeiler, M.D.: ADADELTA: an adaptive learning rate method. CoRR (2012)
+ [48] 
+Zhang, G., Li, L., Nado, Z., Martens, J., Sachdeva, S., Dahl, G., Shallue, C.,
+Grosse, R.B.: Which algorithmic choices matter at which batch sizes? insights
+from a noisy quadratic model. In: NeurIPS. pp. 8194–8205 (2019)
+ [49] 
+Zhang, J., Karimireddy, S.P., Veit, A., Kim, S., Reddi, S., Kumar, S., Sra, S.:
+Why are adaptive methods good for attention models? NeurIPS 33 
+(2020)
+ [50] 
+Zhang, M.R., Lucas, J., Ba, J., Hinton, G.E.: Lookahead optimizer: k steps
+forward, 1 step back. In: NeurIPS (2019)
+ [51] 
+Zhu, C., Cheng, Y., Gan, Z., Sun, S., Goldstein, T., Liu, J.: Freelb: Enhanced
+adversarial training for natural language understanding. In: ICLR (2020)
+ [52] 
+Zhuang, J., Tang, T., Tatikonda, S., Dvornek, N., Ding, Y., Papademetris, X.,
+Duncan, J.S.: Adabelief optimizer: Adapting stepsizes by the belief in
+observed gradients. In: NeurIPS (2020)
+ [53] 
+Ziyin, L., Wang, Z.T., Ueda, M.: Laprop: a better way to combine momentum with
+adaptive gradient. arXiv:2002.04839 (2020)
+ MaxVA: Fast Adaptation of Step Sizes by Maximizing Observed Variance of Gradients (Appendix)
+ Appendix 0.A Deriving the closed form solution Eq. 6 
+ Plugging Eq. 2 , 3 , 4 , and the unbiased estimations $u_{t}(\beta)=\tilde{u}_{t}(\beta)/w_{t}(\beta),v_{t}(\beta)=\tilde{v}_{t}(\beta)/w_{t}(\beta)$ 
+into Eq. 5 , each coordinate is solving the same problem:
+ $\argmax_{\beta}f(\beta)=\frac{\beta w_{t-1}{v}_{t-1}+(1-\beta)g_{t}^{2}}{\beta w_{t-1}+(1-\beta)}-\left[\frac{\beta w_{t-1}{u}_{t-1}+(1-\beta)g_{t}}{\beta w_{t-1}+(1-\beta)}\right]^{2}.$ 
+ (13) 
+ Let $\gamma={1}/[\beta w_{t-1}+(1-\beta)]\in[1,1/w_{t-1}]$ , we can see $f(\beta)$ can be represented as a quadratic function of $\gamma$ . Specifically,
+ $f(\beta)=h(\gamma)=\frac{w_{t-1}v_{t-1}-g_{t}^{2}}{w_{t-1}-1}+\left[g_{t}^{2}-\frac{w_{t-1}v_{t-1}-g_{t}^{2}}{w_{t-1}-1}\right]\gamma-\left\{\frac{w_{t-1}u_{t-1}-g_{t}}{w_{t-1}-1}+\left[g_{t}-\frac{w_{t-1}u_{t-1}-g_{t}}{w_{t-1}-1}\right]\gamma\right\}^{2}.$ 
+ Meanwhile, $\beta$ is a monotonic function of $\gamma$ .
+Therefore, $f(\beta)$ has a unique maximum value.
+ To find the maximum value, we return to Eq. 13 , from which we can find a stationary point
+ $\frac{v_{t-1}-u_{t-1}^{2}+(g_{t}-u_{t-1})^{2}}{w_{t-1}\left[(g_{t}-u_{t-1})^{2}-v_{t-1}+u_{t-1}^{2}\right]+v_{t-1}-u_{t-1}^{2}+(g_{t}-u_{t-1})^{2}}.$ 
+ (14) 
+ Appendix 0.B Convergence Proof
+ Following the convergence proofs of Yogi [ 46 ] , we prove the convergence of MAdam in the nonconvex setting.
+ Proof of Theorem 1.
+ Proof 
+ Recall that we have assumed the update steps of MAdam as
+ $\theta_{t+1,i}=\theta_{t,i}-\eta_{t}\frac{g_{t,i}}{\sqrt{v_{t,i}}+\epsilon},$ 
+ (15) 
+ for all $i\in[d]$ , and that $f$ is $L$ -smooth, which results in the following inequalities:
+ (16) 
+ Note the stochastistic gradient is defined as $g_{t}=\frac{1}{b_{t}}\sum_{j=1}^{b_{t}}\nabla_{\theta}\ell(x_{j};\theta_{t})$ .
+Given $\theta_{t}$ , we take expectation over the stochastic gradient $g_{t}$ in Eq. 16 (denoted as $\mathbb{E}_{t}[\cdot]=\mathbb{E}[\cdot|\theta_{t}]$ ) to get
+ (17) 
+ where the second equality holds by applying Lemma 1 to the first expectation term, and taking the absolute value of the second expectation term.
+ Next, we need to bound the term $T_{1}$ to show convergence.
+First, we have the following upper bound for $T_{1}$ :
+ (18) 
+ where the last equality comes from the definition of $v_{t,i}=\beta_{t,i}v_{t-1,i}+(1-\beta_{t,i})g_{t,i}^{2}$ .
+We can further bound $T_{1}$ as
+ (19) 
+ Since the loss on each sample $s$ satisfies $|[\nabla\ell(x,s)]_{i}|\leq G$ , we will have $|[\nabla f(x)]_{i}|\leq G$ for $\forall i\in[d]$ .
+Substituting the coefficients of $T_{1}$ in Eq. 17 with this gradient bound, we have
+ (20) 
+ where the second inequality comes from the fact that $\sqrt{v_{t,i}}+\epsilon\geq\epsilon$ and $v_{t,i}=\beta_{t,i}v_{t-1,i}+(1-\beta_{t,i})g_{t,i}^{2}\geq\underline{\beta}v_{t-1,i}$ , and the third inequality comes from applying Lemma 1 by [ 46 ] to $\mathbb{E}_{t}[g_{t}^{2}]$ .
+The application of Lemma 1 is possible because $v_{t-1}$ is independent of the $t$ -th batch.
+By the assumptions for $\epsilon,G,\underline{\beta}$ , we have
+ $\frac{L\eta_{t}^{2}}{2\epsilon}\leq\frac{\eta}{4},~\frac{\eta G\sqrt{1-\underline{\beta}}}{\epsilon}\leq\frac{1}{4}\eta.$ 
+ (21) 
+ Plugging these two results and the assumption $\bar{\beta}\leq 2\underline{\beta}$ into $T_{2}$ , we have
+ (22) 
+ the main inequality, we have
+ (23) 
+ where we have replaced $b_{t}$ with $t$ by our assumption on the batch size, and the second inequality comes from the fact that $v_{t-1,i}\leq G^{2}$ .
+Taking expectation on both the LHS and RHS for the inequalities at $t=1,...,T$ , using telescope sum and rearranging the terms, we can conclude that
+ $\frac{\eta}{5(G\sqrt{\underline{\beta}}+\epsilon)}\sum_{i=1}^{T}\lVert\nabla f(\theta_{t})\rVert^{2}\leq f(\theta_{1})-E[f(\theta_{T+1})]+\left(\frac{\eta G\sqrt{1-\underline{\beta}}}{\epsilon^{2}}+\frac{L\eta^{2}}{2\epsilon^{2}}\right)\sigma^{2}d\log(T+1)+\frac{2\sigma\eta dG}{\epsilon}\sqrt{T}.$ 
+ (24) 
+ Multiplying both sides with $\frac{5(G\sqrt{\underline{\beta}}+\epsilon)}{T\eta}$ , and using the fact that $f(x^{*})\leq f(\theta_{t+1})$ , we conclude that
+ $\frac{1}{T}\sum_{i=1}^{T}\lVert\nabla f(\theta_{t})\rVert^{2}\leq 5(G\sqrt{\underline{\beta}}+\epsilon)\left(\frac{f(\theta_{1})-f(x^{*})}{\eta T}+\left(\frac{G\sqrt{1-\underline{\beta}}}{\epsilon^{2}}+\frac{L\eta}{2\epsilon^{2}}\right)\frac{\sigma^{2}d\log(T+1)}{T}+\frac{2\sigma dG}{\epsilon\sqrt{T}}\right).$ 
+ (25) 
+ Lemma 1 
+ Assume the gradient is bounded as $\lVert\nabla_{\theta}\ell(x;\theta)\rVert_{\infty}\leq G$ , and has bounded variance $\mathbb{E}[[\nabla_{\theta}\ell(x;\theta)]_{i}-[\nabla f(\theta_{t})]_{i}]^{2}\leq\sigma^{2}$ , and the batch size $b_{t}=t$ . For the $t$ -th iteration of MAdam , we have 
+ $-[\nabla f(\theta_{t})]_{i}\mathbb{E}_{t}\left[\frac{g_{t,i}}{\sqrt{\beta_{t,i}v_{t-1,i}}+\epsilon}\right]\leq-\frac{[\nabla f(\theta_{t})]_{i}^{2}}{\sqrt{\bar{\beta}v_{t-1,i}}+\epsilon}+\frac{G\sigma}{\epsilon\sqrt{t}}$ 
+ (26) 
+ Proof 
+ The LHS can be decomposed as
+ (27) 
+ where the inequality comes from taking the upper bound of $\beta_{t,i}$ , since the first term is non-positive.
+Let $[h(x)]_{+}$ and $[h(x)]_{-}$ be the operators for taking the positive and negative values of function $h(x)$ respectively, i.e.,
+ (28) 
+ It is obvious that $\mathbb{E}[[X]_{+}]\leq\mathbb{E}[|X|]\leq\sqrt{\mathbb{E}[X^{2}]}$ , where the second inequality comes from Cauchy-Schwarz inequality.
+Similarly, $\mathbb{E}[[X]_{-}]\geq-\mathbb{E}[|X|]\geq-\sqrt{\mathbb{E}[X^{2}]}$ .
+With this in mind, we have
+ $0\leq\mathbb{E}_{t}\left[\left[g_{t,i}-[\nabla f(\theta_{t})]_{i}\right]_{+}\right]\leq\sqrt{\mathbb{E}_{t}\left[g_{t,i}-[\nabla f(\theta_{t})]_{i}\right]^{2}}\leq\frac{\sigma}{\sqrt{t}},$ 
+ (29) 
+ where the last inequality comes from applying Lemma 1 from [ 46 ] under the bounded gradient variance assumption, and the assumption that the batch size grows as $b_{t}=t$ .
+Similarly, we have
+ $-\frac{\sigma}{\sqrt{t}}\leq\mathbb{E}_{t}\left[\left[g_{t,i}-[\nabla f(\theta_{t})]_{i}\right]_{-}\right]\leq 0.$ 
+ (30) 
+ Now we will decompose and bound $T_{3}$ as
+ (31) 
+ Plugging this inequality back into Eq. 27 and we will get the RHS.
+ Algorithm 2 LaMAdam 
+ 1: 
+ Input: Learning rate $\{\eta_{t}\}_{t=1}^{T}$ , parameter $0 , $0 , $\epsilon>0$ 
+ 2: 
+ Set $\tilde{m}_{0}=\tilde{u}_{0}=\tilde{v}_{0}=w_{0}=0$ 
+ 3: 
+ for $t=1$ to $T$ do 
+ 4: 
+   Draw samples $S_{t}$ from training set
+ 5: 
+   Compute $g_{t}=\frac{1}{|S_{t}|}\sum_{x_{k}\in\mathcal{S}_{t}}\nabla\ell(x_{k};\theta_{t})$ 
+ 6: 
+    $\tilde{\beta}_{t}={\arg\max}_{\beta}v_{t}(\beta)-u_{t}^{2}(\beta)$ $\triangleright$ see Eq 6 
+ 7: 
+    $\beta_{t}=\max(\underline{\beta},\min(\bar{\beta},\tilde{\beta}_{t}))$ 
+ 8: 
+    $\tilde{u}_{t}=\beta_{t}\tilde{u}_{t-1}+(1-\beta_{t})g_{t}$ 
+ 9: 
+    $\tilde{v}_{t}=\beta_{t}\tilde{v}_{t-1}+(1-\beta_{t})g^{2}_{t}$ 
+ 10: 
+    $w_{t}=\beta_{t}w_{t-1}+(1-\beta_{t})$ 
+ 11: 
+    $\tilde{m}_{t}=\alpha\tilde{m}_{t-1}+(1-\alpha)\frac{g_{t}}{\sqrt{\tilde{v}_{t}/w_{t}}+\epsilon}$ 
+ 12: 
+    $\theta_{t}=\theta_{t-1}-\frac{\eta_{t}}{1-\alpha^{t}}\tilde{m}_{t}$ 
+ Appendix 0.C Practical notes of $\beta_{t}$ 
+ Claims and arguments:
+ 1. 
+ For $t>1,~\text{since }0 
+ This is obvious since in every step, $w_{t}$ is an interpolation between $w_{t-1}$ and $1$ , and $w_{t}\geq w_{t-1}$ . We have also set $w_{1}=1-\beta_{1}$ .
+ 2. 
+ For any $g_{t},u_{t-1},v_{t-1}$ satisfying $v_{t-1}-u_{t-1}^{2}>0$ in Eq. 6 , we have $\beta_{t}\in[1/(1+w_{t-1}),1/(1-w_{t-1})]$ . 
+ Eq. 8 is monotonic in $R_{t}$ .Since $g_{t}$ can be any value, $R_{t}$ can be any value from 0 to $\infty$ . If $R_{t}=0$ , $\beta_{t}$ takes the largest value $1/(1-w_{t})$ . If $R_{t}\rightarrow\infty$ , $\beta_{t}\rightarrow 1/(w_{t}+1)$ .
+ 3. 
+ As $t\rightarrow\infty$ , $w_{t}\rightarrow 1$ and $\beta_{t}\in[0.5,\infty]$ .
+ Combining Claims 1 and 2 to get this result.
+ 4. 
+ Adding a small coefficient $\delta>0$ to the denominator of Eq. 6 has negligibale effect on the value of $\beta_{t}$ and does not violate the maximum variation objective (Eq. 5 ).
+ Since $\delta$ is small, it has negligible effect on $\beta_{t}$ when division by zero does not happen.
+We only need to confirm adding $\delta$ will not affect the solution when division by zero happens.
+We can re-write the dividend of Eq. 6 as
+ $(w_{t-1}+1)(g_{t}-u_{t-1})^{2}+(1-w_{t-1})(v_{t-1}-{u}_{t-1}^{2}).$ 
+ (32) 
+ Since $\mathbb{E}[X^{2}]-\left(\mathbb{E}[X]\right)^{2}=\text{Var}[X]\geq 0$ , we can conclude that ${v}_{t-1}-{u}^{2}_{t-1}\geq 0$ .
+ When $1-\beta_{1}\leq w_{t-1} 32 can be 0 only when $g_{t}={u}_{t-1}$ and ${v}_{t-1}={u}^{2}_{t-1}$ .
+In this special case, we can set $\beta_{t}$ to any value in $[0,1]$ without changing ${\sigma}_{t}^{2}$ ; we will always have ${v}_{t}=\tilde{v}_{t-1}/w_{t-1}=v_{t-1},u_{t}=\tilde{u}_{t-1}/w_{t-1}=u_{t-1}$ , and ${\sigma}_{t}^{2}=0$ .
+Only $w_{t}=(w_{t-1}-1)\beta_{t}+1$ is affected by $\beta_{t}$ , which takes a larger value when $\beta_{t}$ is smaller.
+The solution given by adding $\delta$ to the denominator is $\beta_{t}=0$ , and the following clipping will set $\beta_{t}=\underline{\beta}$ , resulting in the largest possible $w_{t}=(w_{t-1}-1)\underline{\beta}+1$ .
+In the next step, if Eq. 32 is not zero, then we have $\beta_{t+1}=1/(w_{t}+1)$ , and we know $g_{t+1}\neq u_{t}$ . 3 3 
+ 3 
+ Otherwise we will still have $g_{t+1}=u_{t},g_{t+1}^{2}=u_{t}^{2}=v_{t}$ and Eq. 32 is 0. 
+In this case, for $0.5\leq\beta_{t+1} 32 is zero, doing this will not change ${\sigma}_{t+1}^{2}=0$ .
+ When $w_{t-1}=1$ , Eq. 32 is 0 if and only if $g_{t}={u}_{t-1}$ .
+As a result, if $v_{t-1}=u_{t-1}^{2}$ , we have the same conclusion as before.
+Otherwise, $\beta_{t}=({{v}_{t-1}-{u}_{t-1}^{2}})/{\delta}$ before clipping, and $\beta_{t}=\bar{\beta}$ after clipping.
+Also, any $0 
+ Appendix 0.D AdaBound might fail on Transformers?
+ Figure 6: Distribution of effective step size of AdaBound and MAdam at iteration 10000, 30000 and 60000 on IWSLT’14. Red lines indicate the clipping range of AdaBound. On the top/bottom are results of AdaBound/MAdam with learning rates 5e-4/1.25e-3. 
+ Since SGD often performs much worse than Adam on transformers, and AdaBound transitions into SGD asymptotically, it is reasonable to believe that AdaBound would not converge well on transformers.
+We did experiments on the IWSLT’14 dataset to evaluate AdaBound on Transformers.
+AdaBound clips the effective step size to be within $0.1-\frac{0.1}{\gamma t+1}$ and $0.1-\frac{0.1}{\gamma t}$ , and recommends setting $\gamma=1-\beta_{2}=10^{-3}$ .
+In practice, this setting only gives a $ 6 , AdaBound does not effectively clip most of the coordinates even in the last iteration with $\gamma=10^{-8}$ , which means AdaBound essentially degraded into Adam, yet it gives better results than those effectively doing clipping.
+By comparison, the best result of MAdam and Adam with AMSGrad is 36.07(0.07) / 35.87 (0.05), respectively.
+ Appendix 0.E Experimental Details on the Synthetic Finite-sample Experiment
+ Same as [ 8 ] , we use constant learning rates $\eta$ in every step, and set $\alpha=0,\beta=0.9$ for Adam and AMSGrad .
+For MAdam , we set $\alpha=0,(\underline{\beta},\bar{\beta})=(0.5,1)$ .
+ Adam never converged for a variety of $\eta$ we tried within $[10^{-4},1]$ , consistent with [ 8 ] .
+Generally, a larger $\eta$ gives faster convergence for both AMSGrad and MAdam .
+For reproducibility, we repeat experiments 100 times with the same settings, and choose the $\eta$ for AMSGrad and MAdam where the solution $|\theta^{*}| MAdam , but AMSGrad only satisfied it 1% of the times for $\eta=1.2$ and 65% of the times for $\eta=0.9$ .
+ $\eta=0.8$ is the largest $\eta$ we find for AMSGrad to achieve $100\%$ satisfaction.
+Therefore, we use $\eta=0.8$ for both Adam and AMSGrad .
+ Appendix 0.F Details and Additional Experimental Results on the Noisy Quadratic Model
+ Figure 7: More results on the Noisy Quadratic Model. 
+ Details of experimental settings
+ We set $\underline{\beta}=0.5,\bar{\beta}=0.99$ for MAdam , and for fair comparison, we do a grid search for Adam with $\beta\in[0.5,0.6,0.7,0.8,0.9,0.99]$ , and only report the results with the best $\beta$ .
+We repeat the experiments 100 times under each setting, where we select a random initialization of $\theta\sim{\mathcal{N}}(0,I)$ each time, and run MAdam and Adam with different hyper-parameters from this random initialization.
+Each run takes 1000 iterations by default.
+ Additional Results
+ We give more results comparing Adam and MAdam on the Noisy Quadratic Model.
+The results are shown in Figure 7 .
+Generally, the best result of MAdam has a more significant margin when $h_{2}$ and $\sigma$ are higher, i.e., the improvement is more significant when the problem is worse conditioned and the noise level is higher.
+Note that for each trial, we start both algorithms from the same random initialization.
+ Appendix 0.G Details of Experiments on Image Classification
+ Model, larning rate schedules and data augmentations
+ On CIFAR10 and CIFAR100, the ResNet18 comes from a public repository, 4 4 
+ 4 
+ https://github.com/kuangliu/pytorch-cifar which has a base width of 64 by default.
+We use random cropping (4-pixel zero paddings on each side) and random horizontal flip as the data augmentations.
+Instead of using the multi-step schedule, we find the cosine learning rate schedule to yield better results for both SGD and adaptive methods.
+Therefore, we use the cosine learning rate schedule and set a final learning rate of 2e-6 in all cases.
+On ImageNet, we use random resized crop and random horizontal flip for data augmentation.
+For the multi-step learning rate schedule, multiply the learning rate by 0.1 every 30 epochs, and train a total of 90 epochs, with a batch size of 256.
+ Hyperparameters of CIFAR10
+ For each optimizer, we do a grid search over the learning rate and weight decay for the best hyperparameters.
+For Adam and LaProp , we set $\beta=0.999$ .
+For MAdam and LaMAdam , we set $\underline{\beta}=0.5$ and $\bar{\beta}=0.999$ in all cases.
+Except for SGD, we tried learning rates from {5e-4, 1e-3, 2e-3, 3e-3, 4e-3, 6e-3, 8e-3} and weight decay from {0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1 }.
+The best learning rate and weight decay for Adam , LaProp , MAdam and LaMAdam are (3e-3, 0.2), (1e-3, 0.4), (8e-3, 0.05) and (6e-3, 0.05) respectively.
+As to SGD, we tried learning rates from {3e-2, 5e-2, 1e-1, 2e-1, 3e-1} and weight decays from {1e-4, 3e-4, 5e-4, 1e-3, 2e-3}, and the best result was achieved with learning rate 2e-1 and weight decay 3e-4.
+ Hyperparameters for CIFAR100
+ We use the same grid search configurations as for CIFAR10.
+The best learning rate and weight decay for Adam , LaProp , MAdam and LaMAdam are (2e-3, 0.4), (5e-4, 1), (4e-3, 0.2) and (3e-3, 0.2) respectively. For SGD, the best learning rate and weight decay are 3e-2 and 2e-3 respectively.
+ Hyperparameters for ImageNet
+ Due to the heavy workload and the time limit, we were not able to accomplish 4 runs for each hyperparameter in ImageNet, so we report the best results for each optimizer in Table 1 , except for the result of Adam , which was copied from [ 23 ] but uses the same hyperparameters except for the learning rate and weight decay.
+For LaProp , MAdam and LaMAdam , we choose learning rates from {1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 8e-3} and weight decay from {0.003, 0.006, 0.01, 0.012, 0.02, 0.03}, and found the best combinations for LaProp , MAdam and LaMAdam are (2e-3, 0.03), (5e-3, 0.012) and (6e-3, 0.012).
+For SGD, we choose learning rate from {0.05, 0.1, 0.2} and weight decay from {5e-5, 7e-5, 1e-4}, and found the best combination to be (0.1, 7e-5).
+ Appendix 0.H Additional Experimental Results and Details on Machine Translation
+ Figure 8: Training loss, validation BLEU and average step size on IWSLT’14 DE-EN, trained with $\eta$ =5e-4, $\lambda$ =1e-2, $\beta$ =0.999 for LaProp and $\eta$ =1.5e-3, $\lambda$ =1e-2, $\underline{\beta}$ =0.5, $\bar{\beta}$ =0.999 for LaMAdam , and $\eta$ =4.375e-4, $\lambda$ =1e-2, $\beta$ =0.999 for LaProp - $\eta^{\prime}$ . 
+ Additional Experimental Results and analysis
+ In Figure 8 , we plot the training loss, validation BLEU and average step size on IWSLT’14 DE-EN.
+Although the average update size of LaMAdam is smaller even when using 3 times higher learning rate than Adam , LaMAdam shows slightly better convergence on the training set and better validation BLEU.
+This may be explained by the heavy-tailed distribution of the gradient in the process of training transformers from scratch [ 49 ] . Smaller step sizes mitigate the effect of extreme gradient values on the model’s performance.
+It is worth mentioning that LaProp diverges using the large learning rate 1.5e-3.
+Further, we find LaProp is unable to produce the same result as LaMAdam even when their update sizes are similar.
+ LaProp produces a similar step size curve as LaMAdam with learning rate 4.375e-4, but the performance is weaker than LaMAdam .
+ LaMAdam uses the maximum variation rule to select the adaptive learning rate for each dimension, creating benefit that is not achievable by simply scaling the base learning rate $\eta$ .
+ Hyperparameters for IWSLT’14
+ The transformer we use has 512-dimensional word embeddings and 6 Transformer blocks with 4 attention heads and 1024 FFN dimensions for the encoder/decoder, which is refered to as transformer_iwslt_de_en in fairseq.
+We do a grid search for the learning rate and weight decay for both optimizers.
+We tried $\eta$ from {2.5e-4, 5e-4, 1e-3, 1.5e-3, 2e-3}, and weight decay from {0.0001, 0.001, 0.01, 0.1}.
+The best combinations for LaProp and LaMAdam are (5e-4, 0.01) and (1.5e-3, 0.01).
+To demonstrate the full potential of adaptive methods under constant learning rates, we use the tri-stage learning rate schedule [ 30 ] , linearly increase the learning rate from $0.01\eta$ to the full learning rate $\eta$ in 4k iterations, hold it at $\eta$ for 32k iterations, and exponentially decay it to $0.01\eta$ in 24k iterations.
+For LaProp , we tried $\beta$ from {0.98, 0.99, 0.997, 0.999}.
+We found 0.999 to work the best and used it for all the grid search experiments.
+For LaMAdam , we set $\underline{\beta}=0.5$ , $\bar{\beta}=0.999$ .
+For other hyperparameters, we use the default setting in the fairseq example, which sets dropout probability to 0.3, uses label smoothed cross entropy loss with a smoothing coefficient 0.1, and shares the input and output token embedding parameters.
+ Hyperparameters for WMT’16
+ The Transformer we use has 1024-dimensional word embeddings, 6 transformer blocks with 16 attention heads and 4096 FFN dimensions for the encoder/decoder, and is refered to as transformer_vaswani_wmt_en_de_big in fairseq.
+The default implementation from fairseq did not use weight decay, so we also ignore weight decay in all experiments.
+The learning rate schedule takes the first 4k steps to linearly increase the learning rate to its maximum value.
+For LaProp , we found $\beta=0.98$ to give the best results, and we set $\underline{\beta}=0.95,\bar{\beta}=0.98$ in all experiments.
+This takes around 8 hours on 16 V100 GPUs each run.
+For grid search, we tried $\eta$ from {5e-4, 1e-3, 1.5e-3, 2e-3}, and found 1e-3 and 1.5e-3 to work the best for LaProp and LaMAdam respectively.
+Other hyperparameters are the defaults of the corresponding fairseq example, which uses a dropout probability of 0.3, the label smoothed cross entropy loss with a smoothing coefficient 0.1, and shares all embedding parameters.
+ Appendix 0.I Additional Details of Experiments on the GLUE benchmark
+ The GLUE benchmark is a collection of 9 natural language understanding tasks,
+namely Corpus of Linguistic Acceptability (CoLA; [ 40 ] ), Stanford Sentiment Treebank (SST; [ 35 ] ), Microsoft
+Research Paraphrase Corpus (MRPC; [ 11 ] ), Semantic Textual Similarity Benchmark (STS; [ 1 ] ), Quora Question Pairs (QQP; [ 18 ] ), Multi-Genre NLI (MNLI; [ 41 ] ), Question NLI (QNLI; [ 32 ] ), Recognizing Textual Entailment (RTE; [ 9 ] ; [ 15 ] ; [ 14 ] ; [ 3 ] ) and Winograd NLI (WNLI; [ 21 ] ).
+ It is reported in [ 25 ] that Adam is sensitive to the choice of $\epsilon$ on GLUE.
+Following their settings, we set $\epsilon=1e-6$ for both Adam and MAdam .
+For LaProp and LaMAdam , however, we always set $\epsilon=1e-15$ , like all other experiments in this paper, which is consistent with the observation in [ 53 ] that LaProp is robust to the choice of $\epsilon$ .
+We set $\beta=0.98$ for Adam and LaProp , and $\underline{\beta}=0.5,\bar{\beta}=0.98$ for LaProp and LaMAdam .
+All other hyperparameters are set to the same as the example in fairseq. 5 5 
+ 5 
+ https://github.com/pytorch/fairseq/blob/master/examples/roberta/README.glue.md 
+For each task, we do a grid search over the learning rate and weight decay, which are chosen from {5e-6, 1e-5, 2e-5, 4e-5, 5e-5, 6e-5} and {0.025, 0.05, 0.1, 0.2} respectively.
+We list the best combinations for Adam , MAdam , LaProp and LaMAdam on each task as below:
+ MNLI : 
+ (1e-5, 0.1), (1e-5, 0.1), (4e-5, 0.025), (4e-5, 0.025).
+ QQP : 
+ (1e-5, 0.1), (1e-5, 0.1), (4e-5, 0.025), (4e-5, 0.025).
+ QNLI : 
+ (1e-5, 0.1), (1e-5, 0.1), (4e-5, 0.05), (4e-5, 0.05).
+ SST-2 : 
+ (1e-5, 0.1), (1e-5, 0.1), (4e-5, 0.1), (4e-5, 0.1).
+ RTE : 
+ (2e-5, 0.1), (2e-5, 0.1), (6e-5, 0.1), (6e-5, 0.1).
+ MRPC : 
+ (1e-5, 0.1), (1e-5, 0.1), (6e-5, 0.1), (6e-5, 0.1).
+ STS-B : 
+ (2e-5, 0.1), (2e-5, 0.1), (4e-5, 0.5), (4e-5, 0.5).
+ CoLA : 
+ (2e-5, 0.1), (2e-5, 0.1), (6e-5, 0.5), (6e-5, 0.5).
+ Experimental support, please
+ view the build logs 
+ for errors. Generated by
+ L
+ A 
+ T
+ E 
+ xml 
+ .
+ Instructions for reporting errors
+ We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile
+ support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the
+ methods listed below:
+ Click the "Report Issue" ( 
+ ) button, located in the page header.
+ Tip: You can select the relevant text first, to include it in your report.
+ Our team has already identified the following issues . We appreciate your time reviewing and reporting rendering errors we
+ may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability
+ should not be a barrier to accessing research. Thank you for your continued support in championing open access for
+ all.
+ Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion , and welcome developer contributions .
+ We gratefully acknowledge support from
+ our major funders ,
+ member institutions , ,
+ and all contributors.
+ About 
+ · 
+ Help 
+ · 
+ Contact 
+ · 
+ Subscribe 
+ · 
+ Copyright 
+ · 
+ Privacy 
+ · 
+ Accessibility 
+ · 
+ Operational Status (opens in new tab) 
+ Major funding support from

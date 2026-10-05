@@ -1,0 +1,1725 @@
+ 
+ Convergence Analysis of STORMUnder Different Geometries 
+ Report GitHub Issue
+ × 
+ Title: 
+ Content selection saved. Describe the issue below:
+ Description: 
+ Submit without GitHub 
+ Submit in GitHub 
+ arXiv is now an independent nonprofit! 
+ Learn more 
+ × 
+ Back to arXiv 
+ Why HTML? 
+ Report Issue 
+ Back to Abstract 
+ Download PDF 
+ Abstract 
+ 1 Introduction 
+ 2 Related work 
+ Variance reduction for nonconvex objectives. 
+ STORM-based methods for convex optimization. 
+ Variance reduction under the $\mu$ -PL condition. 
+ 3 Assumptions 
+ 4 Convergence under Average Smoothness 
+ 4.1 Nonconvex Objectives 
+ Remark. 
+ 4.2 Objectives Satisfying the PL Condition 
+ Remark. 
+ Core of the analysis. 
+ 5 Convergence without Average Smoothness 
+ 5.1 Nonconvex Objectives 
+ Remark. 
+ Core of the analysis. 
+ 5.2 Convex Objectives 
+ Remark. 
+ Comparison with an auxiliary sequence. 
+ Core of the analysis. 
+ Remark. 
+ Stepsize blocks. 
+ Remark. 
+ 5.3 Strongly Convex Objectives 
+ Remark. 
+ 6 Numerical Experiments 
+ Experimental setup. 
+ Nonconvex and PL objectives under average smoothness. 
+ Nonconvex objectives without average smoothness. 
+ Averaged and last iterates without average smoothness. 
+ 7 Conclusion 
+ References 
+ A Proof of Theorem 
+ B Proof of Theorem 
+ C Proof of Theorem 
+ D Proof of Lemma 
+ E Proof of Lemma 
+ F Other useful lemmas 
+ F.1 A shared one-step inequality 
+ F.2 Rounded-block geometry for arbitrary integer horizons 
+ G Proof of Theorem 
+ G.1 General stepsize-weighted and constant-step means 
+ G.2 The companion’s last-iterate bound 
+ G.3 Proof of the convex theorem 
+ H Proof of Theorems and 
+ H.1 The linearly weighted mean 
+ H.2 A block comparison for an SGD companion 
+ H.3 Proof of the last-iterate theorem 
+ License: CC BY 4.0
+arXiv:2610.01599v1 [math.OC] 01 Oct 2026
+ Convergence Analysis of STORM
+ Under Different Geometries
+ Wei Jiang
+ Affiliation: School of Computer Science and EngineeringNanjing University of Science and Technology, Nanjing, China
+ Yibo Wang
+ Affiliation: School of Artificial Intelligence, Nanjing University, Nanjing, China
+ Wenhao Yang
+ Affiliation: School of Artificial Intelligence, Nanjing University, Nanjing, China
+ Rui Yan
+ Affiliation: School of Computer Science and EngineeringNanjing University of Science and Technology, Nanjing, China
+ Lijun Zhang
+ Affiliation: School of Artificial Intelligence, Nanjing University, Nanjing, China
+ Zechao Li
+ Affiliation: School of Computer Science and EngineeringNanjing University of Science and Technology, Nanjing, China
+ Abstract
+ Stochastic recursive momentum (STORM) achieves fast convergence for
+nonconvex optimization via the variance reduction effect, but existing analyses rely on the strong average smoothness assumption. In this paper, we study the convergence of STORM for different objectives without average smoothness.
+We first revisit the results under average smoothness, obtaining the $O(T^{-1/3})$ bound for nonconvex objectives and the
+ $O(\sigma^{2}/(\mu T))$ bound for last-iterate output under the
+ $\mu$ -Polyak–Łojasiewicz (PL) condition. Without average smoothness, we design an auxiliary sequence and compare the STORM update with it in the analysis.
+With the help of this sequence, we prove that STORM still attains an $O(T^{-1/4})$ rate for nonconvex objectives, which is optimal under standard smoothness.
+For convex and $\lambda$ -strongly convex objectives, we further prove
+averaged and last-iterate bounds with optimal rates of
+ $O(\sigma R/\sqrt{T})$ and $O(\sigma^{2}/(\lambda T))$ , respectively.
+All the obtained results use the same STORM recursion with different hyperparameter choices.
+ 1 Introduction
+ In this paper, we consider the stochastic optimization problem
+ $\min_{x\in\mathbb{R}^{d}}F(x),\qquad F(x)=\mathbb{E}_{\xi\sim\mathcal{D}}[f(x;\xi)],$ 
+ (1) 
+ where function $F(\cdot)$ is differentiable and $L$ -smooth. We have access to an unbiased
+stochastic gradient $g(x,\xi)$ with bounded variance such that
+ $\mathbb{E}_{\xi}g(x,\xi)=\nabla F(x)$ and
+ $\mathbb{E}_{\xi}\left\|g(x,\xi)-\nabla F(x)\right\|^{2}\leq\sigma^{2}$ .
+We measure the convergence rate by the expected gradient norm $\mathbb{E}\left\|\nabla F(x)\right\|$ for the general nonconvex functions and by the
+expected function gap $\mathbb{E}[F(x)]-F^{*}$ for the other cases.
+ For nonconvex objectives, stochastic gradient descent (SGD) attains
+an optimal $O(T^{-1/4})$ convergence rate under the smoothness assumption
+ ( Ghadimi and Lan, 2013 ) . Variance reduction can further improve this
+rate to $O(T^{-1/3})$ under the
+additional average smoothness condition ( Fang et al., 2018 ; Arjevani et al., 2023 ) .
+Among such methods, STORM ( Cutkosky and Orabona, 2019 ) is attractive
+because it uses a constant batch size
+per iteration and does not require periodically computing gradients with large batches.
+Starting from $d_{0}=g(x_{0},\xi_{0})$ , it performs
+ $\displaystyle x_{t+1}$ 
+ $\displaystyle=x_{t}-\eta_{t}d_{t},$ 
+ (2) 
+ $\displaystyle d_{t+1}$ 
+ $\displaystyle=g(x_{t+1},\xi_{t+1})+(1-a_{t+1})\bigl(d_{t}-g(x_{t},\xi_{t+1})\bigr).$ 
+ (3) 
+ Here $\eta_{t}$ is the stepsize and $a_{t+1}$ is the momentum parameter.
+ Although STORM achieves the optimal rate for nonconvex objectives under average smoothness, many issues remain to be investigated.
+First, existing analysis relies on the stronger average smoothness condition, which assumes that $\mathbb{E}_{\xi}\left\|g(x,\xi)-g(y,\xi)\right\|^{2}\leq\mathcal{L}^{2}\left\|x-y\right\|^{2}$ . It remains unknown whether STORM can achieve the same $O(T^{-1/4})$ rate as SGD under standard smoothness alone. Second, existing guarantees do not establish optimal convergence rates for convex or strongly convex objectives without the average smoothness assumption.
+ In this paper, we analyze these questions for the original STORM framework. First, we revisit the previous analysis under average smoothness and obtain the following results through a simpler and more transparent analysis. We do not regard the average smoothness results as the main contribution.
+ • 
+ With average smoothness , we first improve the previous analysis of STORM, achieving the $O(T^{-1/3})$ rate for nonconvex functions. Compared with previous analysis, we remove the logarithmic factor in the bound and avoid using large batches in the first iteration.
+ • 
+ With average smoothness and the $\mu$ -PL condition ,
+we obtain a last-iterate bound with the convergence rate of
+ $O(\sigma^{2}/(\mu T))$ via a two-phase stepsize design, allowing exponential decay of the initialization term.
+ Then, we investigate the convergence of STORM without the average smoothness condition, achieving the following results, which are the main contributions of this paper.
+ • 
+ With standard smoothness , we prove the $O(T^{-1/4})$ convergence rate for STORM, which matches the classical SGD rate and is optimal under standard assumptions.
+ • 
+ For smooth and convex objectives , we obtain the weighted-mean and last-iterate bounds of order
+ $\mathcal{O}(LR^{2}/T+\sigma R/\sqrt{T})$ , where $R$ is the initial distance to a minimizer.
+ • 
+ For smooth and $\lambda$ -strongly convex objectives , we demonstrate that the weighted-mean and last-iterate bounds can be further improved to
+ $\mathcal{O}(\sigma^{2}/(\lambda T))$ .
+ Table 1 summarizes the above convergence guarantees, which are all optimal in terms of the iteration number $T$ under the corresponding settings.
+ Table 1: Convergence of STORM under different settings.
+All rows assume an $L$ -smooth objective and an unbiased oracle with variance at most $\sigma^{2}$ . AS denotes average smoothness.
+The nonconvex rows measure the expected gradient norm, while the other rows measure the expected function gap. Only the dominant term is presented. 
+ Objective 
+ Assumption 
+ Output 
+ Convergence rate 
+ Nonconvex 
+ AS 
+ Uniform random 
+ $T^{-1/3}$ 
+ Nonconvex 
+ $-$ 
+ Uniform random 
+ $T^{-1/4}$ 
+ $\mu$ -PL 
+ AS 
+ Last iterate 
+ $\sigma^{2}/(\mu T)$ 
+ Convex 
+ $-$ 
+ Weighted mean; last iterate 
+ $\sigma R/\sqrt{T}$ 
+ $\lambda$ -strongly convex 
+ $-$ 
+ Weighted mean; last iterate 
+ $\sigma^{2}/(\lambda T)$ 
+ 2 Related work
+ Variance reduction for nonconvex objectives.
+ SARAH ( Nguyen et al., 2017 ) first introduced a recursive estimator based on successive stochastic
+gradient differences. SPIDER ( Fang et al., 2018 ) then uses this principle
+to achieve $O(\varepsilon^{-3})$ stochastic gradient complexity and
+ $O(n+\sqrt{n}\,\varepsilon^{-2})$ finite-sum complexity for ensuring
+ $\mathbb{E}\left\|\nabla F(x)\right\|\leq\varepsilon$ , where $n$ is the number of component
+functions. These guarantees assume average smoothness. SPIDER periodically
+refreshes its estimator using a large batch or the full gradient.
+STORM ( Cutkosky and Orabona, 2019 ) instead incorporates a fresh-gradient difference term at every step,
+removing these periodic refreshes. However, the original STORM analysis contains logarithmic factors in the rate.
+In particular, its guarantee is
+ $O(\log(T)T^{-2/3})$ in expected squared gradient norm, hence
+ $O(\sqrt{\log(T)}T^{-1/3})$ in expected norm. 1 1 
+ 1 
+ In
+ Cutkosky and Orabona (2019) , the last simplification in Theorem 1’s
+proof drops a factor $\sqrt{M}$ uncarefully, where $M=O(\log(T+2))$ . Furthermore, their Appendix B, Theorem 2, explicitly retains
+the logarithmic factor for the nonadaptive guarantee. Other variants of STORM have also been investigated in the literature. STORM+
+ ( Levy et al., 2021 ) obtains
+ $O(T^{-1/3})$ with adaptive parameters under the extra assumption of
+bounded gradients and bounded objective value. Ada-STORM ( Jiang et al., 2024 ) attains the same rates without additional assumptions but with a large initial batchsize on the order $\mathcal{O}(T^{1/3})$ .
+ STORM-based methods for convex optimization.
+ The STORM estimator has also been studied beyond nonconvex
+optimization.
+ Zhang et al. (2020) combine the STORM estimator with
+Frank–Wolfe updates and obtain an $O(T^{-1/2})$ expected
+function-gap bound for convex objectives.
+However, their analysis requires a bounded feasible set, samplewise smoothness, and bounded stochastic gradients.
+More recently, Dahan and Levy (2025) combine STORM with
+anytime averaging in $\mu^{2}$ -SGD and attain the
+ $O(T^{-1/2})$ rate.
+Their method evaluates gradients at running averages of a
+separate projected sequence, and its analysis uses samplewise
+smoothness and a bounded feasible set.
+ Variance reduction under the $\mu$ -PL condition.
+ The variance reduction technique PAGE ( Li et al., 2021 ) obtains an expected function gap of at most $\varepsilon$ with
+ $O((B+\sqrt{B}\,\mathcal{L}/\mu)\log(2\Delta_{0}/\varepsilon))$ 
+stochastic gradient evaluations, where
+ $B=\lceil 2\sigma^{2}/(\mu\varepsilon)\rceil$ . This result assumes the average smoothness and bounded variance, and its refresh batch depends on the target accuracy.
+For compositional objectives, RECOVER ( Qi et al., 2021 ) obtains the sample complexity
+ $O(\max\{\mu^{-3/2}\varepsilon^{-1/2},\mu^{-1}\varepsilon^{-1}\})$ .
+For stochastic multi-level compositional optimization,
+ Jiang et al. (2022) develop stage-wise SMVR using
+STORM estimators.
+For objectives satisfying the $\mu$ -PL condition, their
+stage-wise analysis gives complexity
+ $O(\mu^{-1}\varepsilon^{-1}+\mu^{-3/2}\varepsilon^{-1/2})$ ,
+which reduces to $O((\mu\varepsilon)^{-1})$ 
+when $\varepsilon\leq\mu$ .
+ 3 Assumptions
+ We now state the assumptions for problem ( 1 ). The first
+two assumptions are used throughout the paper and the remaining assumptions specify the setting of each theorem.
+ Assumption 1 (Standard smoothness) . 
+ The differentiable objective $F:\mathbb{R}^{d}\to\mathbb{R}$ has finite infimum
+ $F^{*}=\inf_{x}F(x)$ and satisfies
+ $\left\|\nabla F(x)-\nabla F(y)\right\|\leq L\left\|x-y\right\|\quad\text{for all }x,y\in\mathbb{R}^{d}.$ 
+ (4) 
+ Assumption 2 (Stochastic oracle) . 
+ The stochastic oracle $g$ is unbiased and has
+bounded variance:
+ $\mathbb{E}_{\xi}g(x,\xi)=\nabla F(x),\qquad\mathbb{E}_{\xi}\left\|g(x,\xi)-\nabla F(x)\right\|^{2}\leq\sigma^{2}\quad\text{for all }x\in\mathbb{R}^{d}.$ 
+ (5) 
+ Assumption 3 (Average smoothness) . 
+ Stochastic gradient differences satisfy
+ $\mathbb{E}_{\xi}\left\|g(x,\xi)-g(y,\xi)\right\|^{2}\leq\mathcal{L}^{2}\left\|x-y\right\|^{2}\quad\text{for all }x,y\in\mathbb{R}^{d}.$ 
+ (6) 
+ Note that this assumption is also called mean-square smoothness.
+By Jensen’s inequality, Assumptions 2 
+and 3 imply that $F$ is also $\mathcal{L}$ -smooth, so we assume $L\leq\mathcal{L}$ without loss of generality.
+ Assumption 4 (PL condition) . 
+ For some $0 
+ $\tfrac{1}{2}\left\|\nabla F(x)\right\|^{2}\geq\mu(F(x)-F^{*})\quad\text{for all }x\in\mathbb{R}^{d}.$ 
+ (7) 
+ Assumption 5 (Convexity) . 
+ The objective $F$ has a minimizer $x^{*}$ and satisfies
+ $F(y)\geq F(x)+\left\langle\nabla F(x),y-x\right\rangle\quad\text{for all }x,y\in\mathbb{R}^{d}.$ 
+ (8) 
+ Assumption 6 (Strong convexity) . 
+ The objective $F$ has a minimizer $x^{*}$ and satisfies
+ $F(y)\geq F(x)+\left\langle\nabla F(x),y-x\right\rangle+\tfrac{\lambda}{2}\left\|y-x\right\|^{2}\quad\text{for all }x,y\in\mathbb{R}^{d}.$ 
+ (9) 
+ Strong convexity also implies the PL condition with $\mu=\lambda$ , and the converse does not hold.
+ We initialize at $x_{0}$ , and define $\Delta_{0}=F(x_{0})-F^{*}$ ,
+ $R=\left\|x_{0}-x^{*}\right\|$ and $\kappa=L/\lambda$ when applicable.
+ 4 Convergence under Average Smoothness
+ We first revisit the convergence results under average smoothness (Assumption 3 ). We begin
+with the general nonconvex objectives, then use the PL condition to obtain the function-gap guarantee.
+ 4.1 Nonconvex Objectives
+ For the STORM algorithm, the estimator $d_{t}$ tracks the true function gradient $\nabla F(x_{t})$ , and we define
+ $q_{t}=\mathbb{E}\left\|d_{t}-\nabla F(x_{t})\right\|^{2}$ for its mean squared error. Average smoothness bounds
+the movement error by a term proportional to
+ $\mathcal{L}^{2}\eta_{t}^{2}\mathbb{E}\left\|d_{t}\right\|^{2}$ via $\mathbb{E}\left\|g(x_{t+1},\xi_{t+1})-g(x_{t},\xi_{t+1})\right\|^{2}\leq\mathcal{L}^{2}\mathbb{E}\left\|x_{t+1}-x_{t}\right\|^{2}$ . The descent inequality also contains a
+negative term involving $\mathbb{E}\left\|d_{t}\right\|^{2}$ . To cancel them, we
+use the potential
+ $\Psi_{t}=\mathbb{E}[F(x_{t})-F^{*}]+\eta q_{t}/(2a_{t})$ to obtain
+ $\Psi_{t+1}-\Psi_{t}\leq-\frac{\eta}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}+\eta a_{t+1}\sigma^{2}.$ 
+ The sum of $a_{t+1}=(t+3)^{-2/3}$ is $O(T^{1/3})$ , which leads
+to the following bound.
+ Theorem 1 . 
+ Under Assumptions 1 , 2 , and 3 ,
+setting
+ $\eta_{t}=\eta=\frac{1}{2\mathcal{L}(T+2)^{1/3}}$ , $a_{t}=(t+2)^{-2/3}$ , we have the following guarantee 
+ $\displaystyle\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq{}$ 
+ $\displaystyle\frac{4\mathcal{L}\Delta_{0}(T+2)^{1/3}}{T}+\frac{2^{2/3}\sigma^{2}}{T}+\frac{6\sigma^{2}}{T}\bigl((T+2)^{1/3}-2^{1/3}\bigr).$ 
+ (10) 
+ For $I$ uniform on $\{0,\ldots,T-1\}$ and independent of the trajectory, 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|=O(\sqrt{\mathcal{L}\Delta_{0}+\sigma^{2}}\,T^{-1/3}).$ 
+ When
+ $\sigma=0$ , the alternative choice $\eta=1/(4\mathcal{L})$ and $a_{t}=1/4$ 
+gives 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|=O(\sqrt{\mathcal{L}\Delta_{0}}/\sqrt{T}).$ 
+ Remark.
+ Theorem 1 gives an $O(T^{-1/3})$ rate and
+the corresponding gradient complexity is $O(\varepsilon^{-3})$ , matching the lower bound for nonconvex objectives with average smoothness
+ ( Arjevani et al., 2023 ) .
+The theorem removes the logarithmic factor in the original STORM
+guarantee ( Cutkosky and Orabona, 2019 ) and avoids using a large initial batch on the order of $\mathcal{O}(T^{1/3})$ ( Jiang et al., 2024 ) .
+ 4.2 Objectives Satisfying the PL Condition
+ The PL inequality converts the negative gradient-norm term in the
+descent bound into a decrease proportional to the current function
+gap, i.e., $-\left\|\nabla F(x_{t})\right\|^{2}\leq-2\mu(F(x_{t})-F^{*})$ . In this case, we set the potential
+ $V_{t}=\mathbb{E}[F(x_{t})-F^{*}]+q_{t}/\mu$ and couple the parameters through
+ $a_{t+1}=\mu\eta_{t}$ . The descent and tracking inequalities will then give
+ $V_{t+1}\leq(1-\mu\eta_{t})V_{t}+2\mu\eta_{t}^{2}\sigma^{2}\quad\text{when }\eta_{t}\leq\mu/(8\mathcal{L}^{2}).$ 
+ (11) 
+ Then, we can prove the following theorem under the PL condition.
+ Theorem 2 . 
+ (Harmonic schedule) Under Assumptions 1 – 4 , for
+ $s\geq 16(\mathcal{L}/\mu)^{2}$ , set $\eta_{t}=\frac{2}{\mu(t+s)}$ , $a_{t+1}=\frac{2}{t+s}$ .
+For every integer $T\geq 0$ , the last iterate satisfies 
+ $\mathbb{E}[F(x_{T})-F^{*}]\leq\left(\frac{s}{T+s}\right)^{2}\left(\Delta_{0}+\frac{\sigma^{2}}{\mu}\right)+\frac{8\sigma^{2}}{\mu(T+s)}.$ 
+ (12) 
+ (Two-phase schedule) Alternatively, let $m=\lfloor T/2\rfloor$ and use 
+ (13) 
+ Without resetting either state, this gives 
+ $\mathbb{E}[F(x_{T})-F^{*}]\leq e^{-2m/s}\left(\Delta_{0}+\frac{\sigma^{2}}{\mu}\right)+\frac{24\sigma^{2}}{\mu(T+2s)}.$ 
+ (14) 
+ Remark.
+ The first hyperparameter schedule gives quadratic decay of the initialization
+term and the stochastic order $\sigma^{2}/(\mu T)$ . Then,
+the alternative two-phase schedule first reduces the initial error geometrically
+and then decreases the stepsize to reduce the stochastic error.
+It carries $(x_{t},d_{t})$ between phases without restarting and introduces no extra non-constant factor in the leading stochastic term.
+ The dominant order $O(1/(\mu T))$ is unimprovable, since lower bounds for strongly convex functions also hold for PL objectives
+ ( Agarwal et al., 2012 ) . One important feature of our results is that the same estimator runs through both phases with one
+sample per step, and the rate is for the last iterate.
+ Core of the analysis.
+ We have already proved $V_{t+1}\leq(1-\mu\eta_{t})V_{t}+2\mu\eta_{t}^{2}\sigma^{2}$ in the previous analysis. When using $\mu\eta_{t}=2/(s+t)$ , we have:
+ $\prod_{j=k+1}^{T-1}\left(1-\frac{2}{j+s}\right)=\frac{(k+s-1)(k+s)}{(T+s-2)(T+s-1)}.$ 
+ The initial error is thus multiplied by
+ $O(s^{2}/(T+s)^{2})$ , while each noise term’s $(k+s)^{-2}$ factor
+is canceled, up to constants, by its product weight $(k+s-1)(k+s)$ . Their sum gives
+ $O(\sigma^{2}/[\mu(T+s)])$ . In the first phase of the alternative
+schedule, by using a constant learning rate $\mu\eta_{t}=2/s$ , the inequality $(1-2/s)^{m}\leq e^{-2m/s}$ gives exponential decay.
+ 5 Convergence without Average Smoothness
+ Without the average smoothness, nearby query points may not
+have nearby stochastic gradients. The main difficulty is the
+conditional bias of the estimator $d_{t}$ . Denote $e_{t}=d_{t}-\nabla F(x_{t})$ . We
+separate this inherited error from a centered increment $\nu_{t}$ via
+ $e_{t}=\beta e_{t-1}+\nu_{t}$ .
+Bounded variance can control $\mathbb{E}\left\|e_{t}\right\|^{2}$ , but this alone would leave a nonvanishing term in the usual descent inequality.
+ We handle the inherited error in two ways. For nonconvex objectives,
+we shift the iterate by a multiple of $e_{t-1}$ , so that the resulting
+recursion contains only the centered noise. Standard smoothness then
+controls the difference between the two gradient evaluation points.
+For convex objectives, we compare STORM with an auxiliary
+sequence driven by the same $\nu_{t}$ . The noise then cancels in their
+difference, which can be controlled by nonexpansiveness, or by
+contraction under strong convexity.
+ 5.1 Nonconvex Objectives
+ The faster convergence guarantee in Theorem 1 
+uses the average smoothness condition. Without it, we show that STORM can still attain the optimal
+ $O(T^{-1/4})$ rate with standard smoothness.
+ Theorem 3 . 
+ Under Assumptions 1 and 2 , fixing any $\beta\in(0,1)$ and setting
+ $a_{t+1}=1-\beta$ and $0 
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{2\Delta_{0}}{\eta T}+\frac{1+\beta}{(1-\beta)^{3}}L\eta\sigma^{2}.$ 
+ (15) 
+ When $\Delta_{0},\sigma>0$ , choose
+ $\eta=\min\{1/(2L),\sqrt{\Delta_{0}/(6L\sigma^{2}T)}\}$ and $0 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|=\mathcal{O}\left(\sqrt{L\Delta_{0}}\,T^{-1/2}+(L\Delta_{0}\sigma^{2})^{1/4}\,T^{-1/4}\right).$ 
+ (16) 
+ When
+ $\sigma=0$ , the alternative choice $\eta=1/(2L)$ and $0 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|=O(\sqrt{L\Delta_{0}}/\sqrt{T}).$ 
+ Remark.
+ When $\sigma>0$ , the $O(T^{-1/4})$ rate matches SGD
+ ( Ghadimi and Lan, 2013 ) and is optimal under standard smoothness ( Arjevani et al., 2023 ) . The theorem also allows any fixed
+ $\beta\in(0,1/2]$ .
+ Core of the analysis.
+ Define the estimation error
+ $e_{t}=d_{t}-\nabla F(x_{t})$ and $e_{-1}=0$ . The error obeys
+ $e_{t}=\beta e_{t-1}+\nu_{t}$ , with $\nu_{t}=g(x_{t},\xi_{t})-\nabla F(x_{t})-\beta\bigl(g(x_{t-1},\xi_{t})-\nabla F(x_{t-1})\bigr)$ and $\nu_{0}=e_{0}$ . Note that $\nu_{t}$ has conditional mean
+zero and second moment at most $(1+\beta)^{2}\sigma^{2}$ . Although
+ $e_{t}$ itself is conditionally biased, we can define the auxiliary iterations
+ $z_{t}=x_{t}-\eta\beta e_{t-1}/(1-\beta)$ which satisfy
+ $z_{t+1}=z_{t}-\eta\nabla F(x_{t})-\frac{\eta}{1-\beta}\nu_{t}.$ 
+ This removes the inherited error from the update.
+Standard smoothness controls the difference between
+ $\nabla F(x_{t})$ and $\nabla F(z_{t})$ , such that $\left\|\nabla F(x_{t})-\nabla F(z_{t})\right\|^{2}\leq L^{2}\left\|x_{t}-z_{t}\right\|^{2}\leq\frac{L^{2}\eta^{2}\beta^{2}}{(1-\beta)^{2}}\left\|e_{t-1}\right\|^{2}$ . The shift thus has expected squared size $O(\eta^{2}\sigma^{2})$ for fixed $\beta$ . After deriving a descent argument, we can establish the bound ( 15 ). This argument uses the
+smoothness of $F$ only, and it never bounds a difference of sampled
+gradients by the distance between the query points.
+ 5.2 Convex Objectives
+ We now use convexity to obtain function-gap guarantees without the
+average smoothness assumption. The key observation is that standard
+smoothness and convexity already provide useful stability
+properties for the objective gradient map. These properties
+allow us to compare STORM with a carefully designed auxiliary sequence, even when average smoothness is not assumed.
+ Lemma 4 . 
+ Under Assumptions 1 and 5 ,
+for every $0\leq\eta\leq 1/L$ and all $x,y\in\mathbb{R}^{d}$ , 
+ $\left\|x-\eta\nabla F(x)-y+\eta\nabla F(y)\right\|\leq\left\|x-y\right\|.$ 
+ (17) 
+ If strong convexity (Assumption 6 ) also holds, then 
+ $\left\|x-\eta\nabla F(x)-y+\eta\nabla F(y)\right\|\leq(1-\lambda\eta)\left\|x-y\right\|.$ 
+ (18) 
+ Under Assumption 1 alone, even without convexity, we have 
+ $\displaystyle\left\|\nabla F(y)\right\|^{2}$ 
+ $\displaystyle\leq 2L(F(y)-F^{*}),$ 
+ (19) 
+ $\displaystyle F(x)-F^{*}$ 
+ $\displaystyle\leq 2(F(y)-F^{*})+L\left\|x-y\right\|^{2}.$ 
+ (20) 
+ Remark.
+ Inequality ( 17 ) shows that a gradient
+step would not increase the distance between two points.
+Under strong convexity, ( 18 ) can further give a contraction.
+Both statements concern the exact gradient $\nabla F$ and therefore require no regularity of individual stochastic gradients, avoiding the requirement of average smoothness.
+Once the distance between two trajectories is controlled, the inequality
+( 20 ) transfers a function-gap guarantee
+from one trajectory to the other.
+ Comparison with an auxiliary sequence.
+ Let $\beta=1-a\in[0,1/2]$ . We compare STORM with an auxiliary sequence that uses exact objective gradients
+and the centered increments. This sequence is only used for analysis and requires no real computation.
+ Lemma 5 . 
+ Under Assumptions 1 , 2 , and
+ 5 , let $0\leq\beta\leq 1/2$ and choose $0 
+ $\nu_{t}=\zeta(x_{t},\xi_{t})-\beta\zeta(x_{t-1},\xi_{t}),\qquad e_{t}=\beta e_{t-1}+\nu_{t},\qquad\zeta(x,\xi)=g(x,\xi)-\nabla F(x).$ 
+ (21) 
+ For $\mathcal{F}_{t}=\sigma(\xi_{0},\ldots,\xi_{t-1})$ , we have 
+ $\mathbb{E}[\nu_{t}\mid\mathcal{F}_{t}]=0,\qquad\mathbb{E}[\left\|\nu_{t}\right\|^{2}\mid\mathcal{F}_{t}]\leq S^{2}:=(1+\beta)^{2}\sigma^{2},\qquad q_{t}\leq 3\sigma^{2}.$ 
+ (22) 
+ The auxiliary sequence $y_{0}=x_{0}$ , 
+ $y_{t+1}=y_{t}-\eta_{t}\bigl(\nabla F(y_{t})+\nu_{t}\bigr)$ 
+ satisfies 
+ $\sqrt{\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}}\leq\sqrt{3}\beta\sigma\sum_{j 
+ (23) 
+ Under Assumption 6 , this improves to 
+ $\sqrt{\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}}\leq\sqrt{3}\beta\sigma/\lambda.$ 
+ (24) 
+ Core of the analysis.
+ To see why the comparison works, subtract the two updates:
+ $x_{t+1}-y_{t+1}=\bigl(x_{t}-\eta_{t}\nabla F(x_{t})\bigr)-\bigl(y_{t}-\eta_{t}\nabla F(y_{t})\bigr)-\eta_{t}\beta e_{t-1}.$ 
+ The shared increment $\nu_{t}$ cancels.
+Applying ( 17 ) and then the triangle
+inequality in $L^{2}$ gives
+ $\sqrt{\mathbb{E}\left\|x_{t+1}-y_{t+1}\right\|^{2}}\leq\sqrt{\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}}+\eta_{t}\beta\sqrt{q_{t-1}}.$ 
+ Since $x_{0}=y_{0}$ and $q_{t-1}\leq 3\sigma^{2}$ , summation gives
+( 23 ).
+Under strong convexity, inequality ( 18 ) instead
+multiplies the first term on the right by
+ $1-\lambda\eta_{t}$ . With
+ $\mathbb{E}\left\|e_{t}\right\|^{2}\leq 3\sigma^{2}$ , this gives
+ $\sqrt{\mathbb{E}\left\|x_{t+1}-y_{t+1}\right\|^{2}}\leq(1-\lambda\eta_{t})\sqrt{\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}}+\sqrt{3}\,\beta\sigma\eta_{t},$ 
+ which further yields ( 24 ).
+ Remark.
+ Thus the inherited estimator error affects the trajectory
+comparison through the smaller quantity $\beta e_{t-1}$ .
+Combining ( 23 ) with
+( 20 ) gives
+ $\mathbb{E}[F(x_{t})-F^{*}]\leq 2\mathbb{E}[F(y_{t})-F^{*}]+3L\beta^{2}\sigma^{2}\left(\sum_{j 
+ Choosing $\beta=O(1/(T+1))$ makes this additional error
+compatible with the desired rates.
+ Stepsize blocks.
+ Note that we also want to derive the rates for the last iterate output, and an average guarantee does not by itself control $F(x_{T})$ .
+We therefore arrange the stepsizes so that a good value in an early
+block controls values in the following shorter block. The blocks
+shrink geometrically toward $T$ , and the stepsize is halved at each
+boundary. Larger early steps reduce the initial error and smaller late
+steps limit the fresh noise injected near the returned point.
+For any integer $T\geq 1$ , define
+ $m=\lfloor\log_{2}(T+1)\rfloor,\qquad U_{i}=T+1-\left\lfloor(T+1)/2^{i}\right\rfloor\ (0\leq i\leq m),\qquad U_{m+1}=T+1.$ 
+ (25) 
+ Each block $\{U_{i},\ldots,U_{i+1}-1\}$ is nonempty,
+and the last is
+ $\{T\}$ . For example, when $T=12$ , their lengths are $7,3,2,1$ .
+The construction partitions the $T+1$ output, and it does not
+restart the estimator.
+To see how the blocks are compared, write
+ $h_{t}=\nabla F(y_{t})+\nu_{t}$ and fix indices $p\leq q$ .
+Expanding $\left\|y_{t+1}-y_{p}\right\|^{2}$ , taking expectations, and then using $\left\langle\nabla F(y_{t}),y_{t}-y_{p}\right\rangle\geq F(y_{t})-F(y_{p})$ 
+gives
+ $2\sum_{t=p}^{q}\eta_{t}\mathbb{E}[F(y_{t})-F(y_{p})]\leq\sum_{t=p}^{q}\eta_{t}^{2}\mathbb{E}\left\|h_{t}\right\|^{2}.$ 
+ (26) 
+ Lemma 4 is useful again here.
+Conditional centering and ( 19 ) imply
+ $\mathbb{E}\left\|h_{t}\right\|^{2}=\mathbb{E}\left\|\nabla F(y_{t})\right\|^{2}+\mathbb{E}\left\|\nu_{t}\right\|^{2}\leq 2L\,\mathbb{E}[F(y_{t})-F^{*}]+S^{2}.$ 
+ Thus the right-hand side of ( 26 )
+can be controlled by function errors and the noise variance.
+The stepsize restriction allows the function-error terms to
+be absorbed into the resulting estimates, without assuming
+globally bounded stochastic gradients.
+ We then compare successive blocks using a reference point
+from the preceding block.
+Halving the stepsizes makes the accumulated comparison errors
+summable, and the final singleton block gives a last-iterate
+guarantee.
+ Theorem 6 . 
+ Under Assumptions 1 , 2 , and 5 , for every integer $T\geq 1$ , choose 
+ $\beta=\frac{1}{T+2},\qquad\eta_{t}=2^{-i}\eta\quad(U_{i}\leq t 
+ (27) 
+ Define
+ $\bar{x}_{T}^{\eta}=\sum_{t=0}^{T}\eta_{t}x_{t}/\sum_{t=0}^{T}\eta_{t}$ . Then 
+ $\mathbb{E}[F(\bar{x}_{T}^{\eta})-F^{*}]\leq\frac{4R^{2}}{\eta(T+1)}+5\eta\sigma^{2}.$ 
+ (28) 
+ Both $z_{T}=x_{T}$ and $z_{T}=(T+1)^{-1}\sum_{t=0}^{T}x_{t}$ obey 
+ $\mathbb{E}[F(z_{T})-F^{*}]\leq\frac{8\mathrm{e}R^{2}}{\eta(T+1)}+82\mathrm{e}\eta\sigma^{2}.$ 
+ (29) 
+ For $R,\sigma>0$ , take
+ $\eta=\min\{1/(32L),\,2R/(\sqrt{41}\sigma\sqrt{T+1})\}$ .
+All three outputs $\widehat{x}_{T}$ satisfy 
+ $\mathbb{E}[F(\widehat{x}_{T})-F^{*}]\leq\mathcal{O}\left(\frac{LR^{2}}{T}+\frac{\sigma R}{\sqrt{T}}\right).$ 
+ (30) 
+ If $\sigma=0$ , use $\eta=1/(32L)$ to obtain 
+ $\mathbb{E}[F(\widehat{x}_{T})-F^{*}]\leq\mathcal{O}\left(\frac{LR^{2}}{T}\right).$ 
+ (31) 
+ Remark.
+ The dominant term $\sigma R/\sqrt{T}$ matches the SGD guarantees and the lower bound for convex objectives
+ ( Agarwal et al., 2012 ; Stich, 2019 ; Liu and Zhou, 2024 ) . Compared with previous analysis of STORM, our rates remove the additional average smoothness assumption. Also note that we also establish a last-iterate bound in our analysis.
+ 5.3 Strongly Convex Objectives
+ Under $\lambda$ -strong convexity, the companion distance contracts.
+With $\beta=1/(T+s+1)$ , the function-gap comparison
+takes the form
+ $\mathbb{E}[F(x_{t})-F^{*}]\leq 2\mathbb{E}[F(y_{t})-F^{*}]+\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}.$ 
+ Thus the error introduced by transferring the companion guarantee
+back to STORM can be absorbed into the desired
+ $O(\sigma^{2}/(\lambda T))$ stochastic term.
+For a carefully designed weighted mean, this permits exact
+cancellation of consecutive distance terms. For the last point, we
+combine this contraction with the rounded blocks in
+( 25 ). The two results use different schedules.
+ Theorem 7 (Weighted mean) . 
+ Under Assumptions 1 , 2 , and 6 , for any $s\geq 4\kappa$ , use 
+ $\beta=\frac{1}{T+s+1},\qquad\eta_{t}=\frac{2}{\lambda(t+s+1)},\qquad\bar{x}_{T}=\frac{2\sum_{t=0}^{T}(t+s)x_{t}}{(T+1)(T+2s)}.$ 
+ (32) 
+ Then, we can ensure that 
+ $\mathbb{E}[F(\bar{x}_{T})-F^{*}]\leq\frac{2\lambda s(s-1)R^{2}}{(T+1)(T+2s)}+\frac{19\sigma^{2}}{\lambda(T+s+1)}.$ 
+ (33) 
+ The same bound holds for $x_{I}$ , where $I$ has probabilities proportional to $t+s$ . 
+ Next, we present the guarantee for the last iterate below.
+ Theorem 8 (Last iterate) . 
+ Under Assumptions 1 , 2 , and 6 ,
+let $T\geq 1$ be any integer, $s\geq 4\kappa^{2}$ , and $\beta=1/(T+s+1)$ .
+For the rounded blocks ( 25 ), use 
+ $\eta_{t}=2^{-i}\frac{2}{\lambda(t+s+1)}\quad(U_{i}\leq t 
+ (34) 
+ After $T$ primal updates, the last iterate satisfies 
+ $\displaystyle\mathbb{E}[F(x_{T})-F^{*}]$ 
+ $\displaystyle\leq\frac{288\lambda(s+1)^{2}R^{2}}{(T+1)^{2}}+\frac{2451\sigma^{2}}{\lambda(T+1)}.$ 
+ (35) 
+ Remark.
+ The dominant term $O(\sigma^{2}/(\lambda T))$ of the last iterate bound has the same order as the mean, which is optimal for strongly convex functions
+ ( Agarwal et al., 2012 ) .
+Compared with previous results, we remove the average smoothness assumption and establish a last-iterate bound.
+ 6 Numerical Experiments
+ We study three questions suggested by the theory: how the objective
+geometry affects convergence, whether STORM converges when average
+smoothness fails, and how the prescribed schedules behave for averaged
+and last-iterate outputs. Our contribution is an analysis of the original
+STORM algorithm and its empirical performance has already been studied
+extensively in previous literature,
+so we focus on experiments that isolate these questions
+instead of repeating a broad benchmark evaluation.
+ Experimental setup.
+ We use the following four objectives with known minima and exact
+gradients. An orthogonal change of coordinates $z=Qx$ gives
+ $\displaystyle F_{\rm nc}(x)$ 
+ $\displaystyle=\sum_{i=1}^{10}\left(1-\cos z_{i}+0.05z_{i}^{2}\right),$ 
+ $\displaystyle F_{\rm PL}(x)$ 
+ $\displaystyle=\frac{1}{2}\sum_{i=1}^{10}(z_{i}+2\tanh z_{i})^{2},$ 
+ $\displaystyle F_{\rm cv}(x)$ 
+ $\displaystyle=\frac{1}{2}\sum_{i=1}^{10}\left(z_{i}^{2}-\log(1+z_{i}^{2})\right),$ 
+ $\displaystyle F_{\rm sc}(x)$ 
+ $\displaystyle=\frac{1}{2}\sum_{i=1}^{10}h_{i}z_{i}^{2},$ 
+ where $h_{i}$ are equally spaced in $[1,4]$ .
+For the average-smooth, we add independent standard Gaussian
+noise to the coordinates of the gradient. For the experiments without
+average smoothness, we use
+ $g(x;J,\phi)=\nabla F(x)+Q^{\top}\zeta(Qx;J,\phi),\qquad\zeta_{i}(z;J,\phi)=\sqrt{2}\sin(2^{J_{i}}z_{i}+\phi_{i}),$ 
+ (36) 
+ where $\Pr(J_{i}=j)=2^{-j-1}$ and $\phi_{i}$ is uniform on $[0,2\pi]$ . The oracle is unbiased and has
+ $\sigma^{2}=10$ , but admits no finite average-smoothness constant.
+We run $256$ independent trials.
+All parameters are chosen from the stated analytical constants, without
+tuning hyperparameters.
+ Nonconvex and PL objectives under average smoothness.
+ For $F_{\rm nc}$ , we use the exact schedule in
+Theorem 1 and measure
+ $T^{-1}\sum_{t=0}^{T-1}\|\nabla F(x_{t})\|^{2}$ , whose
+reference order is $T^{-2/3}$ . For $F_{\rm PL}$ , we compare the
+harmonic and two-phase schedules of Theorem 2 and report $F(x_{T})-F^{*}$ .
+ Figure 1: Convergence under average smoothness (log–log scales). 
+ Figure 1 (a) is roughly consistent with the
+ $T^{-2/3}$ reference. On the PL problem, the two-phase schedule gives a smaller
+gap at smaller budgets, whereas the harmonic schedule
+becomes better at the larger budgets.
+ Nonconvex objectives without average smoothness.
+ For $F_{\rm nc}$ , we replace the Gaussian oracle
+by ( 36 ). We test $\beta\in\{0.1,0.3,0.5\}$ with
+the common stepsize prescribed in
+Theorem 3 .
+SGD uses the same stepsize as a reference. We measure the
+average squared gradient. Here, the theoretical stochastic
+order is $T^{-1/2}$ , corresponding to $T^{-1/4}$ in gradient norm.
+In Figure 2 (a), increasing $T$ by a
+factor of $85$ reduces the squared-gradient criterion by about
+ $9.1$ for each tested correction coefficient, close to
+ $\sqrt{85}\approx 9.2$ . The three fixed- $\beta$ curves and SGD
+are nearly indistinguishable at this scale.
+ Averaged and last iterates without average smoothness.
+ For $F_{\rm cv}$ , we use the rounded block schedule in
+Theorem 6 and evaluate the last iterate, the uniform
+mean, and the stepsize-weighted mean of the same trajectory.
+For $F_{\rm sc}$ , we run the two schedules in
+Theorems 7 and 8 
+separately.
+ Figure 2: Convergence without average smoothness (log–log scales). 
+ In Figure 2 (b), the uniform mean
+is slightly better than the last iterate at the largest
+tested budget.
+For strong convexity, both curves in
+Figure 2 (c) follow the $T^{-1}$ 
+reference closely at larger budgets.
+ Also note that our theoretical guarantees are worst-case upper bounds. A particular objective can converge faster than the worst-case rate in practice.
+ 7 Conclusion
+ In this paper, we studied the convergence of STORM under different
+objective geometries and smoothness assumptions.
+Under average smoothness, we provided a direct analysis of the
+logarithm-free nonconvex rate and established a last-iterate
+guarantee with an optimal stochastic term under the PL condition.
+Under standard smoothness alone, STORM matches the nonconvex
+SGD rate and attains optimal stochastic orders for both averaged
+and last iterates in the convex and strongly convex settings.
+These guarantees follow from different parameter choices within
+the same STORM recursion, with a single initial sample and a
+constant number of gradient evaluations per iteration.
+ References
+ Agarwal et al. (2012) 
+ A. Agarwal, P. L. Bartlett, P. Ravikumar, and M. J. Wainwright 
+ Information-theoretic lower bounds on the oracle complexity of stochastic convex optimization .
+ IEEE Transactions on Information Theory 58 ( 5 ), pp. 3235–3249 .
+ Cited by: §4.2 ,
+ §5.2 ,
+ §5.3 .
+ Arjevani et al. (2023) 
+ Y. Arjevani, Y. Carmon, J. C. Duchi, D. J. Foster, N. Srebro, and B. Woodworth 
+ Lower bounds for non-convex stochastic optimization .
+ Mathematical Programming 199 , pp. 165–214 .
+ Cited by: §1 ,
+ §4.1 ,
+ §5.1 .
+ Cutkosky and Orabona (2019) 
+ A. Cutkosky and F. Orabona 
+ Momentum-based variance reduction in non-convex SGD .
+ In Advances in Neural Information Processing Systems ,
+ Cited by: §1 ,
+ §2 ,
+ §4.1 ,
+ footnote 1 .
+ Dahan and Levy (2025) 
+ T. Dahan and K. Y. Levy 
+ Do stochastic, feel noiseless: stable stochastic optimization via a double momentum mechanism .
+ In Proceedings of the 13th International Conference
+on Learning Representations ,
+ Cited by: §2 .
+ Fang et al. (2018) 
+ C. Fang, C. J. Li, Z. Lin, and T. Zhang 
+ SPIDER: near-optimal non-convex optimization via stochastic path-integrated differential estimator .
+ In Advances in Neural Information Processing Systems ,
+ Cited by: §1 ,
+ §2 .
+ Ghadimi and Lan (2013) 
+ S. Ghadimi and G. Lan 
+ Stochastic first- and zeroth-order methods for nonconvex stochastic programming .
+ SIAM Journal on Optimization 23 ( 4 ), pp. 2341–2368 .
+ Cited by: §1 ,
+ §5.1 .
+ Jiang et al. (2022) 
+ W. Jiang, B. Wang, Y. Wang, L. Zhang, and T. Yang 
+ Optimal algorithms for stochastic multi-level compositional optimization .
+ In Proceedings of the 39th International Conference on Machine Learning ,
+ pp. 10195–10216 .
+ Cited by: §2 .
+ Jiang et al. (2024) 
+ W. Jiang, S. Yang, Y. Wang, and L. Zhang 
+ Adaptive variance reduction for stochastic optimization under weaker assumptions .
+ In Advances in Neural Information Processing Systems ,
+ Cited by: §2 ,
+ §4.1 .
+ Levy et al. (2021) 
+ K. Levy, A. Kavis, and V. Cevher 
+ STORM+: fully adaptive SGD with recursive momentum for nonconvex optimization .
+ In Advances in Neural Information Processing Systems ,
+ Cited by: §2 .
+ Li et al. (2021) 
+ Z. Li, H. Bao, X. Zhang, and P. Richtárik 
+ PAGE: a simple and optimal probabilistic gradient estimator for nonconvex optimization .
+ In Proceedings of the 38th International Conference on Machine Learning ,
+ pp. 6286–6295 .
+ Cited by: §2 .
+ Liu and Zhou (2024) 
+ Z. Liu and Z. Zhou 
+ Revisiting the last-iterate convergence of stochastic gradient methods .
+ In The Twelfth International Conference on Learning Representations ,
+ External Links: Link 
+ Cited by: §5.2 .
+ Nguyen et al. (2017) 
+ L. M. Nguyen, J. Liu, K. Scheinberg, and M. Takáč 
+ SARAH: a novel method for machine learning problems using stochastic recursive gradient .
+ In Proceedings of the 34th International Conference on Machine Learning ,
+ pp. 2613–2621 .
+ Cited by: §2 .
+ Qi et al. (2021) 
+ Q. Qi, Z. Guo, Y. Xu, R. Jin, and T. Yang 
+ An online method for a class of distributionally robust optimization with non-convex objectives .
+ In Advances in Neural Information Processing Systems ,
+ Cited by: §2 .
+ Stich (2019) 
+ S. U. Stich 
+ Unified optimal analysis of the (Stochastic) gradient method .
+ arXiv preprint arXiv:1907.04232 .
+ Cited by: §5.2 .
+ Zhang et al. (2020) 
+ M. Zhang, Z. Shen, A. Mokhtari, H. Hassani, and A. Karbasi 
+ One sample stochastic Frank–Wolfe .
+ In Proceedings of the 23rd International Conference
+on Artificial Intelligence and Statistics ,
+ pp. 4012–4023 .
+ Cited by: §2 .
+ Appendix A Proof of Theorem 1 
+ We prove Theorem 1 by combining the descent
+inequality with a bound on the gradient estimation error.
+Let $\mathcal{F}_{t}=\sigma(\xi_{0},\ldots,\xi_{t-1})$ . Define
+ $e_{t}=d_{t}-\nabla F(x_{t}),\qquad q_{t}=\mathbb{E}\left\|e_{t}\right\|^{2},\qquad\Delta_{t}=\mathbb{E}[F(x_{t})-F^{*}].$ 
+ Thus $\Delta_{0}=F(x_{0})-F^{*}$ and $q_{0}\leq\sigma^{2}$ .
+ Lemma 9 . 
+ Under Assumptions 1 and 2 ,
+for every deterministic $\eta_{t}\geq 0$ , the primal update satisfies 
+ $\displaystyle\Delta_{t+1}-\Delta_{t}\leq{}$ 
+ $\displaystyle-\frac{\eta_{t}}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}-\frac{\eta_{t}(1-L\eta_{t})}{2}\mathbb{E}\left\|d_{t}\right\|^{2}+\frac{\eta_{t}}{2}q_{t}.$ 
+ (37) 
+ If Assumption 3 also holds and
+ $0\leq a_{t+1}\leq 1$ , then 
+ $q_{t+1}\leq(1-a_{t+1})^{2}q_{t}+2a_{t+1}^{2}\sigma^{2}+2\mathcal{L}^{2}\eta_{t}^{2}\mathbb{E}\left\|d_{t}\right\|^{2}.$ 
+ (38) 
+ Proof.
+ Smoothness and $x_{t+1}=x_{t}-\eta_{t}d_{t}$ give 
+ $F(x_{t+1})\leq F(x_{t})-\eta_{t}\left\langle\nabla F(x_{t}),d_{t}\right\rangle+\frac{L\eta_{t}^{2}}{2}\left\|d_{t}\right\|^{2}.$ 
+ By the definition of $e_{t}$ , 
+ $\left\|e_{t}\right\|^{2}=\left\|d_{t}\right\|^{2}+\left\|\nabla F(x_{t})\right\|^{2}-2\left\langle\nabla F(x_{t}),d_{t}\right\rangle.$ 
+ Solving this identity for the inner product and substituting yields 
+ $\displaystyle F(x_{t+1})-F(x_{t})$ 
+ $\displaystyle\leq-\frac{\eta_{t}}{2}\left\|\nabla F(x_{t})\right\|^{2}-\frac{\eta_{t}}{2}\left\|d_{t}\right\|^{2}+\frac{\eta_{t}}{2}\left\|e_{t}\right\|^{2}+\frac{L\eta_{t}^{2}}{2}\left\|d_{t}\right\|^{2}$ 
+ $\displaystyle=-\frac{\eta_{t}}{2}\left\|\nabla F(x_{t})\right\|^{2}-\frac{\eta_{t}(1-L\eta_{t})}{2}\left\|d_{t}\right\|^{2}+\frac{\eta_{t}}{2}\left\|e_{t}\right\|^{2}.$ 
+ Taking expectations proves ( 37 ). 
+ To prove the error recursion, abbreviate $a=a_{t+1}$ and write
+ $\zeta(x,\xi)=g(x,\xi)-\nabla F(x)$ .
+Subtracting $\nabla F(x_{t+1})$ from the estimator update gives the
+exact identity 
+ $\displaystyle e_{t+1}$ 
+ $\displaystyle=(1-a)e_{t}+\zeta(x_{t+1},\xi_{t+1})-(1-a)\zeta(x_{t},\xi_{t+1})$ 
+ $\displaystyle=(1-a)e_{t}+a\zeta(x_{t+1},\xi_{t+1})+(1-a)\bigl(\zeta(x_{t+1},\xi_{t+1})-\zeta(x_{t},\xi_{t+1})\bigr).$ 
+ Conditional on $\mathcal{F}_{t+1}$ , the fresh-sample terms together have mean
+zero, so their cross term with the fixed $e_{t}$ vanishes. We then use
+ $\left\|u+v\right\|^{2}\leq 2\left\|u\right\|^{2}+2\left\|v\right\|^{2}$ to obtain 
+ $\displaystyle\mathbb{E}[\left\|e_{t+1}\right\|^{2}\mid\mathcal{F}_{t+1}]$ 
+ $\displaystyle\leq(1-a)^{2}\left\|e_{t}\right\|^{2}+2a^{2}\mathbb{E}[\left\|\zeta(x_{t+1},\xi_{t+1})\right\|^{2}\mid\mathcal{F}_{t+1}]$ 
+ $\displaystyle\quad+2(1-a)^{2}\mathbb{E}\bigl[\left\|\zeta(x_{t+1},\xi_{t+1})-\zeta(x_{t},\xi_{t+1})\right\|^{2}\mid\mathcal{F}_{t+1}\bigr].$ 
+ The first conditional noise moment is at most $\sigma^{2}$ by
+( 5 ) and fresh-sample independence. For the second one,
+centering a random vector subtracts the squared norm of its mean: 
+ $\displaystyle\mathbb{E}\bigl[\left\|\zeta(x_{t+1},\xi_{t+1})-\zeta(x_{t},\xi_{t+1})\right\|^{2}\mid\mathcal{F}_{t+1}\bigr]$ 
+ $\displaystyle\quad=\mathbb{E}\bigl[\left\|g(x_{t+1},\xi_{t+1})-g(x_{t},\xi_{t+1})\right\|^{2}\mid\mathcal{F}_{t+1}\bigr]-\left\|\nabla F(x_{t+1})-\nabla F(x_{t})\right\|^{2}$ 
+ $\displaystyle\quad\leq\mathcal{L}^{2}\left\|x_{t+1}-x_{t}\right\|^{2}=\mathcal{L}^{2}\eta_{t}^{2}\left\|d_{t}\right\|^{2}.$ 
+ The inequality uses ( 6 ). Substitution gives 
+ $\mathbb{E}[\left\|e_{t+1}\right\|^{2}\mid\mathcal{F}_{t+1}]\leq(1-a)^{2}\left\|e_{t}\right\|^{2}+2a^{2}\sigma^{2}+2(1-a)^{2}\mathcal{L}^{2}\eta_{t}^{2}\left\|d_{t}\right\|^{2}.$ 
+ Finally, $(1-a)^{2}\leq 1$ gives
+( 38 ).
+∎ 
+ Lemma 10 . 
+ Under Assumptions 1 , 2 , and
+ 3 , let
+ $\eta_{t}=\eta>0$ and $L\eta\leq 1/2$ .
+Choose an auxiliary weight $a_{0}>0$ and deterministic coefficients satisfying 
+ $0 
+ With 
+ $\Psi_{t}=\Delta_{t}+\frac{\eta}{2a_{t}}q_{t},$ 
+ one has 
+ $\Psi_{t+1}\leq\Psi_{t}-\frac{\eta}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}+\eta a_{t+1}\sigma^{2}.$ 
+ (39) 
+ Proof.
+ Multiply ( 38 ) by $\eta/(2a_{t+1})$ and add it to
+( 37 ). This gives 
+ $\displaystyle\Psi_{t+1}$ 
+ $\displaystyle\leq\Delta_{t}-\frac{\eta}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}+\left(\frac{\eta}{2}+\frac{\eta(1-a_{t+1})^{2}}{2a_{t+1}}\right)q_{t}$ 
+ $\displaystyle\quad+\left(-\frac{\eta(1-L\eta)}{2}+\frac{\mathcal{L}^{2}\eta^{3}}{a_{t+1}}\right)\mathbb{E}\left\|d_{t}\right\|^{2}+\eta a_{t+1}\sigma^{2}.$ 
+ Subtract $\Psi_{t}=\Delta_{t}+\eta q_{t}/(2a_{t})$ .
+The remaining coefficient of $q_{t}$ is 
+ $\displaystyle\frac{\eta}{2}+\frac{\eta(1-a_{t+1})^{2}}{2a_{t+1}}-\frac{\eta}{2a_{t}}$ 
+ $\displaystyle=\frac{\eta}{2}\left(1+a_{t+1}^{-1}-2+a_{t+1}-a_{t}^{-1}\right)$ 
+ $\displaystyle=\frac{\eta}{2}\left(a_{t+1}^{-1}-a_{t}^{-1}-1+a_{t+1}\right)$ 
+ $\displaystyle\leq\frac{\eta}{2}\left(\frac{1}{2}-1+\frac{1}{2}\right)=0.$ 
+ The coefficient of $\mathbb{E}\left\|d_{t}\right\|^{2}$ is also nonpositive: 
+ $-\frac{\eta(1-L\eta)}{2}+\frac{\mathcal{L}^{2}\eta^{3}}{a_{t+1}}\leq-\frac{\eta}{4}+\frac{\mathcal{L}^{2}\eta^{3}}{4\mathcal{L}^{2}\eta^{2}}=0.$ 
+ Dropping these two nonpositive terms proves ( 39 ).
+∎ 
+ Proof of Theorem 1 .
+ Fix an arbitrary integer $T\geq 1$ and use: 
+ $\eta=\frac{1}{2\mathcal{L}(T+2)^{1/3}},\qquad a_{t}=(t+2)^{-2/3}.$ 
+ We first verify the conditions of Lemma 10 for
+ $t=0,\ldots,T-1$ . Since $L\leq\mathcal{L}$ , 
+ $L\eta\leq\frac{1}{2(T+2)^{1/3}}\leq\frac{1}{2}.$ 
+ The mixing sequence decreases, and hence 
+ $a_{t+1}\leq a_{1}=3^{-2/3} 
+ Because $u\mapsto u^{2/3}$ is concave, its unit increments
+decrease as $u$ increases. Therefore 
+ $a_{t+1}^{-1}-a_{t}^{-1}=(t+3)^{2/3}-(t+2)^{2/3}\leq 3^{2/3}-2^{2/3} 
+ Thus, all conditions of Lemma 10 hold.
+Rearrange ( 39 ) and sum over the $T$ steps: 
+ $\displaystyle\frac{\eta}{2}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}$ 
+ $\displaystyle\leq\sum_{t=0}^{T-1}(\Psi_{t}-\Psi_{t+1})+\eta\sigma^{2}\sum_{t=0}^{T-1}a_{t+1}$ 
+ $\displaystyle=\Psi_{0}-\Psi_{T}+\eta\sigma^{2}\sum_{t=0}^{T-1}a_{t+1}$ 
+ $\displaystyle\leq\Delta_{0}+\frac{\eta\sigma^{2}}{2a_{0}}+\eta\sigma^{2}\sum_{t=0}^{T-1}a_{t+1}.$ 
+ Here $\Psi_{T}\geq 0$ because $F(x_{T})\geq F^{*}$ and $q_{T}\geq 0$ ,
+and the initial variance bound gives $q_{0}\leq\sigma^{2}$ .
+Dividing by $\eta T/2$ yields 
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{2\Delta_{0}}{\eta T}+\frac{\sigma^{2}}{a_{0}T}+\frac{2\sigma^{2}}{T}\sum_{t=0}^{T-1}(t+3)^{-2/3}.$ 
+ Since $u^{-2/3}$ is decreasing, integrating over each interval
+ $[t+2,t+3]$ gives 
+ $\displaystyle\sum_{t=0}^{T-1}(t+3)^{-2/3}$ 
+ $\displaystyle\leq\sum_{t=0}^{T-1}\int_{t+2}^{t+3}u^{-2/3}\,du$ 
+ $\displaystyle=\int_{2}^{T+2}u^{-2/3}\,du$ 
+ $\displaystyle=3\bigl((T+2)^{1/3}-2^{1/3}\bigr).$ 
+ Substitute this bound, $\eta^{-1}=2\mathcal{L}(T+2)^{1/3}$ , and
+ $a_{0}^{-1}=2^{2/3}$ to obtain 
+ $\displaystyle\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq{}$ 
+ $\displaystyle\frac{4\mathcal{L}\Delta_{0}(T+2)^{1/3}}{T}+\frac{2^{2/3}\sigma^{2}}{T}+\frac{6\sigma^{2}}{T}\bigl((T+2)^{1/3}-2^{1/3}\bigr),$ 
+ which is ( 10 ). 
+ Finally, let $I$ be uniform on $\{0,\ldots,T-1\}$ and independent of
+the trajectory. Then 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|^{2}=\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}.$ 
+ Cauchy–Schwarz gives
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|\leq(\mathbb{E}\left\|\nabla F(x_{I})\right\|^{2})^{1/2}$ .
+Since $T+2\leq 3T$ for $T\geq 1$ , the displayed second-moment
+bound is $O((\mathcal{L}\Delta_{0}+\sigma^{2})T^{-2/3})$ , proving the
+stated expected-norm rate.
+∎ 
+ The noiseless case. 
+ If $\sigma=0$ , take $\eta=1/(4\mathcal{L})$ and $a_{t}=1/4$ for every
+ $t\geq 0$ , including the potential weight $a_{0}$ .
+Then $L\eta\leq 1/4$ , $a_{t+1}=4\mathcal{L}^{2}\eta^{2}=1/4$ , and
+ $a_{t+1}^{-1}-a_{t}^{-1}=0$ , so the certificate applies.
+Since $q_{0}=0$ and the noise term vanishes, summing it gives
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{2\Delta_{0}}{\eta T}=\frac{8\mathcal{L}\Delta_{0}}{T}.$ 
+ Appendix B Proof of Theorem 2 
+ Proof.
+ Retain the notation
+ $e_{t}=d_{t}-\nabla F(x_{t})$ , $q_{t}=\mathbb{E}\left\|e_{t}\right\|^{2}$ , and
+ $\Delta_{t}=\mathbb{E}[F(x_{t})-F^{*}]$ .
+The potential in this proof has a constant estimator-error weight: 
+ $V_{t}=\Delta_{t}+\frac{q_{t}}{\mu}.$ 
+ Also note that $\Delta_{t}\leq V_{t}$ and
+ $V_{0}\leq\Delta_{0}+\sigma^{2}/\mu$ . 
+ First, consider any one step satisfying 
+ $a_{t+1}=\mu\eta_{t},\qquad 0 
+ Add ( 38 ) divided by $\mu$ to
+( 37 ). The resulting inequality is 
+ $\displaystyle V_{t+1}$ 
+ $\displaystyle\leq\Delta_{t}-\frac{\eta_{t}}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}+\left(\frac{(1-\mu\eta_{t})^{2}}{\mu}+\frac{\eta_{t}}{2}\right)q_{t}$ 
+ $\displaystyle\quad+\left(-\frac{\eta_{t}(1-L\eta_{t})}{2}+\frac{2\mathcal{L}^{2}\eta_{t}^{2}}{\mu}\right)\mathbb{E}\left\|d_{t}\right\|^{2}+2\mu\eta_{t}^{2}\sigma^{2}.$ 
+ By the PL inequality, 
+ $\Delta_{t}-\frac{\eta_{t}}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq(1-\mu\eta_{t})\Delta_{t}.$ 
+ For the coefficient of $q_{t}/\mu$ , direct expansion gives 
+ $\displaystyle(1-\mu\eta_{t})^{2}+\frac{\mu\eta_{t}}{2}$ 
+ $\displaystyle=1-\frac{3}{2}\mu\eta_{t}+(\mu\eta_{t})^{2}$ 
+ $\displaystyle=1-\mu\eta_{t}+\mu\eta_{t}\left(\mu\eta_{t}-\frac{1}{2}\right)$ 
+ $\displaystyle\leq 1-\mu\eta_{t}.$ 
+ Finally, $L\eta_{t}\leq 1/2$ and
+ $\eta_{t}\leq\mu/(8\mathcal{L}^{2})$ imply 
+ $-\frac{\eta_{t}(1-L\eta_{t})}{2}+\frac{2\mathcal{L}^{2}\eta_{t}^{2}}{\mu}\leq-\frac{\eta_{t}}{4}+\eta_{t}\frac{2\mathcal{L}^{2}}{\mu}\frac{\mu}{8\mathcal{L}^{2}}=0.$ 
+ Since $\mathbb{E}\left\|d_{t}\right\|^{2}\geq 0$ , that term can be discarded.
+Combining the other two coefficients gives 
+ $V_{t+1}\leq(1-\mu\eta_{t})V_{t}+2\mu\eta_{t}^{2}\sigma^{2}.$ 
+ (40) 
+ For either schedule in the theorem, the largest stepsize is
+ $2/(\mu s)$ . Since $s\geq 16(\mathcal{L}/\mu)^{2}$ , 
+ $\frac{2}{\mu s}\leq\frac{\mu}{8\mathcal{L}^{2}},\qquad\frac{2}{s}\leq\frac{\mu^{2}}{8\mathcal{L}^{2}}\leq\frac{1}{8},\qquad L\frac{2}{\mu s}\leq\frac{L\mu}{8\mathcal{L}^{2}}\leq\frac{1}{8}.$ 
+ Thus ( 40 ) holds at every step of either
+schedule. In particular, $s\geq 16$ , so the scalar factors used
+below are positive. 
+ The first schedule. 
+Substituting $\eta_{t}=2/[\mu(t+s)]$ into ( 40 ) gives 
+ $V_{t+1}\leq\frac{t+s-2}{t+s}V_{t}+\frac{8\sigma^{2}}{\mu(t+s)^{2}}.$ 
+ (41) 
+ The first two substitutions are 
+ $\displaystyle V_{1}$ 
+ $\displaystyle\leq\frac{s-2}{s}V_{0}+\frac{8\sigma^{2}}{\mu s^{2}},$ 
+ $\displaystyle V_{2}$ 
+ $\displaystyle\leq\frac{s-1}{s+1}\frac{s-2}{s}V_{0}+\frac{8\sigma^{2}}{\mu}\left(\frac{s-1}{(s+1)s^{2}}+\frac{1}{(s+1)^{2}}\right).$ 
+ Induction therefore gives 
+ $V_{T}\leq V_{0}\prod_{k=0}^{T-1}\frac{k+s-2}{k+s}+\frac{8\sigma^{2}}{\mu}\sum_{j=0}^{T-1}\frac{1}{(j+s)^{2}}\prod_{k=j+1}^{T-1}\frac{k+s-2}{k+s}.$ 
+ (42) 
+ For every $0\leq u\leq T$ , 
+ $\prod_{k=u}^{T-1}\frac{k+s-2}{k+s}=\frac{(u+s-2)(u+s-1)}{(T+s-2)(T+s-1)}.$ 
+ (43) 
+ Taking $u=0$ gives the initialization product.
+Taking $u=j+1$ in each noise term gives 
+ $\displaystyle\frac{1}{(j+s)^{2}}\prod_{k=j+1}^{T-1}\frac{k+s-2}{k+s}$ 
+ $\displaystyle=\frac{1}{(j+s)^{2}}\frac{(j+s-1)(j+s)}{(T+s-2)(T+s-1)}$ 
+ $\displaystyle=\frac{(j+s-1)/(j+s)}{(T+s-2)(T+s-1)}.$ 
+ Consequently, ( 42 ) becomes the explicit bound 
+ $V_{T}\leq\frac{(s-2)(s-1)V_{0}+\dfrac{8\sigma^{2}}{\mu}\sum_{j=0}^{T-1}\dfrac{j+s-1}{j+s}}{(T+s-2)(T+s-1)}.$ 
+ (44) 
+ We now bound the initialization and noise terms separately. 
+ For $r=1,2$ , positivity of the denominators and $rT\geq 0$ imply 
+ $\frac{s-r}{T+s-r}\leq\frac{s}{T+s}.$ 
+ Indeed, after cross multiplication this is precisely
+ $(s-r)(T+s)\leq s(T+s-r)$ .
+Multiplying the two inequalities gives 
+ $\frac{(s-2)(s-1)}{(T+s-2)(T+s-1)}\leq\left(\frac{s}{T+s}\right)^{2}.$ 
+ Every summand $(j+s-1)/(j+s)$ in the noise numerator is at most
+one. Furthermore, 
+ $\displaystyle(T+s-2)(T+s-1)-T(T+s)=(s-3)(T+s)+2\geq 0,$ 
+ because $s\geq 16$ . Hence 
+ $\frac{\sum_{j=0}^{T-1}(j+s-1)/(j+s)}{(T+s-2)(T+s-1)}\leq\frac{T}{(T+s-2)(T+s-1)}\leq\frac{1}{T+s}.$ 
+ Combining the two bounds yields 
+ $V_{T}\leq\left(\frac{s}{T+s}\right)^{2}V_{0}+\frac{8\sigma^{2}}{\mu(T+s)}.$ 
+ (45) 
+ Using $\Delta_{T}\leq V_{T}$ and
+ $V_{0}\leq\Delta_{0}+\sigma^{2}/\mu$ proves ( 12 ). 
+ The two-phase schedule. 
+ Now fix any integer $T\geq 1$ , put $m=\lfloor T/2\rfloor$ , and
+use ( 13 ). During the first $m$ updates,
+( 40 ) gives 
+ $V_{t+1}\leq\left(1-\frac{2}{s}\right)V_{t}+\frac{8\sigma^{2}}{\mu s^{2}}.$ 
+ Repeated substitution gives 
+ $\displaystyle V_{m}$ 
+ $\displaystyle\leq\left(1-\frac{2}{s}\right)^{m}V_{0}+\frac{8\sigma^{2}}{\mu s^{2}}\sum_{j=0}^{m-1}\left(1-\frac{2}{s}\right)^{j}$ 
+ $\displaystyle=\left(1-\frac{2}{s}\right)^{m}V_{0}+\frac{4\sigma^{2}}{\mu s}\left[1-\left(1-\frac{2}{s}\right)^{m}\right]$ 
+ $\displaystyle\leq e^{-2m/s}V_{0}+\frac{4\sigma^{2}}{\mu s}.$ 
+ The final line uses
+ $1-u\leq e^{-u}$ and drops a factor between zero and one
+from the noise term. 
+ There remain $n=T-m$ updates. Their parameters are
+ $\eta_{m+j}=2/[\mu(s+j)]$ for $j=0,\ldots,n-1$ .
+Applying the bound ( 45 )
+with initial value $V_{m}$ gives 
+ $V_{T}\leq\left(\frac{s}{s+n}\right)^{2}V_{m}+\frac{8\sigma^{2}}{\mu(s+n)}.$ 
+ The potential $V_{m}$ already includes the estimation error $q_{m}$ .
+Hence this argument applies directly to the remaining updates,
+without restarting $x_{m}$ or $d_{m}$ .
+Substitute the preceding bound for $V_{m}$ to obtain 
+ $\displaystyle V_{T}$ 
+ $\displaystyle\leq\left(\frac{s}{s+n}\right)^{2}e^{-2m/s}V_{0}+\frac{4\sigma^{2}s}{\mu(s+n)^{2}}+\frac{8\sigma^{2}}{\mu(s+n)}$ 
+ $\displaystyle\leq e^{-2m/s}V_{0}+\frac{12\sigma^{2}}{\mu(s+n)}$ 
+ $\displaystyle\leq e^{-2m/s}V_{0}+\frac{24\sigma^{2}}{\mu(T+2s)}.$ 
+ The second line uses $s/(s+n)\leq 1$ and the third uses
+ $n=\lceil T/2\rceil\geq T/2$ .
+Finally, $\Delta_{T}\leq V_{T}$ and the initial bound on $V_{0}$ 
+give ( 14 ).
+∎ 
+ Appendix C Proof of Theorem 3 
+ Throughout this section,
+ $\eta_{t}=\eta$ and $a_{t+1}=1-\beta$ , where
+ $0 
+ Proof.
+ The estimation error has bounded second moment. 
+Let $\mathcal{F}_{t}=\sigma(\xi_{0},\ldots,\xi_{t-1})$ denote the information
+available before sample $\xi_{t}$ is drawn.
+Write $\mathbb{E}_{t}[\cdot]=\mathbb{E}[\cdot\mid\mathcal{F}_{t}]$ and define 
+ $e_{t}=d_{t}-\nabla F(x_{t}),\qquad e_{-1}=0.$ 
+ For $t\geq 1$ , subtract $\nabla F(x_{t})$ from the estimator update: 
+ $\displaystyle e_{t}$ 
+ $\displaystyle=\beta e_{t-1}+\nu_{t},$ 
+ $\displaystyle\nu_{t}$ 
+ $\displaystyle=g(x_{t},\xi_{t})-\nabla F(x_{t})-\beta\bigl(g(x_{t-1},\xi_{t})-\nabla F(x_{t-1})\bigr).$ 
+ Set $\nu_{0}=e_{0}$ . The error recursion therefore holds also at $t=0$ : 
+ $e_{t}=\beta e_{t-1}+\nu_{t},\qquad t\geq 0.$ 
+ (46) 
+ Both query points in $\nu_{t}$ are $\mathcal{F}_{t}$ -measurable. Since $\xi_{t}$ 
+is independent of $\mathcal{F}_{t}$ , oracle unbiasedness gives 
+ $\mathbb{E}_{t}\nu_{t}=0.$ 
+ (47) 
+ The two oracle errors in $\nu_{t}$ use the same sample and need not
+be independent. We bound their sum by the conditional $L^{2}$ triangle
+inequality and then use ( 5 ): 
+ $\displaystyle\bigl(\mathbb{E}_{t}\left\|\nu_{t}\right\|^{2}\bigr)^{1/2}$ 
+ $\displaystyle\leq\bigl(\mathbb{E}_{t}\left\|g(x_{t},\xi_{t})-\nabla F(x_{t})\right\|^{2}\bigr)^{1/2}+\beta\bigl(\mathbb{E}_{t}\left\|g(x_{t-1},\xi_{t})-\nabla F(x_{t-1})\right\|^{2}\bigr)^{1/2}$ 
+ $\displaystyle\leq(1+\beta)\sigma.$ 
+ For $t=0$ , initialization gives the stronger bound
+ $\mathbb{E}\left\|\nu_{0}\right\|^{2}\leq\sigma^{2}$ . Thus, for every $t\geq 0$ , 
+ $\mathbb{E}_{t}\left\|\nu_{t}\right\|^{2}\leq(1+\beta)^{2}\sigma^{2}.$ 
+ (48) 
+ Squaring ( 46 ) and conditioning on $\mathcal{F}_{t}$ 
+eliminates its cross term, because $e_{t-1}$ is $\mathcal{F}_{t}$ -measurable
+and ( 47 ) holds. Consequently, 
+ $\mathbb{E}\left\|e_{t}\right\|^{2}\leq\beta^{2}\mathbb{E}\left\|e_{t-1}\right\|^{2}+(1+\beta)^{2}\sigma^{2}.$ 
+ Starting from $e_{-1}=0$ , repeated substitution gives 
+ $\mathbb{E}\left\|e_{t}\right\|^{2}\leq(1+\beta)^{2}\sigma^{2}\sum_{j=0}^{t}\beta^{2j}\leq\frac{(1+\beta)^{2}}{1-\beta^{2}}\sigma^{2}=\frac{1+\beta}{1-\beta}\sigma^{2}.$ 
+ (49) 
+ An auxiliary iterate removes the inherited error. 
+Define, only for the analysis, 
+ $z_{t}=x_{t}-\frac{\eta\beta}{1-\beta}e_{t-1}.$ 
+ (50) 
+ Then $z_{0}=x_{0}$ . The factor $\beta/(1-\beta)$ is chosen so that
+the error cancels from the following update: 
+ $\displaystyle z_{t+1}$ 
+ $\displaystyle=x_{t+1}-\frac{\eta\beta}{1-\beta}e_{t}$ 
+ $\displaystyle=x_{t}-\eta\nabla F(x_{t})-\eta e_{t}-\frac{\eta\beta}{1-\beta}e_{t}$ 
+ $\displaystyle=x_{t}-\eta\nabla F(x_{t})-\frac{\eta}{1-\beta}e_{t}$ 
+ $\displaystyle=x_{t}-\frac{\eta\beta}{1-\beta}e_{t-1}-\eta\nabla F(x_{t})-\frac{\eta}{1-\beta}\nu_{t}.$ 
+ The last equality uses ( 46 ). Hence 
+ $z_{t+1}=z_{t}-\eta\nabla F(x_{t})-\frac{\eta}{1-\beta}\nu_{t}.$ 
+ (51) 
+ The update has centered noise, but evaluates the gradient at $x_{t}$ 
+rather than $z_{t}$ . Standard smoothness will control this difference.
+Indeed, ( 50 ) gives the exact identity 
+ $\left\|x_{t}-z_{t}\right\|^{2}=\frac{\eta^{2}\beta^{2}}{(1-\beta)^{2}}\left\|e_{t-1}\right\|^{2}.$ 
+ No auxiliary sequence is computed by STORM. 
+ Descent along the auxiliary sequence. 
+Apply standard smoothness to
+( 51 ): 
+ $\displaystyle F(z_{t+1})\leq{}F(z_{t})-\eta\left\langle\nabla F(z_{t}),\nabla F(x_{t})+\nu_{t}/(1-\beta)\right\rangle+\frac{L\eta^{2}}{2}\left\|\nabla F(x_{t})+\nu_{t}/(1-\beta)\right\|^{2}.$ 
+ Conditional on $\mathcal{F}_{t}$ ,
+ $\mathbb{E}_{t}\nu_{t}=0$ . Expanding the squared norm before taking conditional
+expectations therefore yields 
+ $\displaystyle\mathbb{E}_{t}F(z_{t+1})\leq{}F(z_{t})-\eta\left\langle\nabla F(z_{t}),\nabla F(x_{t})\right\rangle+\frac{L\eta^{2}}{2}\left\|\nabla F(x_{t})\right\|^{2}+\frac{L\eta^{2}}{2(1-\beta)^{2}}\mathbb{E}_{t}\left\|\nu_{t}\right\|^{2}.$ 
+ To express the decrease in terms of the gradient at the actual iterate,
+use $\left\langle u,v\right\rangle\leq\left\|u\right\|^{2}+\left\|v\right\|^{2}/4$ : 
+ $\displaystyle-\left\langle\nabla F(z_{t}),\nabla F(x_{t})\right\rangle$ 
+ $\displaystyle=-\left\|\nabla F(x_{t})\right\|^{2}+\left\langle\nabla F(x_{t})-\nabla F(z_{t}),\nabla F(x_{t})\right\rangle$ 
+ $\displaystyle\leq-\frac{3}{4}\left\|\nabla F(x_{t})\right\|^{2}+\left\|\nabla F(x_{t})-\nabla F(z_{t})\right\|^{2}$ 
+ $\displaystyle\leq-\frac{3}{4}\left\|\nabla F(x_{t})\right\|^{2}+\frac{L^{2}\eta^{2}\beta^{2}}{(1-\beta)^{2}}\left\|e_{t-1}\right\|^{2}.$ 
+ Since
+ $L\eta\leq 1/2$ , the coefficient of the squared gradient is at most
+ $-\eta(3/4-L\eta/2)\leq-\eta/2$ . We obtain 
+ $\displaystyle\mathbb{E}_{t}F(z_{t+1})\leq{}F(z_{t})-\frac{\eta}{2}\left\|\nabla F(x_{t})\right\|^{2}+\frac{L^{2}\eta^{3}\beta^{2}}{(1-\beta)^{2}}\left\|e_{t-1}\right\|^{2}+\frac{L\eta^{2}(1+\beta)^{2}}{2(1-\beta)^{2}}\sigma^{2}.$ 
+ Taking full expectations and using
+( 49 ), which also bounds
+ $\mathbb{E}\left\|e_{-1}\right\|^{2}=0$ , gives 
+ $\mathbb{E}F(z_{t+1})\leq{}\mathbb{E}F(z_{t})-\frac{\eta}{2}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}+\frac{L^{2}\eta^{3}\beta^{2}(1+\beta)}{(1-\beta)^{3}}\sigma^{2}+\frac{L\eta^{2}(1+\beta)^{2}}{2(1-\beta)^{2}}\sigma^{2}.$ 
+ (52) 
+ Summation and the choice of parameters. 
+Rearrange ( 52 ) and sum over
+ $t=0,\ldots,T-1$ . The function values telescope, so 
+ $\displaystyle\frac{\eta}{2}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq{}$ 
+ $\displaystyle F(z_{0})-\mathbb{E}F(z_{T})+\frac{L^{2}\eta^{3}T\beta^{2}(1+\beta)}{(1-\beta)^{3}}\sigma^{2}+\frac{L\eta^{2}T(1+\beta)^{2}}{2(1-\beta)^{2}}\sigma^{2}.$ 
+ Since $z_{0}=x_{0}$ and $F(z_{T})\geq F^{*}$ , division by $\eta T/2$ gives
+the more precise bound 
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq{}\frac{2\Delta_{0}}{\eta T}+\frac{(1+\beta)^{2}}{(1-\beta)^{2}}L\eta\sigma^{2}+\frac{2\beta^{2}(1+\beta)}{(1-\beta)^{3}}L^{2}\eta^{2}\sigma^{2}.$ 
+ (53) 
+ The condition $2L\eta\leq 1$ bounds the last term by
+ $\beta^{2}(1+\beta)L\eta\sigma^{2}/(1-\beta)^{3}$ . Combining it with
+the preceding noise term uses only the identity 
+ $\frac{(1+\beta)^{2}}{(1-\beta)^{2}}+\frac{\beta^{2}(1+\beta)}{(1-\beta)^{3}}=\frac{(1+\beta)((1+\beta)(1-\beta)+\beta^{2})}{(1-\beta)^{3}}=\frac{1+\beta}{(1-\beta)^{3}}.$ 
+ This proves ( 15 ). 
+ For $\eta=1/(2L\sqrt{T})$ , substitution gives 
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{4L\Delta_{0}+(1+\beta)\sigma^{2}/(2(1-\beta)^{3})}{\sqrt{T}}.$ 
+ If $0 
+ $\mathbb{E}\left\|\nabla F(x_{I})\right\|\leq\sqrt{\mathbb{E}\left\|\nabla F(x_{I})\right\|^{2}}=\sqrt{\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}}.$ 
+ ∎ 
+ Dependence on the variance. 
+For $0 15 ) also gives
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{2\Delta_{0}}{\eta T}+12L\eta\sigma^{2}.$ 
+ When $\Delta_{0},\sigma>0$ , choose
+ $\eta=\min\{1/(2L),\sqrt{\Delta_{0}/(6L\sigma^{2}T)}\}$ .
+The elementary inequalities
+ $\eta^{-1}\leq 2L+\sqrt{\frac{6L\sigma^{2}T}{\Delta_{0}}},\qquad\eta\leq\sqrt{\frac{\Delta_{0}}{6L\sigma^{2}T}}$ 
+ then yield
+ $\frac{1}{T}\sum_{t=0}^{T-1}\mathbb{E}\left\|\nabla F(x_{t})\right\|^{2}\leq\frac{4L\Delta_{0}}{T}+4\sqrt{6}\,\sigma\sqrt{\frac{L\Delta_{0}}{T}}.$ 
+ Thus the bound recovers the usual initialization and variance orders
+of nonconvex SGD.
+ If $\sigma=0$ , taking $\eta=1/(2L)$ directly
+gives $4L\Delta_{0}/T$ .
+ Appendix D Proof of Lemma 4 
+ Proof.
+ For fixed $y$ , let $\phi(z)=F(z)-\left\langle\nabla F(y),z\right\rangle$ .
+Convexity and $\nabla\phi(y)=0$ imply that $y$ minimizes $\phi$ .
+The smoothness upper model at $x$ , evaluated at
+ $x-L^{-1}\nabla\phi(x)$ , therefore gives 
+ $\phi(y)\leq\phi\bigl(x-L^{-1}\nabla\phi(x)\bigr)\leq\phi(x)-\frac{\left\|\nabla\phi(x)\right\|^{2}}{2L}.$ 
+ Substituting the definition of $\phi$ yields 
+ $F(x)-F(y)-\left\langle\nabla F(y),x-y\right\rangle\geq\frac{\left\|\nabla F(x)-\nabla F(y)\right\|^{2}}{2L}.$ 
+ Interchanging $x,y$ and adding cancels the function values. With
+ $u=x-y$ and $v=\nabla F(x)-\nabla F(y)$ , the result is
+ $\left\langle v,u\right\rangle\geq\left\|v\right\|^{2}/L$ . Hence 
+ $\left\|u-\eta v\right\|^{2}=\left\|u\right\|^{2}-2\eta\left\langle u,v\right\rangle+\eta^{2}\left\|v\right\|^{2}\leq\left\|u\right\|^{2}-\eta(2/L-\eta)\left\|v\right\|^{2}\leq\left\|u\right\|^{2}.$ 
+ Taking square roots proves ( 17 ). 
+ Contraction under strong convexity. 
+Assume first that $L>\lambda$ and set
+ $H(z)=F(z)-\lambda\left\|z\right\|^{2}/2$ . Subtracting the quadratic term
+from the strong-convexity lower model and the smoothness upper model gives 
+ $0\leq H(z)-H(w)-\left\langle\nabla H(w),z-w\right\rangle\leq\frac{L-\lambda}{2}\left\|z-w\right\|^{2}.$ 
+ Thus $H$ is convex and has an upper quadratic model with coefficient
+ $L-\lambda$ . The preceding proof of nonexpansiveness uses only these
+two properties, so it applies to $H$ . Since $\eta\leq 1/L$ and
+ $L>\lambda$ , we have $1-\lambda\eta>0$ and 
+ $\frac{\eta}{1-\lambda\eta}\leq\frac{1}{L-\lambda};$ 
+ after multiplying by the positive denominators, this is just
+ $L\eta\leq 1$ . Using $\nabla F(z)=\nabla H(z)+\lambda z$ , 
+ $\displaystyle\left\|x-\eta\nabla F(x)-y+\eta\nabla F(y)\right\|$ 
+ $\displaystyle\quad=(1-\lambda\eta)\left\|x-\frac{\eta}{1-\lambda\eta}\nabla H(x)-y+\frac{\eta}{1-\lambda\eta}\nabla H(y)\right\|$ 
+ $\displaystyle\quad\leq(1-\lambda\eta)\left\|x-y\right\|.$ 
+ If $L=\lambda$ , the lower and upper models for $H$ coincide, so $H$ 
+is affine. Hence $\nabla F(x)-\nabla F(y)=\lambda(x-y)$ and
+( 18 ) holds with equality. 
+ Comparison of function gaps. 
+The smoothness upper model evaluated at one gradient step gives 
+ $F^{*}\leq F\bigl(y-L^{-1}\nabla F(y)\bigr)\leq F(y)-\frac{\left\|\nabla F(y)\right\|^{2}}{2L}.$ 
+ Rearrangement proves ( 19 ). Apply the upper model
+once more to $F(x)$ , and use Young’s inequality: 
+ $\displaystyle F(x)-F^{*}$ 
+ $\displaystyle\leq F(y)-F^{*}+\left\langle\nabla F(y),x-y\right\rangle+\frac{L}{2}\left\|x-y\right\|^{2}$ 
+ $\displaystyle\leq F(y)-F^{*}+\frac{\left\|\nabla F(y)\right\|^{2}}{2L}+L\left\|x-y\right\|^{2}$ 
+ $\displaystyle\leq 2(F(y)-F^{*})+L\left\|x-y\right\|^{2}.$ 
+ The two function-gap inequalities require smoothness only.
+∎ 
+ Appendix E Proof of Lemma 5 
+ Proof.
+ Let $\mathcal{F}_{t}=\sigma(\xi_{0},\ldots,\xi_{t-1})$ be the information
+before drawing $\xi_{t}$ .
+Write $\zeta(x,\xi)=g(x,\xi)-\nabla F(x)$ and
+ $e_{t}=d_{t}-\nabla F(x_{t})$ . Set $e_{-1}=0$ , $\nu_{0}=e_{0}$ , and
+ $\nu_{t}=\zeta(x_{t},\xi_{t})-\beta\zeta(x_{t-1},\xi_{t})$ for $t\geq 1$ .
+Subtracting $\nabla F(x_{t})$ from ( 3 ) yields
+ $e_{t}=\beta e_{t-1}+\nu_{t}$ . Fresh-sample independence and unbiasedness give
+ $\mathbb{E}[\nu_{t}\mid\mathcal{F}_{t}]=0$ . The conditional $L^{2}$ 
+triangle inequality gives 
+ $\displaystyle\bigl(\mathbb{E}[\left\|\nu_{t}\right\|^{2}\mid\mathcal{F}_{t}]\bigr)^{1/2}\leq\bigl(\mathbb{E}[\left\|\zeta(x_{t},\xi_{t})\right\|^{2}\mid\mathcal{F}_{t}]\bigr)^{1/2}+\beta\bigl(\mathbb{E}[\left\|\zeta(x_{t-1},\xi_{t})\right\|^{2}\mid\mathcal{F}_{t}]\bigr)^{1/2}\leq(1+\beta)\sigma.$ 
+ At $t=0$ the same bound follows directly from ( 5 ).
+Thus, with $S^{2}=(1+\beta)^{2}\sigma^{2}$ , 
+ $\mathbb{E}[\nu_{t}\mid\mathcal{F}_{t}]=0,\qquad\mathbb{E}[\left\|\nu_{t}\right\|^{2}\mid\mathcal{F}_{t}]\leq S^{2}\leq 9\sigma^{2}/4.$ 
+ (54) 
+ The estimation error. 
+The previous error is $\mathcal{F}_{t}$ -measurable, so
+ $\mathbb{E}\left\langle e_{t-1},\nu_{t}\right\rangle=0$ . Squaring the error recursion and
+substituting recursively from $e_{-1}=0$ gives 
+ $\mathbb{E}\left\|e_{t}\right\|^{2}\leq\beta^{2}\mathbb{E}\left\|e_{t-1}\right\|^{2}+S^{2}\leq S^{2}\sum_{j=0}^{t}\beta^{2j}\leq\frac{(1+\beta)^{2}\sigma^{2}}{1-\beta^{2}}=\frac{1+\beta}{1-\beta}\sigma^{2}\leq 3\sigma^{2}.$ 
+ Define the mathematical companion by 
+ $y_{0}=x_{0},\qquad y_{t+1}=y_{t}-\eta_{t}(\nabla F(y_{t})+\nu_{t}).$ 
+ (55) 
+ Subtracting ( 55 ) from ( 2 ) cancels
+the shared innovation: 
+ $x_{t+1}-y_{t+1}=x_{t}-\eta_{t}\nabla F(x_{t})-y_{t}+\eta_{t}\nabla F(y_{t})-\eta_{t}\beta e_{t-1}.$ 
+ For $r_{t}=(\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2})^{1/2}$ , Minkowski’s inequality,
+( 17 ), and the estimation-error bound above yield
+ $r_{t+1}\leq r_{t}+\sqrt{3}\beta\sigma\eta_{t}$ .
+Summing $r_{j+1}-r_{j}\leq\sqrt{3}\beta\sigma\eta_{j}$ from $j=0$ 
+to $t-1$ , with $r_{0}=0$ , gives
+ $r_{t}\leq\sqrt{3}\beta\sigma\sum_{j 
+ $\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}\leq 3\beta^{2}\sigma^{2}\left(\sum_{j=0}^{t-1}\eta_{j}\right)^{2}.$ 
+ (56) 
+ Under $\lambda$ -strong convexity, ( 18 ) instead gives
+ $r_{t+1}\leq(1-\lambda\eta_{t})r_{t}+\sqrt{3}\beta\sigma\eta_{t}$ .
+Starting from $r_{0}=0$ , the induction 
+ $r_{t+1}\leq(1-\lambda\eta_{t})\frac{\sqrt{3}\beta\sigma}{\lambda}+\sqrt{3}\beta\sigma\eta_{t}=\frac{\sqrt{3}\beta\sigma}{\lambda}$ 
+ proves 
+ $\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}\leq 3\beta^{2}\sigma^{2}/\lambda^{2}.$ 
+ (57) 
+ Under strong convexity, this gives 
+ $\mathbb{E}[F(x_{t})-F^{*}]\leq 2\mathbb{E}[F(y_{t})-F^{*}]+3L\beta^{2}\sigma^{2}/\lambda^{2}.$ 
+ (58) 
+ Combining the same pointwise inequality with
+( 56 ) gives the convex assertion explicitly: 
+ $\mathbb{E}[F(x_{t})-F^{*}]\leq 2\mathbb{E}[F(y_{t})-F^{*}]+3L\beta^{2}\sigma^{2}\left(\sum_{j=0}^{t-1}\eta_{j}\right)^{2}.$ 
+ (59) 
+ ∎ 
+ Appendix F Other useful lemmas
+ F.1 A shared one-step inequality
+ Lemma 11 . 
+ Let $y_{t}$ be an adapted recursion of the form ( 55 )
+with ( 54 ), where $y_{t}$ is $\mathcal{F}_{t}$ -measurable.
+Under Assumptions 1 and 5 , suppose
+ $y_{0}=x_{0}$ . Define
+ $D_{t}=\mathbb{E}\left\|y_{t}-x^{*}\right\|^{2}$ , $\delta_{t}=\mathbb{E}[F(y_{t})-F^{*}]$ ,
+and $h_{t}=\nabla F(y_{t})+\nu_{t}$ . For deterministic
+ $0 
+ $\displaystyle\mathbb{E}\left\|h_{t}\right\|^{2}$ 
+ $\displaystyle\leq 2L\delta_{t}+S^{2},$ 
+ (60) 
+ $\displaystyle D_{t+1}$ 
+ $\displaystyle\leq D_{t}-\eta_{t}\delta_{t}+\eta_{t}^{2}S^{2}.$ 
+ (61) 
+ Proof.
+ Note that
+ $\left\|\nabla F(y_{t})\right\|\leq L\left\|y_{t}-x^{*}\right\|$ and conditional centering justifies
+ $\mathbb{E}\left\langle\nabla F(y_{t}),\nu_{t}\right\rangle=0$ . Expanding $\left\|h_{t}\right\|^{2}$ 
+and using ( 19 ) proves ( 60 ).
+For distance, the same centering and convexity give 
+ $\displaystyle D_{t+1}$ 
+ $\displaystyle=D_{t}-2\eta_{t}\mathbb{E}\left\langle h_{t},y_{t}-x^{*}\right\rangle+\eta_{t}^{2}\mathbb{E}\left\|h_{t}\right\|^{2}$ 
+ $\displaystyle\leq D_{t}-2\eta_{t}\mathbb{E}\left\langle\nabla F(y_{t}),y_{t}-x^{*}\right\rangle+\eta_{t}^{2}(2L\delta_{t}+S^{2})$ 
+ $\displaystyle\leq D_{t}-2\eta_{t}(1-L\eta_{t})\delta_{t}+\eta_{t}^{2}S^{2}$ 
+ $\displaystyle\leq D_{t}-\eta_{t}\delta_{t}+\eta_{t}^{2}S^{2}.$ 
+ The third line uses
+ $\left\langle\nabla F(y_{t}),y_{t}-x^{*}\right\rangle\geq F(y_{t})-F^{*}$ .
+The last uses $2(1-L\eta_{t})\geq 1$ and $\delta_{t}\geq 0$ .
+∎ 
+ F.2 Rounded-block geometry for arbitrary integer horizons
+ Lemma 12 . 
+ For the partition ( 25 ) and $T\geq 1$ , put
+ $M=\lceil(T+1)/4\rceil$ , $K=\lceil(T+1)/2\rceil$ . Define 
+ $B_{0}=\{M-1,\ldots,K-1\},\qquad B_{i}=\{U_{i},\ldots,U_{i+1}-1\}\quad(1\leq i\leq m).$ 
+ (62) 
+ Then $U_{1}=K$ , $B_{m}=\{T\}$ , and 
+ $\displaystyle M\geq(T+1)/4,\quad K\geq(T+1)/2,\quad K\in\{2M-1,2M\},$ 
+ $\displaystyle n:=K-M+1\geq(T+1)/4,\quad K/n\leq 2,$ 
+ (63) 
+ $\displaystyle|B_{0}|\leq 2|B_{1}|,\qquad|B_{i}|\leq 3|B_{i+1}|\quad(1\leq i 
+ (64) 
+ In particular, a suffix of $B_{i}$ together with all of $B_{i+1}$ 
+contains at most $4|B_{i+1}|$ indices. 
+ Proof.
+ The identities $U_{1}=\lceil(T+1)/2\rceil$ and
+ $\lfloor(T+1)/2^{m}\rfloor=1$ prove the boundary assertions.
+Writing $T+1=4q+r$ with $r\in\{0,1,2,3\}$ verifies
+ $K\in\{2M-1,2M\}$ . Hence $n\geq M\geq(T+1)/4$ and $K\leq 2n$ .
+The same four cases give 
+ For $r=0,1$ , $T\geq 1$ implies $q\geq 1$ ; for $r=2,3$ , $q\geq 0$ 
+is enough. Thus $|B_{0}|\leq 2|B_{1}|$ in every case, including
+ $T=1,2$ . 
+ For the remaining ratios, let $r_{i}=\lfloor(T+1)/2^{i}\rfloor$ .
+For $1\leq i 
+ $|B_{i}|=r_{i+1}+\varepsilon\leq 2\lceil r_{i+1}/2\rceil+1=2|B_{i+1}|+1\leq 3|B_{i+1}|.$ 
+ For the final pair, $r_{m}=1$ and $r_{m-1}\in\{2,3\}$ ,
+so $|B_{m-1}|\leq 2$ and $|B_{m}|=1$ .
+∎ 
+ Appendix G Proof of Theorem 6 
+ G.1 General stepsize-weighted and constant-step means
+ Theorem 13 . 
+ Under Assumptions 1 , 2 , and
+ 5 , let $T\geq 1$ 
+be any integer, take $\beta=1/(T+2)$ , and choose deterministic stepsizes
+ $0 
+ $\Lambda_{T}=\sum_{t=0}^{T}\eta_{t},\qquad\bar{x}_{T}^{\eta}=\frac{1}{\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}x_{t}.$ 
+ Then 
+ $\mathbb{E}[F(\bar{x}_{T}^{\eta})-F^{*}]\leq\frac{2R^{2}}{\Lambda_{T}}+\frac{9\sigma^{2}}{2\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}^{2}+\frac{3L\sigma^{2}\Lambda_{T}^{2}}{(T+2)^{2}}.$ 
+ (65) 
+ Proof.
+ Apply Lemma 5 , and use the notation
+ $D_{t}=\mathbb{E}\left\|y_{t}-x^{*}\right\|^{2}$ and
+ $\delta_{t}=\mathbb{E}[F(y_{t})-F^{*}]$ .
+Rearrange ( 61 ) as
+ $\eta_{t}\delta_{t}\leq D_{t}-D_{t+1}+\eta_{t}^{2}S^{2}$ .
+Summing over $t=0,\ldots,T$ cancels each interior distance: 
+ $\displaystyle\sum_{t=0}^{T}\eta_{t}\delta_{t}$ 
+ $\displaystyle\leq\sum_{t=0}^{T}(D_{t}-D_{t+1})+S^{2}\sum_{t=0}^{T}\eta_{t}^{2}=D_{0}-D_{T+1}+S^{2}\sum_{t=0}^{T}\eta_{t}^{2}\leq R^{2}+S^{2}\sum_{t=0}^{T}\eta_{t}^{2}.$ 
+ The final distance is nonnegative and can be discarded. 
+ The weights $\eta_{t}/\Lambda_{T}$ are positive and sum to one.
+Apply convexity to the weighted mean of STORM iterates, then apply
+( 59 ) to each summand: 
+ $\displaystyle\mathbb{E}[F(\bar{x}_{T}^{\eta})-F^{*}]$ 
+ $\displaystyle\leq\frac{1}{\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}\mathbb{E}[F(x_{t})-F^{*}]$ 
+ $\displaystyle\leq\frac{2}{\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}\delta_{t}+\frac{3L\beta^{2}\sigma^{2}}{\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}\left(\sum_{j=0}^{t-1}\eta_{j}\right)^{2}$ 
+ $\displaystyle\leq\frac{2R^{2}}{\Lambda_{T}}+\frac{2S^{2}}{\Lambda_{T}}\sum_{t=0}^{T}\eta_{t}^{2}+3L\beta^{2}\sigma^{2}\Lambda_{T}^{2}.$ 
+ For the last term, every prefix sum is at most $\Lambda_{T}$ , and
+ $\sum_{t}\eta_{t}=\Lambda_{T}$ . Substituting $\beta=1/(T+2)$ and
+ $S^{2}\leq 9\sigma^{2}/4$ proves the theorem.
+∎ 
+ Corollary 14 . 
+ With $\eta_{t}=\eta\leq 1/(2L)$ , the weighted mean becomes the uniform
+mean such that $\bar{x}_{T}=(T+1)^{-1}\sum_{t=0}^{T}x_{t}$ , and 
+ $\mathbb{E}[F(\bar{x}_{T})-F^{*}]\leq\frac{2R^{2}}{\eta(T+1)}+6\eta\sigma^{2}.$ 
+ (66) 
+ If $R>0$ and $\sigma>0$ , choose
+ $\eta=\min\{1/(2L),\,R/(\sqrt{3}\sigma\sqrt{T+1})\}$ to obtain 
+ $\mathbb{E}[F(\bar{x}_{T})-F^{*}]\leq\frac{4LR^{2}}{T+1}+\frac{4\sqrt{3}\sigma R}{\sqrt{T+1}}.$ 
+ (67) 
+ Proof.
+ Here $\Lambda_{T}=(T+1)\eta$ and $\sum_{t}\eta_{t}^{2}=(T+1)\eta^{2}$ .
+Since $(T+1)/(T+2)\leq 1$ and $L\eta\leq 1/2$ , the last two terms of
+( 65 ) are at most
+ $(9/2)\eta\sigma^{2}+3L\eta^{2}\sigma^{2}\leq 6\eta\sigma^{2}$ .
+For the tuned result, use 
+ $\frac{1}{\eta}=\max\{2L,\sqrt{3}\sigma\sqrt{T+1}/R\}\leq 2L+\sqrt{3}\sigma\sqrt{T+1}/R,\qquad\eta\leq\frac{R}{\sqrt{3}\sigma\sqrt{T+1}}.$ 
+ The first inequality bounds the initialization term by
+ $4LR^{2}/(T+1)+2\sqrt{3}\sigma R/\sqrt{T+1}$ ; the second bounds the
+noise term by $2\sqrt{3}\sigma R/\sqrt{T+1}$ , giving the stated bound.
+If $\sigma=0$ , take $\eta=1/(2L)$ .
+∎ 
+ G.2 The companion’s last-iterate bound
+ Lemma 15 . 
+ Under Assumptions 1 and 5 , let
+ $y_{t+1}=y_{t}-\eta_{t}(\nabla F(y_{t})+\nu_{t})$ , with $y_{0}=x_{0}$ ,
+ $y_{t}$ measurable with respect to the filtration $\mathcal{F}_{t}$ ,
+ $\mathbb{E}[\nu_{t}\mid\mathcal{F}_{t}]=0$ , and
+ $\mathbb{E}[\left\|\nu_{t}\right\|^{2}\mid\mathcal{F}_{t}]\leq S^{2}$ .
+For $T\geq 1$ and the stepsizes in ( 27 ), 
+ $\max\left\{\delta_{T},\,\frac{1}{T+1}\sum_{t=0}^{T}\delta_{t}\right\}\leq\frac{4\mathrm{e}R^{2}}{\eta(T+1)}+18\mathrm{e}\eta S^{2},\qquad\delta_{t}=\mathbb{E}[F(y_{t})-F^{*}].$ 
+ (68) 
+ Proof.
+ Use $D_{t}=\mathbb{E}\left\|y_{t}-x^{*}\right\|^{2}$ and
+ $h_{t}=\nabla F(y_{t})+\nu_{t}$ . Note that ( 60 )–( 61 )
+apply. Put $M=\lceil(T+1)/4\rceil$ and $K=\lceil(T+1)/2\rceil$ .
+The first schedule block is $0,\ldots,K-1$ , with
+ $\eta_{t}=\eta$ . 
+ A reference value in the first half. 
+Discard the nonpositive term $-\eta\delta_{t}$ in
+( 61 ) for $0\leq t 
+ $D_{M-1}\leq D_{0}+(M-1)\eta^{2}S^{2}=R^{2}+(M-1)\eta^{2}S^{2}.$ 
+ Now keep that decrease and sum from $t=M-1$ to $K-1$ : 
+ $\displaystyle\eta\sum_{t=M-1}^{K-1}\delta_{t}$ 
+ $\displaystyle\leq D_{M-1}-D_{K}+(K-M+1)\eta^{2}S^{2}$ 
+ $\displaystyle\leq R^{2}+\bigl((M-1)+(K-M+1)\bigr)\eta^{2}S^{2}$ 
+ $\displaystyle=R^{2}+K\eta^{2}S^{2}.$ 
+ Let $A_{0}$ be the minimum of $\delta_{t}$ over these $K-M+1$ 
+indices. A minimum is at most the mean, so 
+ $A_{0}\leq\frac{R^{2}}{(K-M+1)\eta}+\frac{K}{K-M+1}\eta S^{2}\leq\frac{4R^{2}}{\eta(T+1)}+2\eta S^{2}.$ 
+ (69) 
+ The last line uses $K-M+1\geq(T+1)/4$ and
+ $K/(K-M+1)\leq 2$ from Lemma 12 .
+We will also need the mean over the entire first block.
+Summing directly from $0$ to $K-1$ gives 
+ $\frac{1}{K}\sum_{t=0}^{K-1}\delta_{t}\leq\frac{R^{2}}{K\eta}+\eta S^{2}\leq\frac{2R^{2}}{\eta(T+1)}+\eta S^{2},$ 
+ (70) 
+ where $K\geq(T+1)/2$ . 
+ Comparison with an earlier point. 
+Fix deterministic indices $p\leq q$ . For every $p\leq t\leq q$ ,
+expand the squared distance from $y_{p}$ : 
+ $\left\|y_{t+1}-y_{p}\right\|^{2}=\left\|y_{t}-y_{p}\right\|^{2}-2\eta_{t}\left\langle h_{t},y_{t}-y_{p}\right\rangle+\eta_{t}^{2}\left\|h_{t}\right\|^{2}.$ 
+ Although $y_{p}$ is random, it is $\mathcal{F}_{t}$ -measurable when
+ $t\geq p$ . Conditional centering therefore gives 
+ $\displaystyle\mathbb{E}\left\langle h_{t},y_{t}-y_{p}\right\rangle$ 
+ $\displaystyle=\mathbb{E}\left\langle\nabla F(y_{t}),y_{t}-y_{p}\right\rangle$ 
+ $\displaystyle\geq\mathbb{E}[F(y_{t})-F(y_{p})]=\delta_{t}-\delta_{p}.$ 
+ The inequality follows by rearranging
+ $F(y_{p})\geq F(y_{t})+\left\langle\nabla F(y_{t}),y_{p}-y_{t}\right\rangle$ .
+After taking expectations and summing the distance identity,
+the initial distance is zero and the terminal distance is nonnegative: 
+ $\displaystyle 2\sum_{t=p}^{q}\eta_{t}(\delta_{t}-\delta_{p})$ 
+ $\displaystyle\leq-\mathbb{E}\left\|y_{q+1}-y_{p}\right\|^{2}+\sum_{t=p}^{q}\eta_{t}^{2}\mathbb{E}\left\|h_{t}\right\|^{2}$ 
+ $\displaystyle\leq 2L\sum_{t=p}^{q}\eta_{t}^{2}\delta_{t}+S^{2}\sum_{t=p}^{q}\eta_{t}^{2}.$ 
+ The right side still depends on the function errors. Write
+ $\delta_{t}=(\delta_{t}-\delta_{p})+\delta_{p}$ there, and move the
+first part to the left. This is an exact rearrangement, giving 
+ $2\sum_{t=p}^{q}\eta_{t}(1-L\eta_{t})(\delta_{t}-\delta_{p})\leq(2L\delta_{p}+S^{2})\sum_{t=p}^{q}\eta_{t}^{2}.$ 
+ (71) 
+ The differences $\delta_{t}-\delta_{p}$ need not be nonnegative. 
+ Comparison of consecutive blocks. 
+Use the comparison blocks ( 62 ).
+For each $i$ , choose a deterministic minimizer $\tau_{i}$ of
+ $\delta_{t}$ on $B_{i}$ and set $A_{i}=\delta_{\tau_{i}}$ .
+These are indices minimizing expected errors, not data-dependent
+choices made by the algorithm. Write
+ $\bar{\delta}_{i}=|B_{i}|^{-1}\sum_{t\in B_{i}}\delta_{t}$ for a block mean.
+In particular, $A_{i}\leq\bar{\delta}_{i}$ and
+ $A_{m}=\bar{\delta}_{m}=\delta_{T}$ because $B_{m}=\{T\}$ . 
+ In ( 71 ), take $p=\tau_{i}$ and
+ $q=\max B_{i+1}$ for $0\leq i 
+ $\displaystyle 2\eta 2^{-(i+1)}(1-L\eta 2^{-(i+1)})|B_{i+1}|(\bar{\delta}_{i+1}-A_{i})\leq(2LA_{i}+S^{2})\sum_{t=\tau_{i}}^{\max B_{i+1}}\eta_{t}^{2}.$ 
+ Every comparison span has at most $4|B_{i+1}|$ indices by
+( 64 ). Its largest stepsize is
+at most $\eta 2^{-i}$ . Moreover,
+ $1-L\eta 2^{-(i+1)}\geq 1/2$ . Thus the ratio of the sum of squared
+stepsizes to the coefficient of $\bar{\delta}_{i+1}-A_{i}$ is at most 
+ $\frac{4|B_{i+1}|\eta^{2}2^{-2i}}{|B_{i+1}|\eta 2^{-(i+1)}}=8\eta 2^{-i}=:c_{i}.$ 
+ Since $2LA_{i}+S^{2}\geq 0$ , it follows that 
+ $A_{i+1}\leq\bar{\delta}_{i+1}\leq(1+2Lc_{i})A_{i}+c_{i}S^{2},\qquad c_{i}=8\eta 2^{-i}.$ 
+ (72) 
+ The mean difference $\bar{\delta}_{i+1}-A_{i}$ itself may be negative;
+division by its positive coefficient remains valid in that case.
+The length bounds used here include $T=1$ and $T=2$ , whose blocks
+are respectively $B_{0}=\{0\},B_{1}=\{1\}$ and
+ $B_{0}=\{0,1\},B_{1}=\{2\}$ . 
+ Expansion of the scalar recursion. 
+The first two substitutions in ( 72 )
+(the second when $m\geq 2$ ) are 
+ $\displaystyle A_{1}$ 
+ $\displaystyle\leq(1+2Lc_{0})A_{0}+c_{0}S^{2},$ 
+ $\displaystyle A_{2}$ 
+ $\displaystyle\leq(1+2Lc_{1})(1+2Lc_{0})A_{0}+\bigl(c_{0}(1+2Lc_{1})+c_{1}\bigr)S^{2}.$ 
+ More generally, induction gives, for $0\leq i 
+ $\bar{\delta}_{i+1}\leq A_{0}\prod_{j=0}^{i}(1+2Lc_{j})+S^{2}\sum_{j=0}^{i}c_{j}\prod_{\ell=j+1}^{i}(1+2Lc_{\ell}).$ 
+ (73) 
+ To see the induction step, use the same formula with index $i-1$ 
+to bound $A_{i}\leq\bar{\delta}_{i}$ , multiply it by $1+2Lc_{i}$ , and
+add $c_{i}S^{2}$ . This extends every existing product by its last
+factor and adds the $j=i$ summand, whose empty product equals one. 
+ The coefficients have a geometric sum: 
+ $\sum_{j=0}^{m-1}c_{j}=8\eta\sum_{j=0}^{m-1}2^{-j}\leq 16\eta.$ 
+ For any product occurring in ( 73 ), use
+ $1+u\leq\exp(u)$ for $u\geq 0$ to obtain 
+ $\prod(1+2Lc_{j})\leq\exp\left(2L\sum_{j=0}^{m-1}c_{j}\right)\leq\exp(32L\eta)\leq\mathrm{e}.$ 
+ Hence every tail-block mean satisfies 
+ $\displaystyle\bar{\delta}_{i+1}$ 
+ $\displaystyle\leq\mathrm{e}A_{0}+16\mathrm{e}\eta S^{2}$ 
+ $\displaystyle\leq\frac{4\mathrm{e}R^{2}}{\eta(T+1)}+18\mathrm{e}\eta S^{2}.$ 
+ (74) 
+ The second line inserts ( 69 ).
+The coefficients $c_{j}$ form a geometric sequence, so neither term
+incurs a factor proportional to the number of blocks. 
+ The last iterate and the uniform mean. 
+The last block is a singleton, so ( 74 )
+with $i+1=m$ is already the desired last-point inequality.
+For the full mean, partition $0,\ldots,T$ into the entire
+first schedule block and $B_{1},\ldots,B_{m}$ : 
+ $\frac{1}{T+1}\sum_{t=0}^{T}\delta_{t}=\frac{K}{T+1}\left(\frac{1}{K}\sum_{t=0}^{K-1}\delta_{t}\right)+\sum_{i=1}^{m}\frac{|B_{i}|}{T+1}\bar{\delta}_{i}.$ 
+ The coefficients on the right sum to one. The first mean is
+bounded by ( 70 ), which is no larger than
+the right side of ( 74 ); every remaining
+mean is bounded by ( 74 ) itself.
+Their convex combination obeys the same bound. This completes
+the proof of ( 68 ).
+∎ 
+ G.3 Proof of the convex theorem
+ Proof of Theorem 6 .
+ Lemma 5 gives
+ $S^{2}\leq 9\sigma^{2}/4$ and a companion to which
+Lemma 15 applies.
+Because $\eta_{t}\leq\eta$ and $\beta=1/(T+2)$ , for every $0\leq t\leq T$ , 
+ $\mathbb{E}\left\|x_{t}-y_{t}\right\|^{2}\leq 3\beta^{2}\sigma^{2}(t\eta)^{2}\leq 3\sigma^{2}\eta^{2}.$ 
+ (75) 
+ Transfer the companion’s last-point guarantee using
+( 59 ) and ( 75 ): 
+ $\displaystyle\mathbb{E}[F(x_{T})-F^{*}]$ 
+ $\displaystyle\leq 2\delta_{T}+3L\sigma^{2}\eta^{2}$ 
+ $\displaystyle\leq\frac{8\mathrm{e}R^{2}}{\eta(T+1)}+36\mathrm{e}\eta S^{2}+3L\sigma^{2}\eta^{2}$ 
+ $\displaystyle\leq\frac{8\mathrm{e}R^{2}}{\eta(T+1)}+(81\mathrm{e}+3/32)\eta\sigma^{2}$ 
+ $\displaystyle\leq\frac{8\mathrm{e}R^{2}}{\eta(T+1)}+82\mathrm{e}\eta\sigma^{2}.$ 
+ Here $36(9/4)=81$ and $L\eta\leq 1/32$ .
+For the uniform mean, convexity gives 
+ $\mathbb{E}[F(\bar{x}_{T})-F^{*}]\leq\frac{1}{T+1}\sum_{t=0}^{T}\mathbb{E}[F(x_{t})-F^{*}]\leq\frac{2}{T+1}\sum_{t=0}^{T}\delta_{t}+3L\sigma^{2}\eta^{2}.$ 
+ Use the mean part of ( 68 ) and the
+same numerical calculation. This proves the last-point and uniform-mean bound. 
+ The stepsize-weighted mean. 
+Use Theorem 13 directly, and put $K=\lceil(T+1)/2\rceil$ .
+The first $K$ weights
+equal $\eta$ , every weight is at most $\eta$ , and $K\geq(T+1)/2$ .
+Therefore 
+ $\Lambda_{T}\geq K\eta\geq(T+1)\eta/2,\qquad\sum_{t=0}^{T}\eta_{t}^{2}\leq\eta\Lambda_{T},\qquad\frac{\Lambda_{T}}{T+2}\leq\eta.$ 
+ Insert these three inequalities into
+( 65 ): 
+ $\displaystyle\mathbb{E}[F(\bar{x}_{T}^{\eta})-F^{*}]$ 
+ $\displaystyle\leq\frac{4R^{2}}{\eta(T+1)}+\frac{9}{2}\eta\sigma^{2}+3L\eta^{2}\sigma^{2}$ 
+ $\displaystyle\leq\frac{4R^{2}}{\eta(T+1)}+\left(\frac{9}{2}+\frac{3}{32}\right)\eta\sigma^{2}\leq\frac{4R^{2}}{\eta(T+1)}+5\eta\sigma^{2}.$ 
+ This gives the weighted-mean bound. Its right side is no larger than
+the common bound for the last iterate and uniform mean, so that
+bound applies to all three outputs. 
+ Choice of the base stepsize. 
+For the stepsize choice in Theorem 6 , 
+ $\frac{1}{\eta}=\max\left\{32L,\frac{\sqrt{41}\sigma\sqrt{T+1}}{2R}\right\}\leq 32L+\frac{\sqrt{41}\sigma\sqrt{T+1}}{2R},\qquad\eta\leq\frac{2R}{\sqrt{41}\sigma\sqrt{T+1}}.$ 
+ Thus the two terms of the common bound satisfy 
+ $\displaystyle\frac{8\mathrm{e}R^{2}}{\eta(T+1)}$ 
+ $\displaystyle\leq\frac{256\mathrm{e}LR^{2}}{T+1}+\frac{4\sqrt{41}\,\mathrm{e}\sigma R}{\sqrt{T+1}},$ 
+ $\displaystyle 82\mathrm{e}\eta\sigma^{2}$ 
+ $\displaystyle\leq\frac{164\mathrm{e}\sigma R}{\sqrt{41}\sqrt{T+1}}=\frac{4\sqrt{41}\,\mathrm{e}\sigma R}{\sqrt{T+1}}.$ 
+ Adding proves the tuned bound.
+If $\sigma=0$ , choose $\eta=1/(32L)$ and obtain the first term
+of the tuned bound. If $R=0$ , the separate zero-step
+choice returning $x_{0}=x^{*}$ gives zero error.
+∎ 
+ Appendix H Proof of Theorems 7 and 8 
+ H.1 The linearly weighted mean
+ Proof of Theorem 7 .
+ Use the parameters in ( 32 ), and write
+ $W_{T}=\sum_{t=0}^{T}(t+s)=(T+1)(T+2s)/2$ .
+The choices satisfy $\beta\leq 1/2$ and $\eta_{t}\leq 1/(2L)$ , so the companion
+lemma applies. For the remainder of this proof write 
+ $D_{t}=\mathbb{E}\left\|y_{t}-x^{*}\right\|^{2},\qquad\delta_{t}=\mathbb{E}[F(y_{t})-F^{*}].$ 
+ The one-step inequality. 
+Expand the squared distance in ( 55 ). The cross terms
+containing $\nu_{t}$ vanish after conditioning on $\mathcal{F}_{t}$ , giving 
+ $\displaystyle D_{t+1}$ 
+ $\displaystyle\leq D_{t}-2\eta_{t}\mathbb{E}\left\langle\nabla F(y_{t}),y_{t}-x^{*}\right\rangle+\eta_{t}^{2}\mathbb{E}\left\|\nabla F(y_{t})\right\|^{2}+\eta_{t}^{2}S^{2}$ 
+ $\displaystyle\leq(1-\lambda\eta_{t})D_{t}-2\eta_{t}(1-L\eta_{t})\delta_{t}+\eta_{t}^{2}S^{2}$ 
+ $\displaystyle\leq(1-\lambda\eta_{t})D_{t}-\eta_{t}\delta_{t}+\eta_{t}^{2}S^{2}.$ 
+ The second line uses
+ $\left\langle\nabla F(y_{t}),y_{t}-x^{*}\right\rangle\geq F(y_{t})-F^{*}+\lambda\left\|y_{t}-x^{*}\right\|^{2}/2$ , together with ( 19 ). The third line
+uses $L\eta_{t}\leq 1/2$ . Rearranging and substituting the stepsize gives 
+ $\delta_{t}\leq\frac{\lambda}{2}(t+s-1)D_{t}-\frac{\lambda}{2}(t+s+1)D_{t+1}+\frac{2S^{2}}{\lambda(t+s+1)}.$ 
+ (76) 
+ Summation with increasing weights. 
+Multiply ( 76 ) by $t+s$ : 
+ $\displaystyle(t+s)\delta_{t}\leq\frac{\lambda}{2}\bigl((t+s)(t+s-1)D_{t}-(t+s)(t+s+1)D_{t+1}\bigr)+\frac{2S^{2}}{\lambda}\frac{t+s}{t+s+1}.$ 
+ At $t=0$ , the distance terms are
+ $s(s-1)D_{0}-s(s+1)D_{1}$ . At $t=1$ , they are
+ $s(s+1)D_{1}-(s+1)(s+2)D_{2}$ . Thus the $D_{1}$ terms cancel,
+and the same cancellation occurs at every interior index. Summing gives 
+ $\displaystyle\sum_{t=0}^{T}(t+s)\delta_{t}$ 
+ $\displaystyle\leq\frac{\lambda}{2}\bigl(s(s-1)D_{0}-(T+s)(T+s+1)D_{T+1}\bigr)+\frac{2S^{2}}{\lambda}\sum_{t=0}^{T}\frac{t+s}{t+s+1}$ 
+ $\displaystyle\leq\frac{\lambda s(s-1)R^{2}}{2}+\frac{2(T+1)S^{2}}{\lambda}.$ 
+ Here $D_{T+1}\geq 0$ , every fraction is at most one, and $D_{0}=R^{2}$ . 
+ Transfer to the STORM iterates. 
+Convexity and ( 58 ) imply 
+ $\displaystyle\mathbb{E}[F(\bar{x}_{T})-F^{*}]$ 
+ $\displaystyle\leq\frac{1}{W_{T}}\sum_{t=0}^{T}(t+s)\mathbb{E}[F(x_{t})-F^{*}]$ 
+ $\displaystyle\leq\frac{2}{W_{T}}\sum_{t=0}^{T}(t+s)\delta_{t}+\frac{3L\beta^{2}\sigma^{2}}{\lambda^{2}}$ 
+ $\displaystyle\leq\frac{\lambda s(s-1)R^{2}}{W_{T}}+\frac{4(T+1)S^{2}}{\lambda W_{T}}+\frac{3L\beta^{2}\sigma^{2}}{\lambda^{2}}.$ 
+ Substitute $W_{T}=(T+1)(T+2s)/2$ , $S^{2}\leq 9\sigma^{2}/4$ , and
+ $\beta=1/(T+s+1)$ to obtain the sharper three-term bound 
+ $\mathbb{E}[F(\bar{x}_{T})-F^{*}]\leq\frac{2\lambda s(s-1)R^{2}}{(T+1)(T+2s)}+\frac{18\sigma^{2}}{\lambda(T+2s)}+\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}.$ 
+ (77) 
+ For the simpler bound, use $s\geq 4\kappa\geq 4$ : 
+ $\displaystyle\frac{18\sigma^{2}}{\lambda(T+2s)}+\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}$ 
+ $\displaystyle\leq\left(18+\frac{3\kappa}{T+s+1}\right)\frac{\sigma^{2}}{\lambda(T+s+1)}$ 
+ $\displaystyle\leq\left(18+\frac{3}{4}\right)\frac{\sigma^{2}}{\lambda(T+s+1)}\leq\frac{19\sigma^{2}}{\lambda(T+s+1)}.$ 
+ If $J$ is independent of the run with
+ $\Pr(J=t)=(t+s)/W_{T}$ , the weighted average of expected STORM function gaps equals
+ $\mathbb{E}[F(x_{J})-F^{*}]$ . The same calculation therefore proves the
+random-output assertion.
+∎ 
+ H.2 A block comparison for an SGD companion
+ Lemma 16 (From an earlier block to the last point) . 
+ Let $F$ be differentiable and convex, and consider 
+ $y_{t+1}=y_{t}-\eta_{t}h_{t},\qquad\mathbb{E}[h_{t}\mid\mathcal{F}_{t}]=\nabla F(y_{t}),$ 
+ where $(\mathcal{F}_{t})$ is a filtration and $y_{t}$ is
+ $\mathcal{F}_{t}$ -measurable. Let $T\geq 1$ be an integer and set 
+ $M=\lceil(T+1)/4\rceil,\qquad K=\lceil(T+1)/2\rceil,\qquad\gamma_{t}=\frac{c}{t+s+1},\qquad c>0,\ s\geq 0.$ 
+ Use the boundaries in ( 25 ) and the stepsizes
+ $\eta_{t}=2^{-i}\gamma_{t}$ for $U_{i}\leq t 
+ $\mathbb{E}F(y_{T})\leq\min_{M-1\leq t\leq K-1}\mathbb{E}F(y_{t})+64G^{2}\gamma_{T}.$ 
+ (78) 
+ It is enough to introduce $y_{T+1}$ virtually; the output is $y_{T}$ . 
+ Proof.
+ Since $T\geq 1$ , we have $m\geq 1$ . We use the geometry proved in
+Lemma 12 :
+ $M\geq(T+1)/4$ , $K\leq 2M$ , and $n=K-M+1\geq(T+1)/4$ . 
+ Comparison with an earlier point. 
+Fix deterministic indices $M-1\leq p\leq q\leq T$ .
+For every $p\leq t\leq q$ , expand the update around $y_{p}$ : 
+ $\left\|y_{t+1}-y_{p}\right\|^{2}=\left\|y_{t}-y_{p}\right\|^{2}-2\eta_{t}\left\langle h_{t},y_{t}-y_{p}\right\rangle+\eta_{t}^{2}\left\|h_{t}\right\|^{2}.$ 
+ Although $y_{p}$ is random, it is $\mathcal{F}_{t}$ -measurable because
+ $p\leq t$ . The same is true of $y_{t}$ . Consequently, 
+ $\displaystyle\mathbb{E}[\left\langle h_{t},y_{t}-y_{p}\right\rangle\mid\mathcal{F}_{t}]$ 
+ $\displaystyle=\left\langle\mathbb{E}[h_{t}\mid\mathcal{F}_{t}],y_{t}-y_{p}\right\rangle$ 
+ $\displaystyle=\left\langle\nabla F(y_{t}),y_{t}-y_{p}\right\rangle$ 
+ $\displaystyle\geq F(y_{t})-F(y_{p}).$ 
+ The last inequality is convexity applied with expansion point $y_{t}$ : 
+ $F(y_{p})\geq F(y_{t})+\left\langle\nabla F(y_{t}),y_{p}-y_{t}\right\rangle.$ 
+ Taking expectations in the distance identity therefore gives 
+ $2\eta_{t}\bigl(\mathbb{E}F(y_{t})-\mathbb{E}F(y_{p})\bigr)\leq\mathbb{E}\left\|y_{t}-y_{p}\right\|^{2}-\mathbb{E}\left\|y_{t+1}-y_{p}\right\|^{2}+\eta_{t}^{2}G^{2}.$ 
+ Summing from $t=p$ to $q$ cancels intermediate distance.
+The first distance is $\left\|y_{p}-y_{p}\right\|^{2}=0$ , so 
+ $\displaystyle 2\sum_{t=p}^{q}\eta_{t}\bigl(\mathbb{E}F(y_{t})-\mathbb{E}F(y_{p})\bigr)\leq-\mathbb{E}\left\|y_{q+1}-y_{p}\right\|^{2}+G^{2}\sum_{t=p}^{q}\eta_{t}^{2}\leq G^{2}\sum_{t=p}^{q}\eta_{t}^{2}.$ 
+ We will use the resulting inequality in the form 
+ $2\sum_{t=p}^{q}\eta_{t}\bigl(\mathbb{E}F(y_{t})-\mathbb{E}F(y_{p})\bigr)\leq G^{2}\sum_{t=p}^{q}\eta_{t}^{2}.$ 
+ (79) 
+ All distances in this calculation have finite expectations: indeed,
+ $y_{t}-y_{p}=-\sum_{j=p}^{t-1}\eta_{j}h_{j}$ is a finite sum of random vectors
+with finite second moments. 
+ Comparison of adjacent blocks. 
+Use the comparison blocks ( 62 ). They are
+consecutive from $M-1$ through $T$ , and $B_{m}=\{T\}$ .
+Choose index $\tau_{i}\in B_{i}$ minimizing
+ $\mathbb{E}F(y_{t})$ on $B_{i}$ , and write 
+ $H_{i}=\mathbb{E}F(y_{\tau_{i+1}})-\mathbb{E}F(y_{\tau_{i}})\qquad(0\leq i 
+ The index $\tau_{i}$ is deterministic because the quantities being
+minimized are expectations, not observed sample-path values. 
+ Apply ( 79 ) with
+ $p=\tau_{i}$ and $q=\max B_{i+1}$ . The left sum consists of the
+remaining part of the source block $B_{i}$ and all of the target block
+ $B_{i+1}$ . On the source part, the choice of $\tau_{i}$ gives 
+ $\mathbb{E}F(y_{t})-\mathbb{E}F(y_{\tau_{i}})\geq 0.$ 
+ On the target block, the choice of $\tau_{i+1}$ gives 
+ $\mathbb{E}F(y_{t})-\mathbb{E}F(y_{\tau_{i}})\geq\mathbb{E}F(y_{\tau_{i+1}})-\mathbb{E}F(y_{\tau_{i}})=H_{i}.$ 
+ All stepsizes are positive. Thus the whole left side of
+( 79 ) is at least
+ $2H_{i}\sum_{t\in B_{i+1}}\eta_{t}$ . Dividing by this positive
+weight sum gives 
+ $H_{i}\leq\frac{G^{2}\sum_{t=\tau_{i}}^{\max B_{i+1}}\eta_{t}^{2}}{2\sum_{t\in B_{i+1}}\eta_{t}}.$ 
+ (80) 
+ This reasoning is valid whether $H_{i}$ is positive, zero, or negative. 
+ The effect of rounded block lengths. 
+First consider $i=0$ . By ( 64 ), the numerator
+in ( 80 ) contains at most $3|B_{1}|$ terms.
+Furthermore, $T+1\leq 4M$ and $s\geq 0$ give 
+ $\eta_{t}\leq\gamma_{M-1}=\frac{c}{M+s}\leq 4\gamma_{T}\quad\text{throughout the first comparison span}.$ 
+ On $B_{1}$ , the multiplier is $1/2$ , and $t\leq T$ implies
+ $\gamma_{t}\geq\gamma_{T}$ . Each target stepsize is therefore
+at least $\gamma_{T}/2$ . Substituting these upper and lower
+bounds into ( 80 ) yields 
+ $H_{0}\leq\frac{3|B_{1}|G^{2}(4\gamma_{T})^{2}}{2|B_{1}|(\gamma_{T}/2)}=48G^{2}\gamma_{T}.$ 
+ Next take $1\leq i 64 ), the
+comparison span contains at most $4|B_{i+1}|$ indices.
+All its indices satisfy $t\geq U_{1}=K\geq(T+1)/2$ , whence 
+ $\gamma_{t}=\frac{c}{t+s+1}\leq 2\gamma_{T}.$ 
+ The largest multiplier in this span is $2^{-i}$ , so its largest
+stepsize is at most $2^{1-i}\gamma_{T}$ .
+On the target block the multiplier is $2^{-i-1}$ , and every
+stepsize is at least $2^{-i-1}\gamma_{T}$ . Consequently, 
+ $H_{i}\leq\frac{4|B_{i+1}|G^{2}(2^{1-i}\gamma_{T})^{2}}{2|B_{i+1}|2^{-i-1}\gamma_{T}}=16\,2^{-i}G^{2}\gamma_{T}.$ 
+ When $m=1$ , there are no comparisons of this second type. 
+ Summation over the blocks. 
+Since $\tau_{m}=T$ , consecutive differences telescope: 
+ $\displaystyle\mathbb{E}F(y_{T})-\mathbb{E}F(y_{\tau_{0}})$ 
+ $\displaystyle=\sum_{i=0}^{m-1}H_{i}$ 
+ $\displaystyle\leq\left(48+16\sum_{i=1}^{m-1}2^{-i}\right)G^{2}\gamma_{T}$ 
+ $\displaystyle\leq 64G^{2}\gamma_{T}.$ 
+ The defining property of $\tau_{0}$ now proves
+( 78 ). The last comparison uses the update at
+ $t=T$ only to produce the nonnegative terminal distance
+ $\mathbb{E}\left\|y_{T+1}-y_{\tau_{m-1}}\right\|^{2}$ , which is discarded.
+The point $y_{T+1}$ need not be returned or computed by the algorithm.
+∎ 
+ H.3 Proof of the last-iterate theorem
+ Proof of Theorem 8 .
+ Apply Lemma 5 . In particular, the companion
+starts at $y_{0}=x_{0}$ and has centered innovations satisfying 
+ $\mathbb{E}[\nu_{t}\mid\mathcal{F}_{t}]=0,\qquad\mathbb{E}[\left\|\nu_{t}\right\|^{2}\mid\mathcal{F}_{t}]\leq S^{2},\qquad S^{2}=(1+\beta)^{2}\sigma^{2}\leq\frac{9}{4}\sigma^{2}.$ 
+ Write 
+ $D_{t}=\mathbb{E}\left\|y_{t}-x^{*}\right\|^{2},\qquad\delta_{t}=\mathbb{E}[F(y_{t})-F^{*}],\qquad\gamma_{t}=\frac{2}{\lambda(t+s+1)},$ 
+ and let $M=\lceil(T+1)/4\rceil$ , $K=\lceil(T+1)/2\rceil$ .
+The schedule ( 34 ) satisfies $\eta_{t}=\gamma_{t}$ for $0\leq t 
+ Distance decrease in the first half. 
+Expand one companion update around $x^{*}$ : 
+ $y_{t+1}-x^{*}=y_{t}-x^{*}-\eta_{t}\nabla F(y_{t})-\eta_{t}\nu_{t}.$ 
+ The first three terms are $\mathcal{F}_{t}$ -measurable, so the
+cross term with $\nu_{t}$ vanishes after taking expectation.
+Gradient-map contraction and $\nabla F(x^{*})=0$ then imply 
+ $\displaystyle D_{t+1}$ 
+ $\displaystyle\leq(1-\lambda\eta_{t})^{2}D_{t}+\eta_{t}^{2}S^{2}$ 
+ $\displaystyle\leq(1-\lambda\eta_{t})D_{t}+\eta_{t}^{2}S^{2}.$ 
+ (81) 
+ The second line follows from $0\leq\lambda\eta_{t}\leq 1$ .
+During the first block, where $\eta_{t}=\gamma_{t}$ , we claim that 
+ $D_{t}\leq\frac{(s+1)^{2}R^{2}}{(t+s+1)^{2}}+\frac{4S^{2}}{\lambda^{2}(t+s+1)},\qquad 0\leq t\leq K.$ 
+ (82) 
+ At $t=0$ , the first term equals $D_{0}=R^{2}$ and the second is
+nonnegative. For the induction step, put $u=t+s+1$ .
+Here $u\geq 5$ , so $1-2/u\geq 0$ and substitution of the induction
+upper bound into ( 81 ) preserves the inequality.
+Since $\eta_{t}=2/(\lambda u)$ , this gives 
+ $\displaystyle D_{t+1}$ 
+ $\displaystyle\leq\left(1-\frac{2}{u}\right)\left(\frac{(s+1)^{2}R^{2}}{u^{2}}+\frac{4S^{2}}{\lambda^{2}u}\right)+\frac{4S^{2}}{\lambda^{2}u^{2}}$ 
+ $\displaystyle=\frac{(s+1)^{2}R^{2}(u-2)}{u^{3}}+\frac{4S^{2}(u-1)}{\lambda^{2}u^{2}}$ 
+ $\displaystyle\leq\frac{(s+1)^{2}R^{2}}{(u+1)^{2}}+\frac{4S^{2}}{\lambda^{2}(u+1)}.$ 
+ The last line follows term by term from 
+ $(u-2)(u+1)^{2}=u^{3}-3u-2\leq u^{3},\qquad(u-1)(u+1)=u^{2}-1\leq u^{2}.$ 
+ This proves ( 82 ). 
+ Second moments of the search directions. 
+For any $t\geq M-1$ , discard contraction in
+( 81 ) and sum from $M-1$ to $t-1$ : 
+ $D_{t}\leq D_{M-1}+S^{2}\sum_{j=M-1}^{t-1}\eta_{j}^{2}\leq D_{M-1}+S^{2}\sum_{j=M-1}^{\infty}\gamma_{j}^{2}.$ 
+ The infinite sum is only an upper bound on a finite sum; it does
+not introduce additional algorithmic iterations. By monotonicity
+of the summand and $M+s\geq 1$ , 
+ $\displaystyle\sum_{j=M-1}^{\infty}\gamma_{j}^{2}$ 
+ $\displaystyle=\frac{4}{\lambda^{2}}\sum_{k=M}^{\infty}\frac{1}{(k+s)^{2}}$ 
+ $\displaystyle\leq\frac{4}{\lambda^{2}}\left(\frac{1}{(M+s)^{2}}+\int_{M}^{\infty}\frac{du}{(u+s)^{2}}\right)$ 
+ $\displaystyle=\frac{4}{\lambda^{2}}\left(\frac{1}{(M+s)^{2}}+\frac{1}{M+s}\right)\leq\frac{8}{\lambda^{2}(M+s)}.$ 
+ Use ( 82 ) at $t=M-1$ to conclude that 
+ $D_{t}\leq\frac{(s+1)^{2}R^{2}}{(M+s)^{2}}+\frac{12S^{2}}{\lambda^{2}(M+s)},\qquad M-1\leq t\leq T.$ 
+ (83) 
+ Now write $h_{t}=\nabla F(y_{t})+\nu_{t}$ for the companion direction.
+Since $y_{t}$ is $\mathcal{F}_{t}$ -measurable, conditional centering gives
+ $\mathbb{E}\left\langle\nabla F(y_{t}),\nu_{t}\right\rangle=0$ .
+Standard smoothness and $\nabla F(x^{*})=0$ imply
+ $\left\|\nabla F(y_{t})\right\|\leq L\left\|y_{t}-x^{*}\right\|$ .
+Consequently, 
+ $\displaystyle\mathbb{E}\left\|h_{t}\right\|^{2}$ 
+ $\displaystyle=\mathbb{E}\left\|\nabla F(y_{t})\right\|^{2}+\mathbb{E}\left\|\nu_{t}\right\|^{2}$ 
+ $\displaystyle\leq L^{2}D_{t}+S^{2}$ 
+ $\displaystyle\leq\frac{L^{2}(s+1)^{2}R^{2}}{(M+s)^{2}}+\left(1+\frac{12\kappa^{2}}{M+s}\right)S^{2}$ 
+ $\displaystyle\leq\frac{L^{2}(s+1)^{2}R^{2}}{(M+s)^{2}}+4S^{2}=:G^{2}.$ 
+ For the last line, $M+s\geq s\geq 4\kappa^{2}$ gives
+ $12\kappa^{2}/(M+s)\leq 3$ . Thus the moment assumption of
+Lemma 16 holds on the required trajectory segment.
+This argument uses smoothness of $F$ only; it imposes neither
+sample smoothness nor a globally bounded stochastic gradient. 
+ A reference function value. 
+For $M-1\leq t\leq K-1$ , the stepsize is $\gamma_{t}$ .
+Lemma 11 applies because $\gamma_{t}\leq 1/(2L)$ ,
+and gives 
+ $D_{t+1}\leq D_{t}-\gamma_{t}\delta_{t}+\gamma_{t}^{2}S^{2}.$ 
+ Rearranging and summing makes the interior distances cancel: 
+ $\sum_{t=M-1}^{K-1}\gamma_{t}\delta_{t}\leq D_{M-1}-D_{K}+S^{2}\sum_{t=M-1}^{K-1}\gamma_{t}^{2}\leq D_{M-1}+S^{2}\sum_{t=M-1}^{K-1}\gamma_{t}^{2}.$ 
+ The left side is at least the smallest $\delta_{t}$ in the range
+times the positive sum of weights. Hence 
+ $\min_{M-1\leq t\leq K-1}\delta_{t}\leq\frac{D_{M-1}+S^{2}\sum_{t=M-1}^{K-1}\gamma_{t}^{2}}{\sum_{t=M-1}^{K-1}\gamma_{t}}.$ 
+ There are $n=K-M+1\geq(T+1)/4$ indices. Their largest denominator
+in $\gamma_{t}$ is $K+s$ and their smallest is $M+s$ , so 
+ $\sum_{t=M-1}^{K-1}\gamma_{t}\geq\frac{2n}{\lambda(K+s)},\qquad\sum_{t=M-1}^{K-1}\gamma_{t}^{2}\leq\frac{4n}{\lambda^{2}(M+s)^{2}}.$ 
+ Also $K\leq 2M$ , and therefore $K+s\leq 2(M+s)$ . It follows that 
+ $\displaystyle\min_{M-1\leq t\leq K-1}\delta_{t}$ 
+ $\displaystyle\leq\frac{\lambda(K+s)}{2n}D_{M-1}+\frac{2S^{2}(K+s)}{\lambda(M+s)^{2}}$ 
+ $\displaystyle\leq\frac{4\lambda(M+s)}{T+1}D_{M-1}+\frac{4S^{2}}{\lambda(M+s)}$ 
+ $\displaystyle\leq\frac{4\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{16S^{2}}{\lambda(T+1)}+\frac{4S^{2}}{\lambda(M+s)}$ 
+ $\displaystyle\leq\frac{4\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{32S^{2}}{\lambda(T+1)}.$ 
+ In the third line, we use the sharper bound
+( 82 ) at $M-1$ , whose noise coefficient is $4$ ,
+rather than the tail bound with coefficient $12$ .
+For the last line, use $M+s\geq(T+1)/4$ . 
+ The last companion iterate. 
+Lemma 16 , with $c=2/\lambda$ , adds at most 
+ $\displaystyle 64G^{2}\gamma_{T}$ 
+ $\displaystyle=\frac{128L^{2}(s+1)^{2}R^{2}}{\lambda(T+s+1)(M+s)^{2}}+\frac{512S^{2}}{\lambda(T+s+1)}$ 
+ $\displaystyle\leq\frac{32\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{512S^{2}}{\lambda(T+1)}.$ 
+ For the initialization term, divide its coefficient by the
+coefficient of $\lambda(s+1)^{2}R^{2}/[(T+1)(M+s)]$ : 
+ $\frac{128\kappa^{2}(T+1)}{(T+s+1)(M+s)}=128\frac{\kappa^{2}}{M+s}\frac{T+1}{T+s+1}\leq 32.$ 
+ Combining this with the preceding bound on the minimum over
+ $M-1\leq t\leq K-1$ , and using $4+32=36$ and
+ $32+512=544$ , gives 
+ $\mathbb{E}[F(y_{T})-F^{*}]\leq\frac{36\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{544S^{2}}{\lambda(T+1)}.$ 
+ (84) 
+ Transfer to STORM. 
+The comparison bound ( 58 ) gives 
+ $\mathbb{E}[F(x_{T})-F^{*}]\leq 2\mathbb{E}[F(y_{T})-F^{*}]+\frac{3L\beta^{2}\sigma^{2}}{\lambda^{2}}.$ 
+ Substitute ( 84 ), then use
+ $S^{2}\leq 9\sigma^{2}/4$ and $\beta=1/(T+s+1)$ : 
+ $\displaystyle\mathbb{E}[F(x_{T})-F^{*}]$ 
+ $\displaystyle\leq\frac{72\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{1088S^{2}}{\lambda(T+1)}+\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}$ 
+ $\displaystyle\leq\frac{72\lambda(s+1)^{2}R^{2}}{(T+1)(M+s)}+\frac{2448\sigma^{2}}{\lambda(T+1)}+\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}.$ 
+ Finally, $s\geq 4\kappa^{2}\geq\kappa$ and
+ $(T+s+1)^{2}\geq 4(T+1)s\geq\kappa(T+1)$ imply 
+ $\frac{3\kappa\sigma^{2}}{\lambda(T+s+1)^{2}}\leq\frac{3\sigma^{2}}{\lambda(T+1)}.$ 
+ Finally, $M+s\geq(T+1)/4$ , so $72/[(T+1)(M+s)]\leq 288/(T+1)^{2}$ , which proves the bound in Theorem 8 .
+∎ 
+ Experimental support, please
+ view the build logs 
+ for errors. Generated by
+ L
+ A 
+ T
+ E 
+ xml 
+ .
+ Instructions for reporting errors
+ We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile
+ support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the
+ methods listed below:
+ Click the "Report Issue" ( 
+ ) button, located in the page header.
+ Tip: You can select the relevant text first, to include it in your report.
+ Our team has already identified the following issues . We appreciate your time reviewing and reporting rendering errors we
+ may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability
+ should not be a barrier to accessing research. Thank you for your continued support in championing open access for
+ all.
+ Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion , and welcome developer contributions .
+ We gratefully acknowledge support from
+ our major funders ,
+ member institutions , ,
+ and all contributors.
+ About 
+ · 
+ Help 
+ · 
+ Contact 
+ · 
+ Subscribe 
+ · 
+ Copyright 
+ · 
+ Privacy 
+ · 
+ Accessibility 
+ · 
+ Operational Status (opens in new tab) 
+ Major funding support from
