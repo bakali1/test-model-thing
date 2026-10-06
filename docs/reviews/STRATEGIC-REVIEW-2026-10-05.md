@@ -1,13 +1,23 @@
-# Strategic review — the memory programme is aimed at a phantom (2026-10-05)
+# Strategic review — the memory programme is aimed at an unmeasured quantity (2026-10-05, rev 2)
 
 **Author:** deep-review subagent (agent "synthesis2"), verified by the orchestrator.
 **Status:** review, not a plan. No experiment in this document has been run except
 the n-gram ceiling, which was run by the review itself and every number
 re-derived from the repo; reproductions are cheap and given.
 
+> **REV 2 (2026-10-06):** an external critique (`RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md`)
+> was accepted in part, and the overclaims below were corrected in place. Rev 1's
+> "phantom" framing is replaced: the precise claim is that the CE ruler **cannot
+> observe** the memory quantity, not that the quantity is absent. The layer-norm
+> argument is downgraded to a **per-scalar-channel bound, not a network proof**
+> (§3.ii), and "cannot be associative" becomes a **capacity/interference
+> hypothesis to test** (§3.iii). The copy task becomes key→payload→retrieval,
+> with selective-copy for the trained leg (§4). Where rev 1 and rev 2 disagree,
+> rev 2 wins.
+
 This review supersedes the framing of `PLAN-2026-10-04-ROADMAP.md` v3. Where they
 disagree, this review wins. The architecture judgement is reasoned, not measured —
-the copy task in §4 is the falsifier.
+the copy task in §4 is the falsifier (as revised in rev 2).
 
 ---
 
@@ -116,9 +126,18 @@ Consequences:
 
 - The entire reward for horizon 8 B → 64 B is **< 0.03 nats** — below the 0.03
   bar the repo uses for "real". The ruler cannot see memory.
-- No optimiser, estimator or architecture change can produce long memory that is
-  *used*, because the training signal that would reward it is ≈0.03 nats. The
+- **No optimiser, estimator or architecture change can produce long memory that is
+  *used***, because the training signal that would reward it is ≈0.03 nats. The
   ladder was aimed at a nonexistent bottleneck.
+
+> **REV 2:** the second bullet is too strong and is withdrawn as a capability
+> claim. Average TinyStories CE provides very little aggregate incentive for
+> dependencies beyond ≈8 bytes — that is a statement about the **ruler**, not a
+> proof that long memory cannot be learned. A dependency decisive at only 0.5% of
+> positions contributes almost nothing to average CE yet can be a real capability
+> — which is exactly why synthetic memory tasks (§4) are required. The corrected
+> claim: **the CE ruler is structurally insensitive to long-range memory, so
+> every ladder verdict drawn from it is about the ruler, not the model.**
 - The in-domain/cross-domain gap (FS-W vs FS-N: −0.5469 in-domain, +0.96 on
   novels) is a **repetition gap, not a long-range-structure gap** — TinyStories
   is more memorisable, and memorisation does not transfer.
@@ -131,8 +150,9 @@ Consequences:
 
 ## 2. Two problems, and the second is bigger than the memory question
 
-1. **The task does not require long memory** — so the memory programme is aimed
-   at nothing.
+1. **The CE ruler does not require long memory** — so the memory programme, as
+   measured by that ruler, is aimed at an unmeasured quantity (rev 2: *not* at
+   nothing — see response doc §5).
 2. **The model is far from the ceiling on the easy task.** It loses to an 8 MB
    lookup table by 0.40 nats. That is a larger deficit than the memory question
    and nothing in the programme has measured it.
@@ -165,9 +185,13 @@ with no exception for the decay slices, and `sigmoid(0) = 0.5` = half-life exact
 Re-derived from `tmt.npz` (not quoted): logit min −1.00, mean 0.114, std 0.227
 (init std 0.0255) — the logit distribution widened 5×, but `n > 2 B: 135 (1.6%),
 n > 4 B: 11, n > 8 B: 2, n > 32 B: 1`. **This is a random walk around a
-weight-decay anchor at its initialisation value** — noise-driven diffusion under
-a restoring force. It responds to nothing because there is nothing in the
-gradient to respond to: the corpus says 0.03 nats.
+weight-decay anchor at its initialisation value** (rev 2: one consistent reading,
+not a demonstrated mechanism — the alternative is `E[g_θ|θ]` itself pointing at
+zero; the discriminating measurement is `E[g_θ|θ∈bin]` vs `−wd·θ`, see
+`RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md` — the outcome differs in fixes, not
+in final distribution). It responds to nothing because there is nothing in the
+gradient to respond to: the corpus says 0.03 nats on the ruler that is blind to
+memory.
 
 So "the decay parameters essentially never move" is right in effect and wrong in
 mechanism: they wander, diffusively, around the point where they started.
@@ -193,19 +217,28 @@ amplitude
 The table values are right; only the stated constant was off, and no conclusion
 depends on it. The scaling law `~1/√d` is the point.)
 
-Two consequences, both fatal:
+Two consequences — but rev 2 reads them as a **per-scalar-channel bound, not a
+network proof**. The state has 512 channels per layer; a cue spread over r
+independent channels gains ≈√r in aggregate signal, so at r=512 the claim
+"information cannot survive to d=64" fails the critique's own arithmetic
+(`0.607·√(512/64) ≈ 1.72`). Heterogeneous decays a₁…a₅₁₂ also let different
+channels specialise on different d. The honest residual concern is
+variance-channel-swamping under aggregate layer-norm (`Var ∝ 1/(1−a²)`: long-
+decay channels dominate the normalisation budget) — a weaker claim, to be settled
+by the Δh retention probe (§4).
 
-1. The best available amplitude decays like **~1/√d no matter what**. Tuning σ
-   cannot buy long memory. This is an architecture-intrinsic horizon — a
-   property of layer-norm applied to an ungated linear recurrence — that no decay
-   initialisation, gate, or log-spacing can beat.
-2. At the model's σ=0.55 the amplitude at d=8 is **30× below its own ceiling**,
-   and at d=16 is **2500× below**. Even perfect tuning only buys 0.007 → 0.208 at
-   d=8; it does not reach d=64.
+1. The best available amplitude for a **single scalar channel** decays like
+   **~1/√d no matter what**: tuning one σ cannot buy long memory in that channel.
+   Whether the network as a whole is bound by this is unproven (rev 2).
+2. At the model's σ=0.55 the per-channel amplitude at d=8 is **30× below its own
+   ceiling**, and at d=16 is **2500× below**. Even perfect tuning only buys
+   0.007 → 0.208 at d=8; it does not reach d=64.
 
-A longer half-life is a **net loss** under this readout: zero amplitude gain (LN
-removes it), full noise-accumulation cost. You must gate the write (Mamba's
-`Δ_t`) or move memory outside the normalisation.
+For a single scalar channel, a longer half-life is a **net loss** under this
+readout: zero amplitude gain (LN removes it), full noise-accumulation cost. If
+the retention probe confirms the single-channel picture, the fix is to gate the
+write (Mamba's `Δ_t`) or move memory outside the normalisation — but that fix is
+justified only by measurement, not by this derivation alone (rev 2).
 
 **(iii) 8,192 diagonal channels is the wrong shape; the budget is a red herring.**
 
@@ -215,11 +248,22 @@ exactly 1.0 — no gate, no key, no `B_t`/`Δ_t` anywhere in the forward pass
 store**. Retrieval requires addressing ("what did I write where `XQ7P`
 appeared?"); TMT can only ask "what is the exponentially-weighted average of
 everything recent?" Those are different questions, and no allocation of 8,192
-diagonal channels answers the second. `ARCHITECTURE_IDEAS2.md §16.1`'s "secret
-symbol at d=10⁶" is an attention test wearing a memory costume: there is no key
-in the model to look up with.
+diagonal channels answers the second **as an exact mechanism**. Rev 2: "not
+explicitly addressable" is a **capacity / interference limitation, not a logical
+impossibility** — a learned encoder can distribute key/value structure into the
+state, and a downstream nonlinear network can operate on the superposition. The
+testable form of the objection is **selectivity**: can the state transition
+protect relevant information from irrelevant writes? That is exactly what Mamba's
+selective-copy isolates (S4 18.3% vs selective SSM 97%+ on the induction-style
+task). `ARCHITECTURE_IDEAS2.md §16.1`'s "secret symbol at d=10⁶" remains an
+attention test wearing a memory costume, but the honest verdict is that the
+model **as built** has no key to look up with — not that the class of models
+cannot (rev 2).
 
-Verdict: **the defect is not σ. It is the ungated, non-addressable write.**
+Verdict (rev 2): **the defect is not σ, and it is not yet proven to be the
+ungated write either. The strongest defensible claim is that the measurements
+conflated three questions — corpus reward, state retention, selective retrieval —
+and the programme must measure retention and selectivity directly.**
 
 ---
 
@@ -229,6 +273,16 @@ Byte stream = uniform random bytes; a **4-byte key** planted at position 0; then
 *d* random distractor bytes; then the **same 4-byte key again**; the model must
 predict the 4 bytes that follow the second occurrence. Sweep d ∈ {8, 32, 128,
 512, 2048}. Chance = 1/256 per byte.
+
+> **REV 2 — task made associative (per external critique).** The bare form above
+> can collapse into pattern recognition (repeating the last-seen 4-byte string);
+> it is a re-appearance pattern, not key→value retrieval. The task must carry a
+> **payload**: `KEY → PAYLOAD → d distractors → KEY → predict PAYLOAD`, with the
+> payload random and **independent of the key**, so the model must truly associate
+> the key with its payload across the gap. And for the trained leg (Stage 2), the
+> gap must be **randomised per sample and mixed with irrelevant key/payload
+> pairs** — the selective-copy form — so the model must decide what to preserve
+> rather than wait a known number of steps.
 
 Why: it is the only instrument that makes the ruler sensitive. Uniform random
 distractors make the task memory-obliterating — local frequency statistics are
@@ -240,15 +294,37 @@ adjudicates §3(ii) directly.
 state, plant the 4-byte key, feed *d* random distractors, probe with
 `tools/state_probe.py`.
 
+> **REV 2 — the second row below was NOT a valid falsifier as written.** A
+> TinyStories-trained checkpoint was never optimised to encode arbitrary random
+> 4-byte keys; chance-level copy accuracy proves almost nothing about
+> architectural possibility (and a pass would not be clean either). The valid
+> Stage 1 is the **retention (Δh) probe**: two identical sequences differing only
+> in the initial key, measure the state difference Δh_d versus d — before LN,
+> after LN, after the nonlinear block, and at the logits — and compare against
+> `a^d·√(1−a²)`. Dies by d≈16 ⇒ the architecture genuinely suppresses temporal
+> perturbations (LN ceiling strengthened); alive at d=512 ⇒ the LN-ceiling
+> hypothesis is weakened. This replaces the table below as the primary reading.
+
 | Result | Conclusion | Action |
 |---|---|---|
 | above chance at d=512+ | architecture fine; corpus was the whole problem | fix the data; nothing architectural |
-| dies at d≈8–16 matching `f(a,d)` | architecture is the constraint; LN + ungated write is the mechanism | gated write (`Δ_t`), strip wd from decay logits, log-spaced init (S4D), memory outside the LN |
+| dies at d≈8–16 matching `f(a,d)` | **not a valid falsifier alone (rev 2)**; only corroborates the LN mechanism at the retention level | gated write (`Δ_t`), strip wd from decay logits, log-spaced init (S4D), memory outside the LN |
 
 **Stage 2** (only if stage 1 fails): train on it, ~2 GPU-hours across the sweep.
 
-**Falsifier, stated in advance:** if a trained model beats chance at d=2048, the
-layer-norm ceiling is wrong and §3(ii) collapses.
+**Falsifier, restated in advance (rev 2):** the trained leg must use the
+**payload + random-gap selective-copy** form — `KEY → PAYLOAD → distractors (random
+gap) → KEY → predict PAYLOAD`, payload random and independent of the key, plus
+irrelevant key/payload pairs — because vanilla fixed-gap copying can be gamed by
+time-aware fixed dynamics. If a trained model beats chance at d=2048, the
+layer-norm ceiling is wrong and §3(ii) collapses as a network claim.
+
+> **Status of the falsifier (rev 2):** the corrected probe
+> (`tools/copy_probe_fix.py`, shared distractor stream + same second key +
+> permutation null) was shipped to the MX150 at 19:33 on 2026-10-05 but its
+> results **never returned** — the runner session ends `Command aborted` at 19:38
+> and no numbers exist in `RESULTS.md`, `runs/`, or any later session. The
+> architecture question is **OPEN** until the retention probe runs.
 
 ---
 
@@ -296,3 +372,9 @@ n-gram numbers come from `lag5.py` (pure-Python, no hashing; `lag2/3.py` contain
 rolling-hash aliasing bug and are superseded). Reruns: build `data/eval` + 8 MB of
 `wiki_tinystories_*.txt` head as train, 300 kB of `tinystories_valid.txt` as
 held-out, MAXORD=12, interpolation weight λ with geometric falloff.
+
+**Rev 2 verification (2026-10-06):** the in-place corrections above were checked
+against the external critique in `RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md`. The
+residual open facts there are unchanged by this revision: the corrected copy probe
+results are still missing (§4), the Δh retention probe has not run, and the
+`E[g_θ|θ]` vs `−wd·θ` measurement has not run.
