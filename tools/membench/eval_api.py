@@ -37,6 +37,11 @@ from __future__ import annotations
 import math
 
 from . import generators as G
+from . import model_backend
+from .model_backend import (model_retention_curve, model_selective_copy_accuracy,
+                            model_associative_retrieval_accuracy,
+                            model_language_ce, model_transfer_ce,
+                            model_cross_domain_ce, load_frozen)
 
 # Every memory result must carry these keys (plan section 10).
 METADATA_KEYS = ("cue_type", "gap_distribution", "distractor_type",
@@ -91,6 +96,32 @@ def _finish(meta, metric, value, unit, source, model):
     return meta
 
 
+
+def _run_model(model, backend_fn, *args, **kwargs):
+    """Run a model-backed backend against a numpy_port Model or a checkpoint path.
+
+    model=None -> caller keeps the model-free baseline.  A str is a checkpoint
+    path (loaded frozen, zero state).  Any other object must be a numpy_port
+    Model.  Anything else raises NotImplementedError (keeps the section-10
+    contract contract testable today)."""
+    if model is None:
+        # The model-free baseline. Every caller keeps its own analytic
+        # chance/null path below this dispatch, so returning None rather than
+        # raising is what makes the section-10 contract testable today
+        # without a checkpoint. Raising here (as this did at first) made
+        # `fn()` with no model unreachable and turned check_membench red.
+        return None
+    if isinstance(model, str):
+        m, _info = load_frozen(model)
+    elif hasattr(model, "new_states") and hasattr(model, "load"):
+        m = model
+    else:
+        raise NotImplementedError(
+            f"model must be a checkpoint path (str), a numpy_port Model, or "
+            f"None for the model-free baseline; got {type(model).__name__}")
+    return backend_fn(m, *args, **kwargs)
+
+
 def _check_d(d, what):
     d = int(d)
     if d not in G.GAP_LADDER:
@@ -127,6 +158,10 @@ def retention_curve(d_list, seed=_SEED_DEFAULT, sample_count=_COUNT_DEFAULT,
                     "scalar prediction a^d*sqrt(1-a^2) needs the checkpoint's "
                     "actual decay sigma",
         })
+    r = _run_model(model, model_retention_curve, d_list, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "retention_curve")
     return _finish(meta, metric="retention_curve",
                    value={int(x): 0.0 for x in d_list},
@@ -155,6 +190,10 @@ def selective_copy_accuracy(d, n_pairs=3, seed=_SEED_DEFAULT,
         chance_level={"per_byte": CHANCE_PER_BYTE,
                       "exact_payload": EXACT_PAYLOAD_CHANCE,
                       "n_pairs_max": int(n_pairs)})
+    r = _run_model(model, model_selective_copy_accuracy, d, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "selective_copy_accuracy")
     return _finish(meta, metric="selective_copy_accuracy",
                    value=EXACT_PAYLOAD_CHANCE,
@@ -181,6 +220,10 @@ def associative_retrieval_accuracy(d, seed=_SEED_DEFAULT,
         distractor_type="uniform random bytes (vocab 256)",
         chance_level={"per_byte": CHANCE_PER_BYTE,
                       "exact_payload": EXACT_PAYLOAD_CHANCE})
+    r = _run_model(model, model_associative_retrieval_accuracy, d, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "associative_retrieval_accuracy")
     return _finish(meta, metric="associative_retrieval_accuracy",
                    value=EXACT_PAYLOAD_CHANCE,
@@ -212,6 +255,10 @@ def language_ce(L=512, seed=_SEED_DEFAULT, sample_count=_COUNT_DEFAULT,
                           f"L = {L}"),
         distractor_type="uniform random filler bytes (vocab 256)",
         chance_level=cl)
+    r = _run_model(model, model_language_ce, L=L, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "language_ce")
     return _finish(meta, metric="language_ce",
                    value=cl["chance_ce_nats_per_byte"],
@@ -237,6 +284,14 @@ def transfer_ce(seed=_SEED_DEFAULT, sample_count=_COUNT_DEFAULT, model=None):
                         "on synthetic memory tasks transfers to text",
         chance_level={"per_byte": CHANCE_PER_BYTE,
                       "chance_ce_nats_per_byte": math.log(G.VOCAB)})
+    # NOTE: the backend is model_transfer_ce, NOT transfer_ce. Dispatching to
+    # this function's own name would recurse forever (transfer_ce ->
+    # _run_model -> transfer_ce), which is what an earlier revision of this
+    # dispatch did; the correct line sat below it, unreachable.
+    r = _run_model(model, model_transfer_ce, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "transfer_ce")
     return _finish(meta, metric="transfer_ce", value=math.log(G.VOCAB),
                    unit="nats per byte (chance)",
@@ -258,6 +313,11 @@ def cross_domain_ce(seed=_SEED_DEFAULT, sample_count=_COUNT_DEFAULT,
         distractor_type="n/a -- domain shift, not distractors",
         chance_level={"per_byte": CHANCE_PER_BYTE,
                       "chance_ce_nats_per_byte": math.log(G.VOCAB)})
+    # model_cross_domain_ce, not cross_domain_ce -- see the note in transfer_ce.
+    r = _run_model(model, model_cross_domain_ce, seed=seed,
+                   sample_count=sample_count)
+    if r is not None:
+        return r
     _require_model(model, "cross_domain_ce")
     return _finish(meta, metric="cross_domain_ce", value=math.log(G.VOCAB),
                    unit="nats per byte (chance)",

@@ -9,6 +9,10 @@ One command prints everything a result needs:
   * cross-domain CE on the Gutenberg novels (out-of-domain generalization)
   * recurrent health: decay spread, half-life histogram, hot-dim count
   * stop-head calibration: AUC vs line-ends, recall/precision at thresholds
+  * distance curve (Karpathy 2015 Fig. 5): P(correctly closing a byte) as a
+    function of the distance back to its matching open byte. Opt-in
+    (--dc-bytes N); reads the SAME held-out files and the SAME forward-pass
+    convention as the CE cells above.
 
 Hard guard (Phase 0.1): if any eval file is also reachable by the training
 glob, the script refuses to run -- an eval on trained bytes is worse than no
@@ -36,6 +40,38 @@ TRAIN_GLOB_DEFAULT = "data/wikipedia_clean/**/wiki_*"
 EVAL_GLOB_DEFAULT = "data/eval/**/*"
 SHIFT_GLOB_DEFAULT = "data/eval_shift/**/*"
 NOVEL_GLOB_DEFAULT = "data/*.txt"
+
+# --- distance-curve cell (Karpathy 2015 S4.2, Fig. 5) --------------------
+# Delimiter classes as (class name, open byte, close byte). Kept explicit
+# because the brace half of the 2015 anchor has 0-5 occurrences per 18-41 MB
+# file in this corpus: that is reported as "no events", which is a different
+# statement from a measured null and must not read like one.
+DC_CLASSES = [("quote", 0x22, 0x22), ("apos", 0x27, 0x27),
+              ("paren", 0x28, 0x29), ("brack", 0x5B, 0x5D),
+              ("brace", 0x7B, 0x7D)]
+# Distance bins in BYTES (the model's unit). Fixed edges so two runs are
+# comparable without re-deriving bins from the data.
+DC_BINS = [(1, 8), (8, 32), (32, 64), (64, 128), (128, 256), (256, 512),
+           (512, 1024), (1024, float("inf"))]
+DC_SCOPE_NOTE = (
+    "SCOPE - read before reading a null here: the existing needle probe "
+    "(#23) tested literal-cue induction only. Obfuscated and parallel-"
+    "tracking retrieval were never tested. So this cell measures one thing, "
+    'and its null does not generalize to "no memory."')
+DC_PARITY_NOTE = (
+    "CONFOUND, stated with the curve because it changes what a HIGH lift "
+    "means: same-byte classes (quote, apostrophe) strictly alternate in this "
+    "corpus, so a model that has only counted opens and closes since the last "
+    "byte can score well here without holding any content. This cell measures "
+    "parity tracking at minimum, which is the cheapest form of memory there "
+    "is. The two-byte classes (paren/bracket/brace), where alternation gives "
+    "nothing, are the ones that would test content -- and they have ~0 events "
+    "in this corpus.")
+DC_ANCHOR = (
+    "anchor, Karpathy 2015 S4.2 / Fig. 5 (arXiv:1506.02078v2): a 1M-param "
+    "LSTM trained with truncated BPTT-100 + RMSProp tracks ~230-char quotes "
+    "and boosts closing-brace accuracy to ~60 chars. The honest null for "
+    "this cell is BELOW that 2015 LSTM, not at it.")
 
 
 def _files(pattern):
@@ -100,6 +136,158 @@ def _eval_corpus(m, files, n_slices, n_bytes):
     return ces, srcs, total, stops, labs
 
 
+def _dc_match(raw):
+    """Matched (open, close) index pairs, per delimiter class.
+
+    Same-byte classes (quote, apostrophe) are matched by alternation; a
+    two-byte class (paren/bracket/brace) is matched with a stack, nearest
+    open first. Closes with no open are COUNTED rather than dropped: an
+    unmatched close means the pairing assumption failed on this text, which is
+    a fact about the corpus the cell has to report, not an error to hide.
+    """
+    out = {}
+    for name, ob, cb in DC_CLASSES:
+        if ob == cb:
+            ev = [(int(i), k % 2) for k, i in enumerate(np.flatnonzero(raw == ob))]
+        else:
+            ev = [(int(i), 0) for i in np.flatnonzero(raw == ob)]
+            ev += [(int(i), 1) for i in np.flatnonzero(raw == cb)]
+            ev.sort()
+        stack, pairs, unmatched = [], [], 0
+        for pos, kind in ev:
+            if kind == 0:
+                stack.append(pos)
+            elif stack:
+                pairs.append((stack.pop(), pos))
+            else:
+                unmatched += 1
+        out[name] = (pairs, unmatched, len(ev))
+    return out
+
+
+def _dc_curve(m, files, n_bytes, batch):
+    """P(correctly closing a byte | distance back to its matching open byte).
+
+    Teacher-forced on held-out bytes: at each position the model emits a 256-way
+    byte distribution, and we read off the probability of the byte that really
+    came next. A pair (open at o, close at c) contributes P(byte c | bytes
+    [0..c-1]) at distance d = c - o. The window is the FIRST n_bytes of each
+    held-out file, concatenated -- fixed rather than sampled, because two arms
+    of an A/B must be scored on the SAME pairs and the pairs are what the bin
+    means are taken over.
+
+    Streams are contiguous chunks, not strided, because a pair's open and
+    close must be fed through the SAME recurrent state.
+
+    Returns a dict of raw per-pair probabilities (plus the floor), so a caller
+    can do a PAIRED arm-vs-arm difference on identical pairs instead of
+    comparing two independent bin means.
+    """
+    parts, srcs = [], []
+    for f in files:
+        with open(f, "rb") as fh:
+            parts.append(np.frombuffer(fh.read(n_bytes), np.uint8))
+        srcs.append(os.path.basename(f))
+    blob = np.concatenate(parts)
+    keep = (len(blob) // batch) * batch
+    truncated = len(blob) - keep
+    blob = blob[:keep]
+    L = keep // batch
+
+    matched = _dc_match(blob)
+    # step -> [(stream, pair index, closing byte)]: the step whose OUTPUT
+    # distribution has to contain the closing byte. Keyed by step alone, so the
+    # hot loop is one dict lookup per step instead of one per stream.
+    want = {}
+    skipped = 0
+    cls_list, dist, slots = [], [], []
+    for name, _ob, cb in DC_CLASSES:
+        pairs, _unmatched, _events = matched[name]
+        for o, c in pairs:
+            stream, loc = divmod(c, L)
+            if loc == 0:
+                skipped += 1      # close is byte 0 of its stream: no prior state
+                continue
+            pidx = len(dist)
+            dist.append(c - o)
+            cls_list.append(name)
+            slots.append(pidx)
+            want.setdefault(loc - 1, []).append((stream, pidx, cb))
+    vals = np.full(len(slots), np.nan)
+
+    m.new_states(batch)
+    marg = {name: 0.0 for name, _ob, _cb in DC_CLASSES}
+    ce_sum = 0.0
+    ce_n = 0
+    n_pos = 0
+    seq = blob.reshape(batch, L)              # (batch, L) time-minor
+    for t in range(L):
+        enc = m.embed[seq[:, t]]
+        x = enc
+        for l in m.layers:
+            x, st, _d, _c = l.forward(enc, x, l.states)
+            l.states = st
+        logits = x @ m.Wd.T + m.bd
+        mx = logits.max(axis=1)
+        lse = mx + np.log(np.exp(logits - mx[:, None]).sum(axis=1))
+        p = np.exp(logits - lse[:, None])
+        for name, _ob, cb in DC_CLASSES:
+            marg[name] += float(p[:, cb].sum())
+        if t + 1 < L:
+            # CE is logsumexp MINUS the logit of the byte that actually came
+            # next. Reporting the logsumexp alone would be reporting the
+            # partition function (~14.7 nats on this checkpoint) and calling
+            # it a loss, which is the kind of definitional slip this repo
+            # already paid for once with coverage.
+            ce_sum += float((lse - logits[np.arange(batch), seq[:, t + 1]]).sum())
+            ce_n += batch
+        n_pos += batch
+        for stream, pidx, byte in want.get(t, ()):
+            vals[pidx] = p[stream, byte]
+    m.new_states(1)
+    return {
+        "classes": sorted(set(cls_list)),
+        "cls": np.array(cls_list),
+        "dist": np.array(dist, float),
+        "p": vals,
+        "floor": {k: (v / max(1, n_pos)) for k, v in marg.items()},
+        "n_positions": n_pos,
+        "window_bytes": keep,
+        "truncated_bytes": truncated,
+        "stream_len": L,
+        "batch": batch,
+        "files": srcs,
+        "skipped_boundary": skipped,
+        "unmatched": {k: v[1] for k, v in matched.items() if v[2]},
+        "events": {k: v[2] for k, v in matched.items()},
+        "mean_nats_per_byte": ce_sum / max(1, ce_n),
+    }
+
+
+def _dc_bins(dc, cls):
+    """(n, mean p_close, SE of the mean) per distance bin, for one class.
+
+    SE is across PAIRS, not across positions: two pairs in one bin are two
+    independent samples of "the model closed correctly at this distance", and
+    a bin mean over ~10 pairs needs that error bar printed next to it or the
+    curve invites reading noise as a decay.
+    """
+    msk = dc["cls"] == cls
+    d, p = dc["dist"][msk], dc["p"][msk]
+    rows = []
+    for lo, hi in DC_BINS:
+        sel = (d >= lo) & (d < hi)
+        n = int(sel.sum())
+        if n == 0:
+            rows.append((lo, hi, 0, None, None))
+            continue
+        v = p[sel]
+        mean = float(v.mean())
+        se = float(v.std(ddof=1) / np.sqrt(n)) if n > 1 else None
+        rows.append((lo, hi, n, mean, se))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
@@ -115,6 +303,14 @@ def main():
     ap.add_argument("--xd-files", type=int, default=0,
                     help="limit novels scored (0 = all)")
     ap.add_argument("--threshold", type=float, default=0.35)
+    ap.add_argument("--dc-bytes", type=int, default=0,
+                    help="distance-curve cell: held-out bytes per eval file "
+                         "(0 = off). Costs real CPU time on this engine "
+                         "(~370 B/s batched at --dc-batch 64), so it is "
+                         "opt-in and its budget is printed with the curve.")
+    ap.add_argument("--dc-batch", type=int, default=64,
+                    help="independent contiguous streams for the "
+                         "distance-curve cell; must divide dc-bytes*files")
     args = ap.parse_args()
 
     train_files = _files(args.train_glob)
@@ -227,6 +423,94 @@ def main():
             sel = stops > thr
             pre = float(lab[sel].mean()) if sel.any() else float("nan")
             print(f"  thr {thr:<4} recall {100 * rec:5.1f}%  precision {100 * pre:5.1f}%")
+
+    # ---- distance curve (Karpathy 2015 Fig. 5) ----
+    # P(close the byte) against the distance back to its matching open byte.
+    # The definition and the floor are printed with the numbers on purpose: a
+    # bare probability here is a frequency, not a memory measurement.
+    if args.dc_bytes > 0:
+        print(f"\n{'=' * 74}")
+        print(f"distance curve (Karpathy 2015 Fig. 5)  "
+              f"[opt-in, --dc-bytes {args.dc_bytes:,}/file]")
+        print(f"  DEFINITION: for every matched (open, close) delimiter pair in")
+        print(f"  the held-out bytes, take P(byte c | bytes[0..c-1]) from the")
+        print(f"  model's 256-way output at position c-1 -- i.e. the probability")
+        print(f"  the model put on the byte that actually closed the pair --")
+        print(f"  and bin it by d = c - o, the distance back to the opener.")
+        print(f"  Teacher-forced on real text; no sampling, no generation.")
+        print(f"  FLOOR: the model's MEAN probability of that same closing byte")
+        print(f"  over every position scored. That is the no-cue level for THIS")
+        print(f"  model on THIS text. A bin at its floor is not memory.")
+        print(f"  {DC_SCOPE_NOTE}")
+        print(f"  {DC_PARITY_NOTE}")
+        print(f"  {DC_ANCHOR}")
+        dc = _dc_curve(m, eval_files, args.dc_bytes, max(1, args.dc_batch))
+        _drop = (f" ({dc['truncated_bytes']:,} B dropped to fit the batch)"
+                 if dc["truncated_bytes"] else "")
+        print(f"  window: {dc['window_bytes']:,} B = {args.dc_bytes:,} B x "
+              f"{len(dc['files'])} file(s) [{', '.join(dc['files'])}]{_drop}")
+        print(f"  streams: {dc['batch']} contiguous x {dc['stream_len']:,} B"
+              f" | {dc['n_positions']:,} scored positions"
+              f" | CE on this window {dc['mean_nats_per_byte']:.4f} nats/B")
+        ev = ", ".join(f"{k}={dc['events'][k]}" for k, _a, _b in DC_CLASSES)
+        print(f"  delimiter events found: {ev}")
+        print(f"  unmatched closes (pairing assumption failed on this text): "
+              f"{dc['unmatched'] or 'none'}; "
+              f"pairs dropped at a stream boundary: {dc['skipped_boundary']}")
+        for cls in dc["classes"]:
+            fl = dc["floor"][cls]
+            print(f"\n  --- class {cls} | no-memory floor (mean P of its closing "
+                  f"byte over {dc['n_positions']:,} positions) = {fl:.6f}")
+            print(f"      {'distance (B)':>14} {'n':>6} {'mean p_close':>14} "
+                  f"{'SE':>9} {'floor':>9} {'lift':>8} {'>=1.96SE above floor'}")
+            rows = _dc_bins(dc, cls)
+            for lo, hi, n, mean, se in rows:
+                if n == 0:
+                    # Printed with full field padding, not "no events": the
+                    # paired arm-vs-arm reader zips the two arms' bin lists by
+                    # position, and a dropped row would silently shift every
+                    # bin after it by one and compare the wrong distances.
+                    print(f"      {f'[{lo},{hi if hi != float('inf') else 'inf'})':>14} "
+                          f"{0:>6} {'(no events)':>14} {'n/a':>9} {'n/a':>9} "
+                          f"{'n/a':>9}  n/a")
+                    continue
+                lift = mean / fl if fl > 0 else float("inf")
+                sig = "yes" if (se is not None and mean - fl > 1.96 * se) else (
+                    "no SE (n=1)" if se is None else "no")
+                print(f"      {f'[{lo},{hi if hi != float('inf') else 'inf'})':>14} "
+                      f"{n:>6} {mean:>14.6f} "
+                      f"{'n/a' if se is None else f'{se:.6f}':>9} "
+                      f"{fl:>9.6f} {lift:>7.1f}x  {sig}")
+            # Crossover: the furthest REACHED bin, contiguously from the
+            # shortest distance, whose mean is still above the floor by more
+            # than its own SE. Stated as a rule because "where the curve falls
+            # off" is otherwise a judgement call wearing a number. A bin with
+            # fewer than 3 pairs cannot qualify: its SE is the measurement.
+            MIN_N = 3
+            xover, xn, stopped = 0, 0, None
+            for lo, hi, n, mean, se in rows:
+                if n == 0:
+                    continue                     # absent measurement, not a null
+                if n >= MIN_N and se is not None and mean - fl > 1.96 * se:
+                    xover, xn = hi, n
+                else:
+                    stopped = (lo, hi, n, mean, se)
+                    break
+            stop_txt = ("" if stopped is None else
+                        f"; stopped at [{stopped[0]},{stopped[1]}) n={stopped[2]}"
+                        f"{'' if stopped[2] >= MIN_N else f' (<{MIN_N} pairs: no SE)'}")
+            print(f"      DC-XOVER {cls}: furthest contiguously-reached bin with "
+                  f"n>={MIN_N} whose mean is >=1.96 SE above the no-memory floor"
+                  f" -> up to d < {xover}"
+                  f"{' (NO bin qualifies)' if not xover else f' (n={xn} there)'}"
+                  f"{stop_txt}")
+            print(f"      DC-PAIRS {cls}: {int(np.sum([r[2] for r in rows]))}")
+        for name, _ob, _cb in DC_CLASSES:
+            if name not in dc["classes"]:
+                print(f"\n  --- class {name}: NO EVENTS in the scored window "
+                      f"(0 of the {dc['window_bytes']:,} bytes). The Karpathy "
+                      f"brace/bracket half of the anchor is NOT MEASURED here; "
+                      f"that is an absent measurement, not a null.")
     return 0
 
 

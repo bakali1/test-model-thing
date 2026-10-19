@@ -1,0 +1,81 @@
+================================================================================================
+CHECK 1 -- closed form  SNR_TMT = s + kappa*(1-s)  ?   d=2000 T=2000 b=0.9
+================================================================================================
+noise              rho_n(1)  s(true)   kappa     pred       MC      err
+white (W=1)      -0.000   0.1667  0.0525   0.2105   0.2107     0.1%
+ma2 rho1=0.5     -0.001   0.1667  0.0526   0.2105   0.2103    -0.1%
+ma5 rho1=0.8      0.750   0.1667  0.1859   0.3216   0.3359     4.4%
+ma11 rho1=0.91    0.900   0.1667  0.3823   0.4853   0.4974     2.5%
+ma41 rho1=0.98    0.975   0.1667  0.7677   0.8064   0.7322    -9.2%
+
+white-noise check: kappa = (1-b)/(1+b) = 0.0526 at b=0.9,  0.0256 at b=0.95,  0.00503 at b=0.99;  MC SNR_TMT on white noise at s=0.1667 = 0.2108
+
+================================================================================================
+CHECK 2 -- bias factor of every estimator against a known truth (L=64)
+================================================================================================
+noise / r               s  TMT raw   TMT bc    plain   bm raw  bm corr  bm/Sig0
+white (W=1) r=0.05 0.0476    2.04x    2.04x    1.01x    1.31x    1.00x    1.05x
+white (W=1) r=0.2  0.1667    1.27x    1.27x    1.00x    1.08x    1.00x    1.20x
+white (W=1) r=1.0  0.5000    1.05x    1.05x    1.00x    1.02x    1.00x    2.00x
+ma2 rho1=0.5 r=0.05 0.0476    2.05x    2.07x    1.01x    1.31x    1.00x    1.05x
+ma2 rho1=0.5 r=0.2 0.1667    1.27x    1.26x    1.00x    1.08x    1.00x    1.20x
+ma2 rho1=0.5 r=1.0 0.5000    1.05x    1.05x    1.00x    1.02x    1.00x    2.00x
+ma5 rho1=0.8 r=0.05 0.0476    4.72x    4.73x    1.04x    2.22x    1.00x    1.05x
+ma5 rho1=0.8 r=0.2 0.1667    1.93x    2.00x    1.01x    1.31x    1.00x    1.20x
+ma5 rho1=0.8 r=1.0 0.5000    1.18x    1.25x    1.00x    1.06x    1.00x    2.00x
+ma11 rho1=0.91 r=0.05 0.0476    8.66x    8.20x    1.10x    3.97x    1.00x    1.05x
+ma11 rho1=0.91 r=0.2 0.1667    2.91x    2.98x    1.02x    1.74x    1.00x    1.20x
+ma11 rho1=0.91 r=1.0 0.5000    1.38x    1.48x    1.00x    1.15x    1.00x    2.00x
+ma41 rho1=0.98 r=0.05 0.0476   16.30x   12.54x    1.40x   10.91x    1.08x    1.14x
+ma41 rho1=0.98 r=0.2 0.1667    4.83x    4.40x    1.10x    3.48x    1.02x    1.23x
+ma41 rho1=0.98 r=1.0 0.5000    1.76x    1.81x    1.02x    1.50x    1.00x    2.02x
+  (entries are bias FACTORS: MC / truth.  1.00x = unbiased.)
+
+================================================================================================
+CHECK 3 -- batch-means bias vs block length L (ma41, r=0.2, T=2000)
+  the correlation time here is ~41 steps, so L must exceed it.
+================================================================================================
+   L=4    K=500  corrected 0.1817 (raw 0.9740)   truth 0.1667   bias x1.090
+   L=8    K=250  corrected 0.1804 (raw 0.9453)   truth 0.1667   bias x1.082
+   L=16   K=125  corrected 0.1777 (raw 0.8893)   truth 0.1667   bias x1.066
+   L=32   K=62   corrected 0.1737 (raw 0.7776)   truth 0.1667   bias x1.042
+   L=64   K=31   corrected 0.1703 (raw 0.5795)   truth 0.1667   bias x1.022
+   L=128  K=15   corrected 0.1685 (raw 0.4004)   truth 0.1667   bias x1.011
+   L=256  K=7    corrected 0.1674 (raw 0.2898)   truth 0.1667   bias x1.005
+
+================================================================================================
+CHECK 4 -- the gns-pytorch construction (per-batch |G|^2 that goes negative)
+================================================================================================
+McCandlish A.1 / gns-pytorch per-example path:  b_small=1, b_big=n, so
+  a_hat = (n*E|G_n|^2 - E|G_1|^2)/(n-1),   t_hat = n*(E|G_1|^2 - E|G_n|^2)/(n-1)
+Both are DIFFERENCES of two large, very noisy squared norms.  That is the
+source of the negativity, and TMT never forms either difference.
+
+||G||^2/(d s2)   B_simple  steps a_hat<=0    EMA-of-RATIO    accum/divide
+        0.0002     5000.0         269/600   787.74 (-84%)  6836.45 (+37%)
+         0.002      500.0          27/600   581.00 (+16%)   502.52 (+1%)
+          0.02       50.0           0/600    49.91 (-0%)    50.29 (+1%)
+           0.2        5.0           0/600     5.03 (+1%)     5.00 (-0%)
+           1.0        1.0           0/600     1.00 (-0%)     1.00 (-0%)
+           4.0        0.2           0/600     0.25 (-0%)     0.25 (-0%)
+          20.0        0.1           0/600     0.05 (+0%)     0.05 (+0%)
+  TMT's operating point: with B=1024 and a measured SNR of 0.05-0.17 the
+  implied B_simple = 1/SNR is 6-20, i.e. WELL ABOVE the noise scale --
+  the regime where this estimator is well conditioned and |G|^2 stays positive.
+
+================================================================================================
+CHECK 5 -- can TMT's denominator EMA_b(||g||^2) go <= 0?
+================================================================================================
+telemetry.py:34-37 accumulates ema_grad_sq = b*ema_grad_sq + (1-b)*g*g,
+elementwise; telemetry.py:36 sums it; :37 clamps with .clamp_min(tiny).
+  * every term (g*g) is >= 0, so the accumulator is a non-negative
+    weighted sum.  It reaches exactly 0 only if g == 0 at every step.
+  * the numerator is a squared norm, so >= 0 by construction.
+  => SNR >= 0 structurally; there is NO negative-denominator mode.
+  adversarial path (600,000 steps, 60% of entries exactly 0):
+     min EMA_b(||g||^2) = 0.000e+00   steps at <= 0: 426   -> clamped to tiny() by telemetry.py:37, so the metric reads 0.0,
+        never negative.
+  real run (this audit, B=1024): min raw ||g||^2 and min EMA denominator
+  are reported in the frozen/moving table below the estimator table.
+
+wrote /tmp/snr_synthetic.json

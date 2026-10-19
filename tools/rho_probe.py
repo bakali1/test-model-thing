@@ -27,7 +27,7 @@ import os
 import sys
 import time
 
-REPO = "/home/baku/programing/opensource/new-llm/test-model-thing"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 import numpy as np

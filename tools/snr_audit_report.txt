@@ -1,0 +1,62 @@
+============================================================================================
+POST-PROCESSED  tools/snr_audit_full_768_B1024.json
+B=1024  steps=768 warmup=64 window=704  L=32  R=24
+============================================================================================
+
+TRUE AGGREGATE AUTOCORRELATION rho(h)  (reconstructed, /R correction applied)
+  frozen h1:+0.712 h2:+0.713 h4:+0.710 h8:+0.708 h16:+0.700 h32:+0.684 h64:+0.640 h128:+0.568 h192:+0.513 h256:+0.445 h320:+0.379
+  moving h1:+0.097 h2:+0.079 h4:+0.005 h8:-0.043 h16:+0.006 h32:+0.001 h64:-0.009 h128:-0.008 h192:+0.001 h256:+0.008 h320:-0.004
+  exact short-lag check, frozen: [0.704, 0.706, 0.706, 0.707, 0.705, 0.706]
+
+kappa(b) -- the autocorrelation inflation of the TMT metric, and the
+closed form  SNR_TMT = s + kappa*(1-s):
+      b  kappa frozen  kappa moving  white floor
+    0.9        0.7186        0.0558       0.0526
+   0.95        0.7003        0.0236       0.0256
+   0.99        0.6243        0.0040       0.0050
+
+CLOSED-FORM CHECK against the measured TMT-EMA value (b=0.9):
+  frozen  s(plain) 0.6965  kappa 0.7186  ->  pred 0.9146   measured TMT 0.7369   (pred/meas 1.24)
+  moving  s(plain) 0.0009  kappa 0.0558  ->  pred 0.0567   measured TMT 0.0452   (pred/meas 1.25)
+
+GOODFELLOW / DISCREPANCY estimator, cutoff H swept.
+  ||G||^2_hat = ||mean_T g||^2 - (2/T^2) sum_{h<=H} (T-h) rho(h) E||g||^2
+  frozen
+    H=   1  correction        3843.1   ||G||^2_hat     1321203.4   SNR    0.6945
+    H=   4  correction       15316.3   ||G||^2_hat     1309730.2   SNR    0.6884
+    H=   8  correction       30453.6   ||G||^2_hat     1294592.9   SNR    0.6805
+    H=  16  correction       60176.6   ||G||^2_hat     1264869.9   SNR    0.6649
+    H=  32  correction      117701.7   ||G||^2_hat     1207344.8   SNR    0.6346
+    H=  63  correction      221111.6   ||G||^2_hat     1103934.9   SNR    0.5803
+    H= 127  correction      402467.8   ||G||^2_hat      922578.7   SNR    0.4849
+    H= 255  correction      660559.9   ||G||^2_hat      664486.6   SNR    0.3493
+    H= 352  correction      778696.5   ||G||^2_hat      546350.0   SNR    0.2872
+  moving
+    H=   1  correction         152.7   ||G||^2_hat         327.9   SNR    0.0006
+    H=   4  correction         332.8   ||G||^2_hat         147.8   SNR    0.0003
+    H=   8  correction          75.5   ||G||^2_hat         405.1   SNR    0.0007
+    H=  16  correction        -201.2   ||G||^2_hat         681.9   SNR    0.0012
+    H=  32  correction        -205.1   ||G||^2_hat         685.7   SNR    0.0012
+    H=  63  correction        -277.0   ||G||^2_hat         757.7   SNR    0.0014
+    H= 127  correction        -204.3   ||G||^2_hat         684.9   SNR    0.0012
+    H= 255  correction        -145.6   ||G||^2_hat         626.3   SNR    0.0011
+    H= 352  correction        -137.8   ||G||^2_hat         618.4   SNR    0.0011
+
+IMPLIED TRUE SNR  s, obtained by inverting the closed form on the
+MEASURED TMT value:   s = (SNR_TMT - kappa) / (1 - kappa)
+  frozen  kappa(exact) 0.7186   measured TMT 0.7369   ->  s =   0.0651
+          and the last Goodfellow cutoff H=352 gives s = 0.2872
+  moving  kappa(exact) 0.0558   measured TMT 0.0452   ->  s =  -0.0113
+          and the last Goodfellow cutoff H=352 gives s = 0.0011
+
+EFFECTIVE INDEPENDENT SAMPLES in the window (this is the real constraint):
+  frozen  lags 1..16   sum_h rho(h) =    22.54   N_eff = win/(1+2 sum) =   29.91
+  frozen  lags 1..64   sum_h rho(h) =    86.93   N_eff = win/(1+2 sum) =    8.01
+  frozen  lags 1..256  sum_h rho(h) =   294.64   N_eff = win/(1+2 sum) =    2.38
+  moving  lags 1..16   sum_h rho(h) =    -0.26   N_eff = win/(1+2 sum) =  953.08
+  moving  lags 1..64   sum_h rho(h) =    -0.38   N_eff = win/(1+2 sum) = 1133.99
+  moving  lags 1..256  sum_h rho(h) =    -0.12   N_eff = win/(1+2 sum) =  801.85
+
+BATCH MEANS (exact, no projection involved):
+  frozen  K=22 L=32: mean_k||m_k||^2 = 1358292.2 +- 20397.8   V_LR/step = 1114514.8   ||G||^2_hat = 1323463.7   SNR = 0.6957
+  moving  K=22 L=32: mean_k||m_k||^2 = 13774.2 +- 1479.6   V_LR/step = 445650.4   ||G||^2_hat = -152.4   SNR = -0.0003
