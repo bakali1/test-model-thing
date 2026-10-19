@@ -2955,3 +2955,367 @@ loses to a memorisation table on its own training distribution by 0.40 nats
 using 0.9% of the data, and the CE curve is flat (12 B and 16 B are *worse*
 than 8 B). The ruler cannot see memory; the experimental programme was aimed at
 a bottleneck the corpus does not present.
+
+---
+
+## The memory ruler: the first direct measurement of retention (2026-10-12)
+
+Every prior statement about memory in this log was inferred from a CE curve,
+which cannot see memory. This is the first direct measurement, and it was taken
+on the trained checkpoint `runs/lrroles/arm_lrdecay1x_t919897.npz` (t=919,897,
+dim 512, 16 layers, ring_k 18) through a frozen numpy_port forward — no weight
+updates, no optimizer, state reset per sample. The prior state-probe used a
+fresh init, which is why its verdict was inconclusive; a fresh init has all
+decays near 0.5 and the tail is inactive, so it was a ring-only measurement
+dressed as an engine measurement.
+
+**The checkpoint says, in its own weights, that it cannot remember.**
+sigma_mean 0.5191, sigma_max 0.9847, mean half-life **1.16 B**, and only **8 of
+512 dims** hold more than 8 B while **5** hold more than 16 B. The longest-lived
+dimension in the model forgets in ~45 bytes.
+
+**Retention curve** — matched-pair state-norm difference against its control
+floor. Both sequences share the same distractors and differ only in a 4-byte key
+at position 0; the control is the iid random-byte arm and the mismatched-cue
+veto, which agree with each other at ~39–46.
+
+| d | matched | control | ratio |
+|---:|---:|---:|---:|
+| 8 | 2.045 | 42.93 | 4.8% |
+| 32 | 0.751 | 43.01 | 1.7% |
+| 128 | 0.140 | 39.04 | 0.36% |
+| 512 | 0.0003 | 43.80 | 7e-6 |
+
+A clean geometric decay. At 128 B the retained signal is a third of a percent of
+the noise floor.
+
+**Retrieval tasks — the readout never beats its own control.** This is the
+result that matters, because a readout can manufacture confident-looking
+numbers. Selective copy: d=8 gives 0.0312 against a permuted-label veto of
+0.0156 (se 0.0217, so ~1.4 sigma — within noise), and at d=512 readout and veto
+are *identical* at 0.0156, i.e. the same artifact. Associative retrieval:
+0.0000 at d=8, 128 and 512; at d=32 the readout is 0.0156 and its veto is
+0.0156. Zero at every distance, with no arm where signal exceeds control.
+
+**Long-range language CE 10.4767 nats/B against a chance level of 5.5248** on a
+509-byte filler task — roughly twice *worse* than the generating distribution.
+A model that had retained the marker would beat chance; this one is actively
+miscalibrated at that range.
+
+**The ruler reconciles with the incumbent on real text exactly.** Held-out CE
+1.2094 +/- 0.0143 nats/byte (6 slices, 120 kB) — matching the standing 1.2094
+figure to four decimals, which is the sanity check that this instrument is
+measuring the same model as the rest of the log. Out-of-domain novels
+2.6330 +/- 0.1538, range 2.048 (alice) to 3.378 (moby_dick), against unigram
+3.063 and bigram 2.291.
+
+**Verdict: the model does not retain information past ~64 bytes, and five
+independent arms agree.** This was the question every prior measurement failed
+to answer. The corpus does not reward it (the strategic review's ~0.03 nats for
+any horizon beyond 8 B), and the weights agree with the corpus.
+
+### The cause is the init, and it is a capacity limit rather than a training one
+
+The incumbent decay init is `rng.uniform(-1/sqrt(dim), 1/sqrt(dim))`, so every
+logit is within 0.044 of zero and every sigma within 1% of 0.5. Measured on the
+actual engine, that puts **every half-life in [0.919, 1.094] bytes**. There is
+no dimension in this model capable of holding 512 B, and no amount of training
+builds one it was never given. This is what P4 of the T-axis plan addresses.
+
+### ring_k caps at 256, and that caps P4 at ~32 B
+
+`ring_k = min(256, ceil(ln(RING_TOL) / ln(sigma_max)))`. Measured across the
+init: half_max 8 B gives ring_k 107, but half_max 32 B and above all return
+**256, saturated at the hardcoded cap**.
+
+So the plan's `--half-min 2 --half-max 512` buys nothing past ~32 B — a dim with
+a 512 B half-life receives credit from only 256 bytes of history. This inverts
+the plan's dependency order: P2 (the dense embedding trace, which deletes the
+ring and its cap) is not an independent efficiency item, it is a **prerequisite
+for P4's benefit**. The honest P4 A/B until then is `--half-max 32`, fully
+served by ring_k 256; running `--half-max 512` would spend the full ring memory
+for coverage the ring cannot deliver and any null result would be unattributable.
+
+### Four bugs the ruler exposed, none caught by the gates
+
+The gate suite never executes `tools/ruler.py`, so all of this shipped uncaught:
+
+1. `_REPO` computed one directory too high — `import numpy_port` failed outright.
+2. `_print_meta` indexed `n_gt_8B`, `sigma_mean`, `half_life_mean_B`, keys no
+   metadata dict provides, crashing *after* the numbers were computed; `dim` and
+   `layers` also reported 0.
+3. `_frozen_forward` never sized state to its batch. `load_frozen` leaves
+   `new_states(1)`, so batched calls died on `(64,512) vs (128,512)`. Fixing it
+   with `m.new_states(B)` also implemented the documented per-call reset, and
+   **the retention numbers dropped** (d=32 1.83 -> 0.75, d=128 0.34 -> 0.14)
+   because the leak had been inflating the signal.
+4. `_eval_corpus` returned `int(ces.sum())` under the name `total_bytes` — the
+   sum of CE values, not a byte count. A 120 kB run reported "7 B". It was
+   printed as `{total:,} B` and surfaced as `"total_bytes"`, so **every dose
+   figure derived from it was wrong**.
+
+Plus two in the ruler itself: `E._baselines` should have been `mb._baselines`
+(same line already used `mb._eval_corpus`), and `sorted(glob("data/*.txt"))[:9]`
+swept `data/sample.txt` — the training corpus — into the **out-of-domain** arm,
+presenting an in-domain score as domain shift.
+
+**Standing measurement-integrity note:** the retention numbers moved between
+runs, and the direction was toward *less* signal. A measurement that only ever
+moves toward the conclusion you wanted should be treated as suspect; here the
+fix that reduced the signal was the one that implemented the documented state
+reset, so the post-fix numbers are the correct reading and the reduction is
+conservative rather than convenient.
+
+---
+
+## The CPU is usable, and the ring was never load-bearing (2026-10-12)
+
+Two corrections to assumptions this log had been carrying.
+
+### The CPU can run small experiments
+
+Measured on the current engine, `numpy_port`, B=1024, dim=512, layers=16,
+median of the last 10 of 12 steps:
+
+| OPENBLAS_NUM_THREADS | ms/step | B/s |
+|---:|---:|---:|
+| 1 | 1,310 | 782 |
+| **2** | **1,202** | **852** |
+| 4 | 1,242 | 824 |
+| unset (default) | 1,495 | 685 |
+
+Default is genuinely the worst setting and 2 threads is the optimum, worth
+**1.24x** end to end with no code change. The magnitude is smaller than a
+loaded-box measurement suggested; the direction holds.
+
+**sigmoid is ~20% of the CPU step** (cProfile, 5 steps, 10.7 s: step_batch 28%,
+backward 24%, sigmoid 20%, forward 14%). It is called 16x forward and 16x
+backward per step on `(B, dim)` arrays, and `numpy_port.sigmoid` built a boolean
+mask plus two fancy-indexed writes per call. Replacing that with a branchless
+`np.where` over the same two expressions:
+
+    median 1,715 -> 1,402 ms/step = 1.22x, and BIT-IDENTICAL
+
+verified over **131,072,000 elements** spanning N(0,1), N(0,8) and U(-120,120):
+**0 differing bits**, max|delta| = 0.0, dtype preserved. The U(-120,120) arm is
+what exercises the overflow branches, where the discarded branch produces
+`inf/(1+inf) = nan` and is dropped by `np.where`.
+
+A clip-based variant is faster still (5.0 ms vs 8.7 ms per call at (1024,512))
+but is **not** bit-identical (CE delta 9e-6), so it is an algorithm migration
+under this repo's exactness rules and was not shipped.
+
+Both compose: 1.24x x 1.22x on the same path. **This makes small A/Bs feasible
+here**, which the earlier "no GPU, so no experiment" reading got wrong — the
+ruler worked because it is a frozen forward, but so does a short training run.
+
+### The ring was an approximation, and the dense trace reproduces it exactly
+
+The ring buffer and `tail_credit.py`'s private EMA were both approximations of
+one object: an exact per-byte-id embedding eligibility trace. `tail_credit`
+already materialised it for the dims where `sigma**ring_k` would drop more than
+1% of the credit mass. So the dense `(B, 256, dim)` trace is *the tail with
+every dim hot* — the approximation removed, not a new mechanism.
+
+The plan's P2 gate compares them where both are computable:
+
+| regime | max rel dev |
+|---|---|
+| dense vs TailCredit with all dims hot | **0.00e+00** |
+| dense vs ring, `T < ring_k`, zeroed ring | **0.00e+00** |
+
+Bit-level agreement, so the deletion is justified rather than hopeful. **The
+ring and `tail_credit.py` are not yet deleted** — the dense path runs behind
+`--trace-mode dense` so the incumbent and `check_parity` are untouched; deletion
+is the remaining mechanical step.
+
+Three consequences:
+
+1. **P3's blocker dissolves.** The ring forced a per-dim `(dim,)` decay vector
+   through `_scatter_ring_credit`, `TorchTail.begin_step` and `ring_k`
+   inference. A dense trace has no per-dim addressing constraint, so a
+   per-sample `a = sigmoid(decay + gate*x)` is no longer a problem for the
+   credit path. Only the gradient remains, and it was already wrong.
+2. **P4's cap disappears.** `ring_k = min(256, ...)` saturates at
+   `half_max ~= 32 B`, so `--half-max 512` bought nothing. With no ring,
+   `--half-max 512` runs end to end.
+3. **The cost is real but bounded**: B*256*dim*4 per layer, i.e. 0.13 / 0.54 /
+   2.15 GB at B=16/64/256 for dim=512 x 16 layers. All fit an 8 GB box. The
+   trace is persisted at the same order of size the ring's `ring_w` already
+   cost, and **cross-mode checkpoint loads refuse** rather than starting a cold
+   trace — `sigma**50` is ~1e-15 for cold dims but **0.36** at sigma=0.98, so a
+   zeroed trace would silently lose the history of exactly the dims it exists
+   for.
+
+**Method note.** The first draft of this gate compared the engine's hand-built
+gradient against a second hand-written backward and disagreed by 12-40x, which
+proved nothing — two hand-writtens sharing an omission agree perfectly. Rebuilding
+the reference on torch autograd is what produced a trustworthy verdict. The same
+lesson applies to the dense trace: it was checked against `TailCredit`, an
+independent implementation, rather than against a restatement of itself.
+
+---
+
+## The T axis on a real GPU, and the P4 capacity probe (2026-10-12)
+
+Three things this log did not have before: a GPU to measure on, an
+instrument that separates "the init is the capacity limit" from "the init is
+not", and a record of what happens when a gate suite that has only ever run
+on a CPU is run on the device the arms will actually run on.
+
+### The T axis is free at constant B — the plan's B reduction is what costs
+
+`tools/seqlen_probe.py --device cuda` on an MX150 (4 GB, 142 GFLOP/s fp32,
+sm_61), dim 512, layers 16, 20 timed windows per cell:
+
+| cell (B×T) | B·T | µs/byte | vs (1024,1) |
+|---|---:|---:|---:|
+| 1024×1 | 1024 | 148.6 | 1.00× |
+| 1024×2 | 2048 | 140.7 | 1.06× |
+| 1024×4 | 4096 | 137.3 | 1.08× |
+| **1024×16** | 16384 | **136.3** | **1.09×** |
+| 256×16 | 4096 | 157.3 | 0.94× |
+| 64×16 | 1024 | 551.5 | 0.27× |
+| 16×64 | 1024 | 2153.9 | 0.07× |
+| 8×128 | 1024 | 4277.1 | 0.03× |
+
+**At constant B, T is not a cost — it is a 9% speedup.** The per-window
+overhead (the optimizer, the gradient assembly) amortizes over the window's
+bytes while the per-byte work is unchanged. A live training run agrees:
+**7400 B/s at T=16 against 6116 B/s at T=1**, with the loss falling
+62.6 → 40.7 and the CE 2.673 → 1.777 over 200 windows, no NaN.
+
+The collapse in the lower half of the table is **not** the T axis: it tracks
+the GEMM's row count, so at matched B·T the small-B cells are
+launch/occupancy-bound. That is the opposite of the CPU reading, where the
+same trade cost 1.15×, and it is why the T-axis plan's §5 falsifier — "if
+(B=64,T=16) is more than 2× worse, the ring stays and P2 is abandoned" —
+looked safe when it was decided on a CPU. On the GPU it fires at **3.7×**.
+
+**What that changes.** The falsifier was written for the ring-deletion
+decision and it also decided the T-axis decision, which it had no business
+deciding. The two separate cleanly now: the **ring stays** (the B reduction
+that would have made it deletable costs 3.7×) and **T is adopted at
+B=1024** (where it is 1.09× *faster*). The plan's §1 bet — "lowering B in
+exchange is what makes the whole ring/tail-credit apparatus deletable" — is
+the part the measurement kills, and P1 survives it.
+
+### The P4 init buys the capacity. Training gives it back.
+
+The plan's causal story is "the cause is the init, and it is a capacity limit
+rather than a training one". The capacity half had never been tested. It is
+testable without training anything, because retention is a property of the
+recurrence's dynamics: two sequences differing only in a 4-byte key at
+position 0, the same d distractor bytes after it, and the state's norm
+difference between the two.
+
+`tools/capacity_probe.py` (new) measures exactly that on an untrained model;
+`tests/check_p4_capacity.py` (new) gates it. At dim 512, layers 16, 64
+samples, the full ruler:
+
+| init | d=8 | d=32 | d=128 | d=512 |
+|---|---:|---:|---:|---:|
+| default (~1 B half-lives) | 0.40% | 0.00% | 0.00% | 0.00% |
+| **P4 (2…512 B)** | **49.2%** | **21.0%** | **5.8%** | **1.05%** |
+| TRAINED incumbent | 4.8% | 1.7% | 0.36% | 0.0007% |
+
+(matched-pair signal ÷ random-byte control floor. The fast probe at dim 128,
+layers 4, 32 samples reproduces it: 0.42%/0%/0% and 49.8%/22.4%/6.0%.)
+
+**Reading 1 — the plan is right about the capacity.** A model *given* 2…512 B
+half-lives holds a signal 512 B out; one with 1 B half-lives is dead by 32 B.
+"There is no dimension in this model capable of holding 512 B, and no amount
+of training builds one it was never given" is supported, and P4 is
+**necessary**.
+
+**Reading 2 — the plan is wrong about the sufficiency, and this is the
+expensive one.** The TRAINED incumbent retains **less** than a fresh P4 model
+at every distance: 4.8% vs 49.2% at d=8, 0.36% vs 5.8% at d=128. The
+capacity is real and training gave it back. So P4 is a 2×2, not a step —
+`(wd_decay 0.01 / 0.0) × (default init / P4 init)` — with P6 in the first
+factor, because the weight decay on the decay logits pulls them back toward
+`σ=0.5`, i.e. back to a 1-byte half-life, which is precisely the mechanism by
+which the spread decays away (finding 7 says gradient descent undoes the
+log-spaced init within an epoch; P6 says weight decay makes sure it cannot
+grow back either). **Neither is fixed by the init alone.**
+
+The instrument now costs seconds and no GPU, so it belongs in the gate suite
+rather than in a training A/B: `tests/check_p4_capacity.py` gates the
+capacity half; the training A/B gates the usage half.
+
+### The gate suite had never run on a GPU
+
+Running the suite on the box that will run the arms found four device bugs
+and five hardcoded absolute paths, all of them invisible on a CPU box:
+
+* `tools/seqlen_probe.py` built its input windows on the CPU and never moved
+  them to the device — so **the plan's throughput measurement had never been
+  taken on a GPU**, and the probe crashed on CUDA. Fixed.
+* `tests/check_seqlen_credit.py` (the P1 gate) had the same bug, and had
+  therefore never run on a GPU. Fixed, and it now takes `--device`: it
+  **passes on CUDA with numbers identical to CPU** (worst embed-mass
+  deviation 1.177e-07, worst elementwise 6.481e-06).
+* `tests/check_parity.py` (P1's Gate 1) pinned its inputs to CPU while the
+  engines took the device automatically, so it crashed on CUDA. Now pinned
+  deliberately, with the reason recorded: bit-identity is a *CPU* claim
+  (CUDA's atomic ordering makes it the wrong bar there), and the
+  tolerance-based CUDA version of the same question belongs to
+  `check_trace_bptt`.
+* `tests/check_dense_trace.py`, `check_halflife_init.py` and
+  `check_gated_recurrence.py` built their engines with `device=None`, so on a
+  GPU box they silently became CUDA gates with CPU inputs — crashes, not
+  tests. Pinned to CPU, with the convention written down.
+* `tools/membench/model_backend.py` (×2) and three other tools hardcoded
+  `/home/baku/programing/opensource/new-llm/test-model-thing`, so the ruler
+  could not run anywhere else at all. Now derived from `__file__`.
+
+`check_parity` passes on the box (numpy reference against torch-on-CUDA), and
+so does the rest of the suite. The generalisable lesson: **a gate that has
+only ever run on one device is a statement about that device.**
+
+### The safety features, and what clipping actually does
+
+`tests/check_safety.py` (new) gates the plan's last open P0 item and P6:
+
+* A non-finite gradient is **REFUSED**: theta, m and v are left
+  bit-identical, the refusal is counted and logged, `t` still advances (the
+  data was consumed; rewinding the LR schedule would be a second, quieter
+  way to change the run), and training continues.
+* The guard is a **no-op on finite gradients, bit-exactly** — the same engine
+  with the guard on and off produces identical theta, m and v over 12 steps.
+  That is what makes it safe to enable by default.
+* The global grad clip is **off by default** and its threshold is in
+  *absolute* gradient units, which are **not comparable across T** (the
+  window's gradient is a sum over T bytes), so it must be off for a T A/B.
+* A measured correction to the assumption behind clipping: under AdamW the
+  clip does **not** shrink the parameter step — the update is
+  `m/√v ≈ sign(g)`, nearly scale-invariant in the gradient (max |Δθ| was
+  2.080e-05 either way in the gate). What the clip bounds is the **moments**,
+  and that is what matters: one enormous gradient inflates `v`, and every
+  later small gradient is then divided by that inflated `√v` and suppressed
+  for ~1/(1−β₂) = 1000 steps.
+* P6's per-group weight decay: the wd vector is uniform by default
+  (bit-identical to the incumbent's scalar `wd * th`) and exempts the 64
+  decay rows at `wd_decay=0`; the update then matches a hand-written AdamW
+  to **0.00e+00**. With the exemption, `--lr-decay` scales only the adaptive
+  term — the "knob wired to a trap" is gone.
+
+### The A/B that is running now
+
+Three arms, all resumed from the **same trained incumbent** (t=919,897, B=1024,
+ring_k=18, held-out CE 1.2094 ± 0.0143), each consuming the **same 8.39 MB**
+of the same corpus in the same order, differing only in T:
+
+| arm | windows | bytes | optimizer updates | within-window credit |
+|---|---:|---:|---:|---:|
+| T=1 | 8192 | 8.39 MB | 8192 | 0 bytes (the incumbent's 1-step regime) |
+| T=4 | 2048 | 8.39 MB | 2048 | 4 bytes, exact |
+| T=16 | 512 | 8.39 MB | 512 | 16 bytes, exact |
+
+The verdict is the held-out CE from the ruler, with the retention curve
+reported alongside, and the update count reported with it: at matched bytes
+T=16 buys **16× fewer updates**, and the credit effect and the update-count
+effect are not separable at one byte budget. That is the honest shape of the
+experiment, and it is why the arms are T=1, 4, 16 rather than 1 and 16: the
+monotone ordering across three points is what distinguishes "the package is
+better" from "the credit effect is real".
