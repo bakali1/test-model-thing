@@ -19,9 +19,18 @@ import checkpoint_hub as hub          # noqa: E402
 import gpu_port                        # noqa: E402
 import train_gpu as tg                 # noqa: E402
 
+# DEVICE CONVENTION. This gate is a CPU gate by its own contract ("No GPU, no
+# network"), so the engines are pinned to "cpu" here. Leaving the device to
+# the engine's auto-default made this gate a CUDA gate on a GPU box, where its
+# CPU-built input tensors die with "Expected all tensors to be on the same
+# device" -- i.e. it was not testing anything there, it was crashing. The
+# device-parameterised gate is tests/check_seqlen_credit.py --device, which
+# runs the T-axis claim on both.
+
+
 
 def hot_model(dim=64, layers=2, B=8):
-    m = gpu_port.GpuModel(dim=dim, layers=layers)
+    m = gpu_port.GpuModel(device="cpu", dim=dim, layers=layers)
     m.new_states(B)
     with torch.no_grad():                       # pre-sigmoid 4 => sigma .982
         for l in m.layers:
@@ -41,7 +50,7 @@ def item1_multiarm_tags():
     d = tempfile.mkdtemp()
     ok = True
     for arm in ("armW", "armN"):
-        m = gpu_port.GpuModel(dim=32, layers=2)
+        m = gpu_port.GpuModel(device="cpu", dim=32, layers=2)
         for t in (1, 2, 3):
             m.t = t
             tg.save_checkpoint(m, os.path.join(d, f"{arm}.npz"), keep_k=2,
@@ -107,7 +116,7 @@ def item3_state_invalidation():
 def item9_content_validation():
     """Mislabeled / corrupt / wrong-shape remote files are rejected."""
     d = tempfile.mkdtemp()
-    m = gpu_port.GpuModel(dim=32, layers=2)
+    m = gpu_port.GpuModel(device="cpu", dim=32, layers=2)
     m.t = 5
     p = os.path.join(d, "x_t000005.npz")
     m.save(p)
@@ -161,7 +170,7 @@ def item10_equal_step_conflict():
     d = tempfile.mkdtemp()
     local = os.path.join(d, "tmt.npz")
     remote = os.path.join(d, "remote_t000010.npz")
-    m = gpu_port.GpuModel(dim=32, layers=2)
+    m = gpu_port.GpuModel(device="cpu", dim=32, layers=2)
     m.t = 10
     m.theta[0] = 0.1
     m.save(remote)

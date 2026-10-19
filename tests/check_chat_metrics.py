@@ -17,6 +17,15 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import chat_models as cm  # noqa: E402
 
+# DEVICE CONVENTION. This gate is a CPU gate by its own contract ("No GPU, no
+# network"), so the engines are pinned to "cpu" here. Leaving the device to
+# the engine's auto-default made this gate a CUDA gate on a GPU box, where its
+# CPU-built input tensors die with "Expected all tensors to be on the same
+# device" -- i.e. it was not testing anything there, it was crashing. The
+# device-parameterised gate is tests/check_seqlen_credit.py --device, which
+# runs the T-axis claim on both.
+
+
 FAILURES = []
 
 ALPHABET = (b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -378,10 +387,21 @@ def t_digest():
             check("digestless sidecar is an error", False, "no exception")
         except ValueError:
             check("digestless sidecar is an error", True)
-        # a renamed copy is still verified against the digest it carries
-        shutil.copyfile(os.path.join(ROOT, "models", "tmt_t094747.npz"),
+        # a renamed copy is still verified against the digest it carries.
+        # The fixture is a 231 MB checkpoint that only exists in a checkout
+        # which has it, so SKIP this sub-check when it is absent rather than
+        # dying with FileNotFoundError: a gate that crashes on a missing
+        # fixture is not a gate, and the rest of the file's checks are about
+        # pure functions.
+        _ck = os.path.join(ROOT, "models", "tmt_t094747.npz")
+        if not (os.path.exists(_ck)
+                and os.path.exists(_ck + ".sha256")):
+            print("  SKIP: the renamed-copy digest check needs "
+                  "models/tmt_t094747.npz(.sha256) in this checkout")
+            return
+        shutil.copyfile(_ck,
                         os.path.join(d, "renamed.npz"))
-        shutil.copyfile(os.path.join(ROOT, "models", "tmt_t094747.npz.sha256"),
+        shutil.copyfile(_ck + ".sha256",
                         os.path.join(d, "renamed.npz.sha256"))
         pref, verified = cm.verify_digest(os.path.join(d, "renamed.npz"))
         check("renamed copy is still verified",
