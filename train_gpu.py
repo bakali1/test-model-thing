@@ -179,7 +179,8 @@ class Trainer:
                  hub_save_every=0, telemetry_every=0, telemetry_path=None,
                  measure_after=0, verify_final=False, distill_dir=None,
                  distill_alpha=0.0, distill_block=32, distill_repo=None,
-                 distill_null_target=False, distill_floor=0.05, **model_kw):
+                 distill_null_target=False, distill_floor=0.05,
+                 ce_only=False, seqlen=1, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -212,6 +213,36 @@ class Trainer:
                                  "(the dump made by tools/mi_dump.py)")
             else:
                 model_kw["distill_alpha"] = self.distill_alpha
+        # CE-only (PLAN-2026-10-06 priority 3; PLAN-2026-10-11 P0). The
+        # variance hinge, embed-MSE/JEPA and end-of-text terms are masked to
+        # EXACTLY zero, so L = CE. Not because those terms are wrong -- because
+        # on the synthetic memory benchmark "copy task succeeds" must mean "the
+        # recurrence + optimizer can learn the capability", and the auxiliary
+        # terms make that ambiguous. Incompatible with KD by construction.
+        self.ce_only = bool(ce_only)
+        model_kw["ce_only"] = self.ce_only
+        if self.ce_only:
+            print("  [ce-only] L = CE. variance hinge, embed-MSE/JEPA and "
+                  "end-of-text masked to exactly zero (tests/check_ce_only.py)")
+        # seqlen (T): bytes per stream per optimizer step. 1 is the historical
+        # behaviour and is bit-identical to the pre-T-axis engine, so every
+        # existing arm and checkpoint describes a T=1 run and MUST keep the
+        # default. Raising it does not change B: state, ring and tail are all
+        # B-shaped, so the memory is unchanged and only the work per update
+        # grows. It DOES change the objective's scale (the loss is the window
+        # SUM, so with the gradient summed over T, decoupled weight decay is
+        # relatively T times weaker) and it changes --steps to mean WINDOWS.
+        self.seqlen = int(seqlen)
+        model_kw["seqlen"] = self.seqlen
+        if self.seqlen != 1:
+            print(f"  [seqlen] T={self.seqlen} bytes/stream per update: one "
+                  f"AdamW update per window, --steps/--warmup/--save-every now "
+                  f"count WINDOWS, and the logged loss is the window sum. "
+                  f"B and T are BOTH part of the run contract -- state/ring/tail "
+                  f"are B-shaped -- so an A/B arm must state --batch and "
+                  f"--seqlen together. Measured on CPU at matched B*T "
+                  f"(tools/seqlen_probe.py): B=64,T=16 is 0.87x of B=1024,T=1 "
+                  f"per byte; B=16,T=64 is 0.45x.")
         self.model = GpuModel(device=str(device), seed=seed, **model_kw)
         self.path = path
         self.seed = int(seed)
@@ -284,6 +315,28 @@ class Trainer:
               f"({(st['coverage'] or 0) * 100:.2f}% coverage at the floor "
               f"above; the rest fell back to CE-only){extra}", flush=True)
 
+    def _windows(self, mats, ets, L):
+        """Yield (c, n, e, T) windows of `seqlen` bytes per stream over one file.
+
+        `mats` is the per-file (L+1, B) byte matrix and `ets` is (L, B), both
+        already on the training device. A window is a slice along TIME
+        transposed to (B, T), which is the layout step_batch wants, so the
+        engine's state carries across the T bytes of a window and one AdamW
+        update covers them.
+
+        The LAST window of a file is short whenever L is not a multiple of
+        seqlen, and that is deliberate: truncating the file's tail would drop
+        bytes the stream actually contains, and padding it to a full T would
+        train on duplicated positions. step_batch accepts any T, including 1,
+        so a short tail window needs no special case in the engine.
+        """
+        T = self.seqlen
+        for t0 in range(0, L, T):
+            t1 = min(t0 + T, L)
+            yield (mats[t0:t1].t().contiguous(),
+                   mats[t0 + 1:t1 + 1].t().contiguous(),
+                   ets[t0:t1].t().contiguous(), t1 - t0)
+
     def train(self, save, dataset, hub_repo=None):
         m = self.model
         m.new_states(self.batch)
@@ -348,8 +401,8 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
-                for t in range(L):
-                    m.step_batch(mats[t], mats[t + 1], ets[t])
+                for c, n_, e_, Tw in self._windows(mats, ets, L):
+                    m.step_batch(c, n_, e_)
                     wsteps += 1
                     if wsteps >= self.warmup:
                         break
@@ -437,8 +490,8 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
-                for t in range(L):
-                    loss = m.step_batch(mats[t], mats[t + 1], ets[t])
+                for c, n_, e_, Tw in self._windows(mats, ets, L):
+                    loss = m.step_batch(c, n_, e_)
                     if self.telemetry is not None:
                         self.telemetry.observe(loss, m.last_ce)
                         if m.t == self.start_t + self.measure_after:
@@ -449,10 +502,19 @@ class Trainer:
                         print(f"[fatal] non-finite loss at t={m.t}: {loss}",
                               flush=True)
                         raise FloatingPointError(f"non-finite loss at t={m.t}")
+                    if m.last_nan_refused:
+                        # The engine refused a non-finite GRADIENT: the
+                        # weights are intact and the run continues, but the
+                        # step did not happen. Logged, because a run that
+                        # silently stops learning is worse than one that
+                        # stops loudly.
+                        print(f"  [guard] refused a non-finite gradient at "
+                              f"t={m.t} (theta/m/v untouched; "
+                              f"{m.nan_refusals} refusals so far)", flush=True)
                     loss_win += loss
                     ce_win += m.last_ce
                     n_win += 1
-                    total += self.batch
+                    total += self.batch * Tw
                     if self.stop_t and m.t >= self.stop_t:
                         print(f"  [reached {self.max_steps} more steps "
                               f"(t={m.t}), stopping]", flush=True)
@@ -592,6 +654,30 @@ def main():
     ap.add_argument("--measure-after", type=int, default=0,
                     help="start steady-state throughput clock after N relative "
                          "training steps; training is not rewound or repeated")
+    ap.add_argument("--seqlen", type=int, default=1,
+                    help="bytes per stream per optimizer step (T). 1 = the "
+                         "historical behaviour, bit-identical to the pre-T-axis "
+                         "engine (tests/check_parity.py pins it to the bit). "
+                         "T>1 is a WINDOW: one AdamW update covers T bytes per "
+                         "stream, so --steps, --warmup, --save-every and "
+                         "--telemetry-every all count WINDOWS, not bytes. "
+                         "T>1 also makes --distill-alpha refuse (the KD target "
+                         "provider is indexed by optimizer step and cannot "
+                         "supply T distinct targets). B and T are BOTH part of "
+                         "the run contract: state, ring and tail are B-shaped "
+                         "and only the work per update grows, so an A/B arm "
+                         "must state --batch and --seqlen together. Note the "
+                         "loss is the window SUM, so decoupled weight decay is "
+                         "relatively T times weaker. Measured (CPU, matched "
+                         "B*T, tools/seqlen_probe.py): (256,4) 0.99x, (64,16) "
+                         "0.87x, (16,64) 0.45x of (1024,1) per byte")
+    ap.add_argument("--ce-only", action="store_true",
+                    help="train on CE alone: the variance hinge, embed-MSE/JEPA "
+                         "and end-of-text terms are masked to exactly zero, so "
+                         "the optimizer descends d(CE)/dtheta alone "
+                         "(PLAN-2026-10-06 priority 3). Refuses --distill-alpha "
+                         "> 0. Off, every term keeps its historical value "
+                         "bit-for-bit (tests/check_ce_only.py).")
     ap.add_argument("--distill-dir", default=os.environ.get("TMT_MI_DUMP"),
                     help="directory written by tools/mi_dump.py; one dump per "
                          "corpus file, bucketed with the SAME B as training")
@@ -617,6 +703,77 @@ def main():
                          "This is the arm that separates 'distillation hurts' "
                          "from 'halving CE hurts': without it, a KD arm losing "
                          "to a CE control is uninterpretable. Needs no dump.")
+    ap.add_argument("--half-min", type=float, default=None,
+                    help="P4: log-spaced half-life init, lower end in BYTES. "
+                         "Needs --half-max. Omit BOTH to keep the incumbent "
+                         "uniform init (|logit| <= 1/sqrt(dim), every half-life "
+                         "within ~1 B of 1 B) bit-for-bit, so every existing arm "
+                         "and the parity gate are untouched. Setting these is a "
+                         "NEW ARM: it changes the starting weights, so it cannot "
+                         "resume an incumbent checkpoint.")
+    ap.add_argument("--trace-mode", choices=("ring", "dense"), default="ring",
+                    help="P2: how per-byte embedding credit is accumulated. "
+                         "'ring' (default) keeps the incumbent K-lag ring plus "
+                         "tail_credit's private EMA for hot dims. 'dense' uses "
+                         "the exact (B,256,dim) eligibility trace per layer, "
+                         "which is the tail with EVERY dim hot -- verified to "
+                         "reproduce ring+tail credit exactly where both are "
+                         "computable (tests/check_dense_trace.py). The ring was "
+                         "only ever a memory/speed approximation of this object, "
+                         "and it caps how far back credit reaches at ring_k<=256 "
+                         "(~32 B of useful history for long half-lives). 'dense' "
+                         "removes that cap, which is what lets P4's "
+                         "--half-max 512 actually be reachable. Cost: "
+                         "B*256*dim*4 bytes per layer. Cannot resume a ring "
+                         "checkpoint.")
+    ap.add_argument("--half-max", type=float, default=None,
+                    help="P4: log-spaced half-life init, upper end in BYTES. "
+                         "Needs --half-min. The SET of half-lives is geometric "
+                         "between the two; the assignment to dims is shuffled by "
+                         "the seeded rng so dim index stays meaningless. Context: "
+                         "the trained checkpoint has sigma_max=0.9847, i.e. its "
+                         "longest-lived dim forgets in ~45 B, and only 8 of 512 "
+                         "dims hold >8 B -- it has no dim that can hold 512 B at "
+                         "all. Expect the spread to decay back toward 0.5 on real "
+                         "text (finding 7); that is the measurement, not a bug.")
+    ap.add_argument("--grad-clip", type=float, default=0.0,
+                    help="global L2 clip on the assembled gradient, in "
+                         "ABSOLUTE gradient units. 0 (default) disables it. "
+                         "Note the units: the window's gradient is a SUM over "
+                         "T bytes and over B streams, so an absolute threshold "
+                         "is not comparable across arms -- at T=16 the same "
+                         "threshold is reached 16x sooner than at T=1. A clip "
+                         "is a safety net, not a knob; leave it off for a T "
+                         "A/B. It also does NOT bound the parameter step "
+                         "(AdamW's update is nearly scale-invariant in the "
+                         "gradient); it bounds the MOMENTS, which is what "
+                         "stops one enormous gradient from suppressing the "
+                         "next thousand steps.")
+    ap.add_argument("--no-nan-guard", action="store_true",
+                    help="disable the NaN guard (ON by default). With the "
+                         "guard on, a non-finite gradient REFUSES the update "
+                         "-- theta, m and v are left exactly as they were, the "
+                         "refusal is counted and logged, and training "
+                         "continues. Without it, the non-finite value is "
+                         "written into the weights and the run is dead. "
+                         "tests/check_safety.py gates the refusal, and gates "
+                         "that the guard is bit-identical to no guard on "
+                         "finite gradients.")
+    ap.add_argument("--wd-decay", type=float, default=0.01,
+                    help="P6: the decoupled weight decay applied to the "
+                         "'.decay' and '.gate' groups. The default (0.01) is "
+                         "the incumbent's uniform weight decay, so every "
+                         "existing arm and checkpoint keeps its exact "
+                         "dynamics. Set 0 to EXEMPT those groups: "
+                         "sigma(0)=0.5 is exactly a 1-BYTE half-life, so a "
+                         "weight decay on the decay logits is a systematic "
+                         "pull toward NO MEMORY and it fights the log-spaced "
+                         "half-life init (P4) directly. The two are a 2x2, "
+                         "not a sequence: measure (wd-decay 0.01/0.0) x "
+                         "(default init / P4 init). With the decay group's "
+                         "weight decay at 0, --lr-decay also stops scaling a "
+                         "weight-decay term, which is the 'knob wired to a "
+                         "trap' this plan flagged.")
     ap.add_argument("--distill-repo", default=None,
                     help="HF repo for the teacher's tokenizer.json "
                          "(default $TMT_TEACHER)")
@@ -683,7 +840,37 @@ def main():
                 distill_block=args.distill_block,
                 distill_repo=args.distill_repo,
                 distill_null_target=args.distill_null_target,
-                distill_floor=args.distill_floor)
+                distill_floor=args.distill_floor,
+                ce_only=args.ce_only,
+                half_life_init=(
+                    (args.half_min, args.half_max)
+                    if args.half_min is not None and args.half_max is not None
+                    else None),
+                seqlen=args.seqlen,
+                trace_mode=args.trace_mode,
+                grad_clip=args.grad_clip,
+                nan_guard=not args.no_nan_guard,
+                wd_decay=args.wd_decay,
+                gated=False)
+    if args.grad_clip > 0.0:
+        print(f"  [clip] global L2 grad clip at {args.grad_clip} (absolute "
+              f"gradient units -- NOT comparable across --seqlen values)")
+    if not args.no_nan_guard:
+        print("  [guard] NaN guard ON: a non-finite gradient refuses the "
+              "update (theta/m/v untouched) and training continues")
+    if args.wd_decay != 0.01:
+        print(f"  [wd] the '.decay'/'.gate' groups get weight decay "
+              f"{args.wd_decay} (default 0.01 = the incumbent's uniform "
+              f"weight decay)")
+    if args.trace_mode == "dense":
+        print("  [trace] dense (B,256,dim) embedding trace per layer: the "
+              "ring and tail_credit are bypassed, so ring_k and its 256 "
+              "cap no longer bound how far back credit reaches. Costs "
+              f"B*256*dim*4 bytes/layer "
+              f"({args.batch * 256 * args.dim * 4 / 1e6:.0f} MB/layer at "
+              f"B={args.batch}, dim={args.dim}). Cannot load a ring "
+              "checkpoint -- start this arm from scratch or convert.",
+              flush=True)
     if args.distill_alpha > 0.0 and not args.distill_null_target:
         if not args.distill_dir or not os.path.isdir(args.distill_dir):
             sys.exit(f"--distill-alpha {args.distill_alpha} but --distill-dir "

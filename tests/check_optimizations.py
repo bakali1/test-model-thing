@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
-"""CPU correctness gate for the optimization candidates."""
-import copy
+"""CPU correctness gate for the surviving optimization paths.
+
+This gate used to test the `cold` / `kloop` / `segmented` ring-credit candidates
+and the factored ring/tail variants. All of those were measured and deleted from
+gpu_port.py (see RESULTS.md), so the gate died with `ValueError: unknown
+ring_credit='cold'` instead of testing anything -- a broken gate is worse than no
+gate, because it reads as coverage.
+
+It now tests the two things that are actually true and actually unguarded:
+
+  1. `grad_assembly="loop"` vs `"cat"` -- documented in gpu_port.py as a pure
+     copy reorganization (same self.shapes order, one kernel instead of 69), so
+     the two must be bit-identical. Nothing else covered this axis.
+  2. The deleted candidates must be REJECTED with a clear ValueError rather than
+     silently falling back to a reference path. A silent fallback would let a
+     caller believe it is running a candidate that no longer exists.
+
+`ring_credit` itself is deliberately not compared here: on CPU every mode
+resolves to `full` (`_ring_mode`), so a comparison would be vacuous. The CUDA
+paths (`compiled`/`triton`/`nvrtc`) need a GPU and are covered by the T4/Colab
+board runs recorded in RESULTS.md.
+"""
 import os
 import sys
-import tempfile
 
 import torch
 
@@ -14,8 +33,7 @@ import gpu_port
 def make(dim=32, layers=2, B=8, seed=123, **kw):
     torch.manual_seed(seed)
     m = gpu_port.GpuModel(dim=dim, layers=layers, device="cpu", **kw)
-    # Force one hot dimension so A1 genuinely exercises the cold-column path
-    # and tail credit is active in every candidate.
+    # Force one hot dimension so the tail-credit path is genuinely exercised.
     for layer in m.layers:
         layer.decay[0] = 4.0
     m.new_states(B)
@@ -38,58 +56,71 @@ def nrel(a, b):
     return float((a - b).abs().max() / (b.square().mean().sqrt() + 1e-30))
 
 
+REMOVED = [
+    ("ring_credit", "cold"),
+    ("ring_credit", "kloop"),
+    ("ring_credit", "segmented"),
+    ("ring_credit", "compiled-bogus"),
+]
+
+
 def main():
     base = make()
     base_losses = drive(base)
-    checks = []
-    for name, kw, tol in [
-        ("a1-cold", {"ring_credit": "cold"}, 1e-6),
-        ("a2-kloop", {"ring_credit": "kloop"}, 1e-6),
-        ("c-segmented", {"ring_credit": "segmented"}, 1e-6),
-        ("b1-ring", {"ring_algorithm": "factored"}, 2e-3),
-        ("b2-tail", {"tail_algorithm": "factored"}, 2e-3),
-        ("b1-b2", {"ring_algorithm": "factored", "tail_algorithm": "factored"}, 2e-3),
-    ]:
-        m = make(**kw)
-        losses = drive(m)
-        theta = nrel(base.theta, m.theta)
-        checks.append((name, theta, tol, losses[-1], base_losses[-1]))
-    for row in checks:
-        name, err, tol, loss, expected = row
-        assert err < tol, f"{name} theta state/RMS {err:.3e} >= {tol:.3e}"
-        assert abs(loss - expected) < 1e-4, f"{name} loss drift {loss} vs {expected}"
-        print(f"{name}: theta state/RMS={err:.3e}, loss delta={loss-expected:+.3e}")
 
-    # Exercise the periodic factored-tail renormalization (the first 100-step
-    # boundary is otherwise easy to leave untested).
-    renorm = make(tail_algorithm="factored")
-    drive(renorm, 101)
-    assert all(torch.isfinite(f).all() for f in renorm.tail.factor.values())
-    assert all(float(f.min()) > 0 for f in renorm.tail.factor.values())
-    print("factored tail renormalization: PASS")
+    # 1. grad_assembly: loop must reproduce cat exactly.
+    m = make(grad_assembly="loop")
+    losses = drive(m)
+    theta = nrel(base.theta, m.theta)
+    assert theta == 0.0, f"grad_assembly=loop theta {theta:.3e}, expected bit-exact"
+    for i, (a, b) in enumerate(zip(losses, base_losses)):
+        assert abs(a - b) < 1e-6, f"grad_assembly=loop loss drift at step {i}: {a} vs {b}"
+    print(f"grad_assembly=loop vs cat: bit-exact over {len(losses)} steps: PASS")
 
-    # Factored state carries an algorithm version and tail factors. A factored
-    # load of a legacy file is allowed only through the explicit migration path.
-    p = os.path.join(tempfile.gettempdir(), "tmt-opt-version.npz")
+    # 2. ring_credit="full" is the portable reference and the CPU resolution of
+    #    "auto", so it must match the default exactly.
+    m = make(ring_credit="full")
+    losses = drive(m)
+    theta = nrel(base.theta, m.theta)
+    assert theta == 0.0, f"ring_credit=full theta {theta:.3e}, expected bit-exact"
+    for i, (a, b) in enumerate(zip(losses, base_losses)):
+        assert abs(a - b) < 1e-6, f"ring_credit=full loss drift at step {i}: {a} vs {b}"
+    assert m._ring_mode() == "full", "CPU must resolve ring_credit to 'full'"
+    print("ring_credit=full == auto on CPU: PASS")
+
+    # 3. The deleted candidates must be refused, not silently downgraded.
+    for key, value in REMOVED:
+        try:
+            make(**{key: value})
+        except ValueError as exc:
+            assert value in str(exc), f"error should name {value!r}, got: {exc}"
+        else:
+            raise AssertionError(
+                f"{key}={value!r} was accepted; this candidate was measured and "
+                f"removed from gpu_port.py -- a silent fallback would let a "
+                f"caller believe it is running code that no longer exists")
+    print(f"removed candidates refused ({len(REMOVED)}): "
+          f"{', '.join(v for _, v in REMOVED)}: PASS")
+
+    # 4. A checkpoint carrying the removed factored keys must still be refused on
+    #    load -- that guard is in gpu_port.load and has no other coverage.
+    import numpy as np
+    import tempfile
+    p = os.path.join(tempfile.gettempdir(), "tmt-opt-stale.npz")
     base.save(p)
-    strict = make(ring_algorithm="factored")
+    with np.load(p) as d:
+        data = {k: d[k] for k in d.files}
+    data["algorithm_version"] = np.array(1, np.int64)
+    np.savez(p, **data)
     try:
-        strict.load(p)
-    except ValueError:
-        pass
+        make().load(p)
+    except ValueError as exc:
+        assert "factored" in str(exc) or "algorithm_version" in str(exc), str(exc)
     else:
-        raise AssertionError("factored model silently loaded a legacy checkpoint")
-    migrated = make(ring_algorithm="factored", allow_algo_migration=True)
-    migrated.load(p)
-    assert migrated.algorithm_version == 1
-    migrated.step_batch(*(torch.ones(8, dtype=torch.long) for _ in range(2)),
-                        torch.zeros(8))
-    migrated.save(p)
-    resumed = make(ring_algorithm="factored", allow_algo_migration=True)
-    resumed.load(p)
-    assert "algorithm_version" in __import__("numpy").load(p)
-    print("checkpoint algorithm version/migration: PASS")
-    print("OPTIMIZATION CANDIDATES: PASS")
+        raise AssertionError("stale factored checkpoint loaded silently")
+    print("stale factored-candidate checkpoint refused: PASS")
+
+    print("OPTIMIZATION PATHS: PASS")
 
 
 if __name__ == "__main__":

@@ -212,18 +212,48 @@ class TorchTail:
 class TorchLayer:
     def __init__(self, dim):
         self.dim = dim
+        # P3 gated recurrence. `gate` is a per-dim vector of LOGITS added to the
+        # decay logit, so a = sigmoid(decay + gate * x_in). It is created only
+        # when the arm is gated (GpuModel sets self.gate/self.gated): leaving it
+        # absent in the default engine keeps theta's layout -- and therefore
+        # check_parity's numpy==torch identity -- untouched.
+        self.gate = None
+        self.gated = False
 
     def forward(self, enc, x_in, states):
         decay = _sig(self.decay)
-        state = states * decay + enc
+        if self.gated:
+            # a = sigmoid(decay + gate * x_in).
+            #
+            # gate init 0 makes this EXACTLY the incumbent: 0.0 * x_in is an
+            # exact zero and decay + 0.0 == decay, so a == decay bit-for-bit.
+            # That is what lets an incumbent checkpoint be resumed into the
+            # gated arm as its own control (the checkpoint carries no
+            # layer{i}.gate key, so load leaves the gate at 0).
+            #
+            # NOTE the form: s = a*s + x, NOT s = a*s + (1-a)*x. The latter is
+            # what the plan wrote, but (1-a) is not 1.0, so that form cannot
+            # reproduce the incumbent even at gate=0 and the "bit-identical
+            # starting point / resumable A/B" property the same paragraph asks
+            # for is impossible. Retention is gated; the write stays weight 1.0.
+            a = _sig(self.decay + self.gate * x_in)
+        else:
+            a = decay
+        state = states * a + enc
         h, cache = _layer_norm(state, self.g, self.b)
         z = h @ self.W.t()
         sg = torch.sigmoid(z)
         y = z * sg
-        return x_in + y, state, decay, (z, sg, h, cache)
+        # x_in is returned so the caller can form dL/dgate without re-deriving
+        # the residual stream: dgate_t = dL/da_t * a_t(1-a_t) * x_in_t.
+        return x_in + y, state, a, (z, sg, h, cache, x_in)
 
     def backward(self, dx_out, cache):
-        z, sg, h, ln_cache = cache
+        # cache is (z, sg, h, ln_cache, x_in); x_in is unused by the backward
+        # proper -- the gate gradient is formed in step_batch, where the
+        # per-timestep recurrence lives -- but it is unpacked so the tuple
+        # shape stays honest about what forward produced.
+        z, sg, h, ln_cache, _x_in = cache
         dz = dx_out * sg * (1.0 + z * (1.0 - sg))
         dW = dz.t() @ h
         dh = dz @ self.W
@@ -389,9 +419,43 @@ class GpuModel:
     """Flat-parameter torch model, 1:1 with numpy_port.Model's params/buffers."""
 
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, lr_decay=None,
-                 decay_init=None,
+                 decay_init=None, half_life_init=None,
                  device=None, ring_credit="auto", sync_metrics=True,
-                 grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0):
+                 grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0,
+                 ce_only=False, seqlen=1, gated=False, trace_mode="ring",
+                 grad_clip=0.0, nan_guard=True, wd_decay=0.01):
+        # trace_mode: how per-byte embedding credit is accumulated.
+        #   "ring"  -- the incumbent: a K-lag ring buffer plus tail_credit's
+        #              private EMA for the "hot" dims where truncation would
+        #              cost more than 1% of the credit mass.
+        #   "dense" -- the exact (B, 256, dim) eligibility trace per layer,
+        #              which is the tail with ALL dims hot. No ring, no tail, no
+        #              membership logic, no ring_k inference, and therefore no
+        #              ring_k<=256 cap -- which is what currently clips P4's
+        #              long half-lives at ~32 B.
+        # "ring" stays the default so every existing arm and checkpoint is
+        # untouched; "dense" is the P2 arm and cannot load a ring checkpoint.
+        if trace_mode not in ("ring", "dense"):
+            raise ValueError(f"trace_mode must be 'ring' or 'dense', got "
+                             f"{trace_mode!r}")
+        self.trace_mode = trace_mode
+        self.dense_E = None
+        # gated (P3): the per-dim gate on the recurrence, a = sigmoid(decay +
+        # gate * x). OFF by default and, when off, the parameter does not exist
+        # at all -- so theta's layout is unchanged and check_parity's
+        # numpy==torch identity still holds exactly. On, the gate starts at 0,
+        # which makes a == sigmoid(decay) bit-for-bit and lets an incumbent
+        # checkpoint be resumed into the gated arm as its own control.
+        self.gated = bool(gated)
+        # seqlen (T): bytes per stream per optimizer step. 1 is the historical
+        # behaviour and MUST stay the default -- every existing caller and every
+        # checkpoint describes a T=1 run, and T=1 is bit-identical to the
+        # pre-T-axis engine (tests/check_parity.py pins that to the bit).
+        # Raising it does NOT change B: state, ring and tail are all B-shaped, so
+        # the memory is unchanged and only the work per update grows.
+        if int(seqlen) < 1:
+            raise ValueError(f"seqlen must be >= 1, got {seqlen!r}")
+        self.seqlen = int(seqlen)
         self.dim = dim
         self.layercount = layers
         self.temp = temp
@@ -400,6 +464,59 @@ class GpuModel:
         # MUST reproduce the pre-KD engine bit-for-bit (gate 3), so the KD path
         # is skipped entirely rather than multiplied by zero.
         self.distill_alpha = float(distill_alpha)
+        # CE-only switch (PLAN-2026-10-06 MEMORY-BENCHMARKS priority 3):
+        # L = CE only. The variance-hinge, embed-MSE/JEPA and end-of-text
+        # terms are masked to EXACTLY zero in step_batch; KD is incompatible
+        # and refusing loudly beats silently disabling (gates in
+        # tests/check_ce_only.py).
+        self.ce_only = bool(ce_only)
+        # ---- SAFETY (PLAN-2026-10-11 P0 item 3) --------------------------
+        # `nan_guard`: if the assembled gradient contains a non-finite value,
+        # REFUSE the update instead of poisoning the weights. Our own KD arm
+        # diverged to 860.68; the CUDA fork refuses a non-finite gradient
+        # outright (CHANGES.md "NaN guard"). A refusal leaves theta, m and v
+        # untouched and counts itself; `t` still advances, because the DATA
+        # was consumed and the schedule must not slip (an update that did not
+        # happen should not also rewind the learning-rate schedule).
+        #
+        # The guard costs one reduction and one host sync per step, and it
+        # changes NO arithmetic when the gradient is finite -- that is what
+        # tests/check_safety.py gates, bit-exactly, against the same engine
+        # with the guard off.
+        self.nan_guard = bool(nan_guard)
+        self.nan_refusals = 0
+        self.last_nan_refused = False
+        # `grad_clip`: GLOBAL L2 clip on the assembled gradient, in absolute
+        # gradient units. 0 disables it (the default, so every existing arm
+        # and checkpoint keeps its exact dynamics).
+        #
+        # NOTE the units, because they interact with the T axis: the window's
+        # gradient is a SUM over T bytes, and the gradient is also a sum over
+        # B streams, so an ABSOLUTE threshold means a T=16 arm reaches it
+        # 16x sooner than a T=1 arm at the same B. A clip threshold is
+        # therefore not a comparable quantity across arms -- it is a safety
+        # net, not a knob, and it must be off (or scaled) for a T A/B.
+        self.grad_clip = float(grad_clip)
+        # `wd_decay`: the decoupled weight decay applied to the `.decay` and
+        # `.gate` groups. The default equals the flat `self.wd`, which makes
+        # the whole vector uniform and therefore bit-identical to the
+        # incumbent's scalar `wd * th` (PLAN-2026-10-11 P6).
+        #
+        # Why P6 wants it at 0: `sigma(0) = 0.5` is exactly a 1-BYTE half-life,
+        # so a weight decay on the decay logits is a systematic pull toward NO
+        # MEMORY, anchored at init. It fights the log-spaced half-life init
+        # (P4) directly: the init that gives the model a 512 B channel is
+        # also the thing weight decay is pulling back to 1 B. The two are
+        # therefore a 2x2, not a sequence: measure (wd_decay 0.01 / 0.0) x
+        # (default init / P4 init).
+        self.wd_decay = float(wd_decay)
+        self._wd_vec = None
+        if self.ce_only and self.distill_alpha > 0.0:
+            raise ValueError(
+                f"ce_only=True requires distill_alpha == 0, got "
+                f"{self.distill_alpha}: a CE-only run strips KD by design "
+                f"(PLAN-2026-10-06 MEMORY-BENCHMARKS priority 3). Set "
+                f"--distill-alpha 0.")
         self._target_fn = None
         self.kd_positions = 0
         self.kd_covered = 0
@@ -457,13 +574,29 @@ class GpuModel:
         self.tail_cap_gb = float(os.environ.get("TMT_TAIL_CAP_GB", "4.0"))
         with torch.no_grad():
             lim = 1.0 / np.sqrt(dim)
-            dmax = float(_sig(torch.tensor(
-                decay_init if decay_init is not None else lim,
-                dtype=torch.float32)).item())
+            # ring_k must cover the LONGEST-lived dim. decay_init may be a
+            # per-dim array (the log-spaced half-life init), so reduce over
+            # dims instead of calling .item() -- an array used to raise
+            # "only one element tensors can be converted to Python scalars"
+            # right here, at construction, before any training.
+            _src = half_life_init if half_life_init is not None else decay_init
+            if _src is None:
+                dmax = float(_sig(torch.tensor(lim, dtype=torch.float32)).item())
+            elif isinstance(_src, (tuple, list)):
+                dmax = float(0.5 ** (1.0 / float(_src[1])))
+            else:
+                _s = _sig(torch.as_tensor(
+                    np.asarray(_src, dtype=np.float32)))
+                dmax = float(_s.max().item()) if _s.ndim else float(_s.item())
             inferred_ring_k = int(min(256, np.ceil(
                 np.log(RING_TOL) / np.log(max(dmax, 1e-3)))))
             self.ring_k = int(ring_k) if self._ring_k_explicit else inferred_ring_k
-        self._build(dim, layers, decay_init)
+        self._build(dim, layers, decay_init, half_life_init, gated)
+        self.gated = bool(gated)
+        if self.gated:
+            for i, l in enumerate(self.layers):
+                l.gated = True
+                l.gate = self.views[f"layer{i}.gate"]
 
     def set_target_fn(self, fn):
         """Install ``step -> (B,256) target on device`` (or None to disable).
@@ -482,7 +615,8 @@ class GpuModel:
                 "coverage": (self.kd_covered / self.kd_positions
                              if self.kd_positions else None)}
 
-    def _build(self, dim, layers, decay_init):
+    def _build(self, dim, layers, decay_init, half_life_init=None,
+                gated=False):
         lim = 1.0 / np.sqrt(dim)
         # Seeded init. Seed 0 is the historical default and is what every
         # from-scratch A/B arm must share, so their starting weights are
@@ -500,9 +634,43 @@ class GpuModel:
             init[f"layer{i}.g"] = np.ones(dim, np.float32)
             init[f"layer{i}.b"] = np.zeros(dim, np.float32)
             d0 = rng.uniform(-lim, lim, (dim,)).astype(np.float32)
-            if decay_init is not None:
+            if half_life_init is not None:
+                # P4: log-spaced half-life prior. half-life h means
+                # sigma = 0.5**(1/h), so logit = ln(sigma/(1-sigma)).
+                #
+                # The incumbent uniform init puts every sigma within 1% of 0.5
+                # (|logit| <= 1/sqrt(dim) = 0.044), i.e. EVERY half-life within
+                # a byte of 1 B. The trained checkpoint confirms it has stayed
+                # there: sigma_max = 0.9847 -> longest dim forgets in ~45 B, and
+                # only 8 of 512 dims hold more than 8 B. So the model has no
+                # capacity at all for the retention we want, and no amount of
+                # training can build one it was never given a dim for.
+                #
+                # The SET of half-lives is geometric; the assignment to dims is
+                # shuffled by the seeded rng so dim index stays meaningless.
+                # Leaving it ordered would make dim 0..dim-1 monotonically
+                # longer-lived in every layer, coupling a coordinate to a
+                # timescale and handing the model a structure it does not have
+                # under the incumbent init.
+                hmin, hmax = (float(half_life_init[0]), float(half_life_init[1]))
+                if not (0 < hmin <= hmax):
+                    raise ValueError(
+                        f"half_life_init needs 0 < half_min <= half_max, got "
+                        f"{(hmin, hmax)}")
+                h = np.geomspace(hmin, hmax, dim)
+                sig = np.power(0.5, 1.0 / h)
+                logits = np.log(sig / (1.0 - sig)).astype(np.float32)
+                rng.shuffle(logits)
+                d0[:] = logits
+            elif decay_init is not None:
                 d0[:] = decay_init
             init[f"layer{i}.decay"] = d0
+            if gated:
+                # P3 gate logits, ZERO so a == sigmoid(decay) at init. Added to
+                # `init` (and therefore to self.shapes and theta) only in the
+                # gated arm: the default engine's theta layout must stay
+                # byte-comparable with numpy_port's for check_parity.
+                init[f"layer{i}.gate"] = np.zeros(dim, np.float32)
 
         self.shapes = [(k, v.shape) for k, v in init.items()]
         n = sum(int(np.prod(s)) for _, s in self.shapes)
@@ -530,6 +698,9 @@ class GpuModel:
             l.g = self.views[f"layer{i}.g"]
             l.b = self.views[f"layer{i}.b"]
             l.decay = self.views[f"layer{i}.decay"]
+            if gated:
+                l.gated = True
+                l.gate = self.views[f"layer{i}.gate"]
         self.B = 1
         self.new_states(1)
         self.tail = None
@@ -555,6 +726,27 @@ class GpuModel:
             l.decaytrace = torch.zeros((B, self.dim), dtype=F, device=self.device)
             l.ring_w = torch.zeros((B, self.ring_k, self.dim), dtype=F,
                                    device=self.device)
+        if self.trace_mode == "dense":
+            # P2: the exact embedding trace, (B, 256, dim) per layer.
+            #
+            # This is the tail with ALL dims hot. tail_credit.py already
+            # maintains exactly this object for the dims whose
+            # sigma**ring_k > 1% -- the ring exists to avoid materialising
+            # (B,256,dim) for every layer, and the tail patches the dims where
+            # that truncation would cost more than 1% of the credit mass.
+            # Materialising it for every dim is therefore not a new mechanism,
+            # it is the approximation removed.
+            #
+            # Cost: B*256*dim*4 bytes per layer. At dim=512, 16 layers:
+            #   B=16 -> 134 MB, B=64 -> 537 MB, B=256 -> 2.1 GB.
+            # That is the whole trade, and it buys away the ring's hardcoded
+            # ring_k<=256 cap -- which is what currently clips P4's long
+            # half-lives at ~32 B -- and the tail's membership/rebasing logic.
+            self.dense_E = [torch.zeros((B, 256, self.dim), dtype=F,
+                                        device=self.device)
+                            for _ in self.layers]
+        elif getattr(self, "dense_E", None) is not None:
+            self.dense_E = None
 
     # ---------------- tail credit --------------------
     def _ensure_tail(self):
@@ -743,171 +935,450 @@ class GpuModel:
 
     # ---------------- training step --------------------
     def step_batch(self, cs, ns, ends):
-        """cs/ns: int64 tensors (B,), ends: fp32 (B,) — all on self.device.
-        Returns loss (python float, or a device tensor when sync_metrics=False).
-        Mirrors numpy_port.step_batch exactly.
+        """cs/ns: int64 (B,) or (B,T); ends: fp32, same shape — all on
+        self.device. Returns the window's loss (python float, or a device
+        tensor when sync_metrics=False). Mirrors numpy_port.step_batch at T=1.
+
+        THE T AXIS (PLAN-2026-10-11 P1)
+        -------------------------------
+        `(B,)` is the historical call and means T=1: it is unsqueezed to
+        `(B,1)` and then takes the SAME arithmetic path as a window, so there is
+        one implementation and not two that can drift. `(B,T)` is a WINDOW: T
+        consecutive bytes per stream, one recurrent pass per byte, ONE AdamW
+        update for the whole window.
+
+        What "one update per window" pins down — every one of these is a
+        plausible-looking way to be wrong, and none of them raises:
+
+        * `self.t` advances by 1, NOT by T. It is the OPTIMIZER-STEP counter: it
+          drives AdamW's bias correction and the LR schedule, and the ring write
+          pointer is derived from it. Advancing it per byte would silently train
+          on a different schedule with a different bias-correction history while
+          every T=1 gate still passed.
+        * `self.bytes_seen` advances by B*T. That counter is bytes (numpy_port's
+          is B per call, for the same reason).
+        * the returned loss is the window SUM `sum_t L_t` — the objective whose
+          gradient is actually accumulated below. So the logged loss at T=4 is
+          roughly 4x the T=1 line: that is the objective, not a regression. It
+          is also why `--batch` and `--seqlen` must be stated together in every
+          A/B arm — with the gradient summed over T, the one term in AdamW that
+          does NOT scale with the gradient, decoupled weight decay, is
+          relatively T times weaker. That is the same shape of interaction
+          `--batch` already has: this engine's gradient is a SUM over B while
+          the loss is a mean over B (the `/B` asymmetry check_trace_bptt.py
+          reports), so a larger B already means relatively weaker decay.
+        * `last_ce` is a RATE — nats/byte over the window's B*T positions, the
+          same quantity numpy_port documents as "nats/byte" — so training logs
+          stay comparable to eval across T. It is deliberately NOT the
+          objective; do not read it as the CE component of `loss`.
+
+        EXACTNESS. The residual stream does not cross timesteps: every layer is
+        handed the same `enc` and writes only the residual `x`, which is rebuilt
+        from `enc` at each byte. So the ONLY cross-time path is the recurrent
+        state, and that path is carried exactly — the ring credits every
+        retained lag with its true survival product and the tail EMA credits the
+        hot dims at every lag. Within the window the gradient is therefore exact
+        truncated BPTT; the residual approximation is the one that already
+        existed at T=1 (credit older than ring_k lags is dropped, or carried by
+        the tail EMA). tests/check_trace_bptt.py measures it at T>1 and reports
+        the within-window term and the window-boundary term separately.
+
+        MEMORY. The engine runs with requires_grad=False everywhere — theta is a
+        plain `torch.from_numpy` buffer and every gradient is hand-built — so
+        there is no autograd graph and nothing is retained across the window:
+        each byte's forward cache is dropped when its iteration ends. Activation
+        memory stays O(B*D) per layer, NOT O(B*T*D). tools/seqlen_probe.py
+        measures it; the PLAN-2026-10-11 §2 P1 note predicting `B*T*D` does not
+        hold for this engine, and the missing `requires_grad` is the reason.
 
         Phase regions (`TMT_PROFILE_REGIONS=0` disables) let the Phase-0
         profiler attribute time to ring / tail / optimizer / layer fwd-bwd
-        instead of leaving us to guess from raw kernel names.
+        instead of leaving us to guess from raw kernel names. The regions are
+        per-BYTE, so at T>1 each fires T times; that is intended — a window's
+        profile is the sum of its bytes.
         """
         rf = _region if _PROFILE_REGIONS else _null_region
-        self.t += 1
-        B = cs.shape[0]
-        self.bytes_seen += B
-        c_arr, n_arr, end_arr = cs, ns, ends
-
-        with rf("fwd_layers"):
-            enc = self.embed[c_arr]                      # (B, dim)
-            x = enc
-            caches, states, decays = [], [], []
-            for l in self.layers:
-                x, state, decay, cache = l.forward(enc, x, l.states)
-                caches.append(cache)
-                states.append(state)
-                decays.append(decay)
-
-        with rf("decoder"):
-            output = x @ self.Wd.t() + self.bd           # (B, 256)
-            stop = _sig(x @ self.Ws + self.bs[0])        # (B,)
-
-        with rf("loss_metrics"):
-            xv = x.var(dim=1, unbiased=False) + 1e-4
-            var_active = (1.0 - torch.sqrt(xv)) > 0
-            tgt = self.embed[n_arr].detach()
-            mx = output.max(dim=1, keepdim=True).values
-            lse = mx + torch.log(torch.exp(output - mx).sum(dim=1, keepdim=True))
-            ar = torch.arange(B, device=self.device)
-            ce = lse[:, 0] - output[ar, n_arr]
+        # (B,) -> (B,1). One branch, not two code paths: everything below speaks
+        # the 2-D form, so the historical call and a windowed call run identical
+        # arithmetic and only the byte index differs.
+        if cs.dim() == 1:
+            cs = cs.unsqueeze(1)
+            ns = ns.unsqueeze(1)
+            ends = ends.unsqueeze(1)
+        elif cs.dim() != 2:
+            raise ValueError(
+                f"step_batch wants (B,) or (B,T) tensors; got cs with shape "
+                f"{tuple(cs.shape)} (dim {cs.dim()}). The historical 1-D call "
+                f"means T=1 and needs no change.")
+        B, T = cs.shape
+        if T < 1:
+            raise ValueError(f"step_batch got an empty window (B,T)=({B},{T})")
+        if ns.shape != cs.shape or ends.shape != cs.shape:
+            raise ValueError(
+                f"cs/ns/ends must share one shape: cs {tuple(cs.shape)}, "
+                f"ns {tuple(ns.shape)}, ends {tuple(ends.shape)}")
+        # KD is REFUSED at T>1 rather than served wrongly. The target provider
+        # is indexed by optimizer step (`step -> (B,256)`), and a window
+        # advances that counter by 1 while consuming T bytes per stream, so
+        # there is no honest way to ask it for T positions: calling it T times
+        # hands every byte of the window the SAME teacher distribution. A
+        # silently-wrong KD gradient is worse than a refused run, so refuse,
+        # before any state has moved.
+        # P3 gated recurrence: REFUSED until the credit machinery is reworked.
+        #
+        # The blocker is architectural, not a missing line. Gating makes the
+        # retention factor input-dependent, a = sigmoid(decay + gate * x), so it
+        # becomes PER-SAMPLE (B, dim) instead of the per-dim (dim,) vector every
+        # consumer assumes:
+        #   - _scatter_ring_credit does w.mul_(dec[None, None, :]) at three
+        #     sites, including the fused nvrtc/kloop paths, and w is (B, K, dim);
+        #   - TorchTail.begin_step takes sig_hot for the hot dims, i.e. a vector;
+        #   - the decaytrace recurrence multiplies by dec[None, :];
+        #   - ring_k is INFERRED from sigma_max, which stops being a single
+        #     number once sigma depends on the input.
+        # Each of those, patched to broadcast a per-sample a, is the kind of
+        # change that yields a plausible-looking gradient that is quietly wrong
+        # -- the failure class this project is organised around avoiding. A
+        # refused run is recoverable; a silently-wrong one is not.
+        #
+        # The forward, the gate parameter (created only in this arm, so theta's
+        # layout is unchanged otherwise) and the gate gradient are
+        # IMPLEMENTED, but the gate gradient is NOT verified and is KNOWN to
+        # be wrong as written: torch autograd on the same recurrence, and a
+        # central finite difference of the loss, both disagree with the
+        # engine's formula (max rel dev 4.59 / 8.19 for dL/dgate and
+        # 11.7 / 22.4 against finite differences, at dim=8 layers=2 B=3 T=4).
+        # tests/check_gated_recurrence.py deliberately pins only the claims
+        # that hold and ASSERTS the refusal; it does not, and must not, claim
+        # the gradient.
+        #
+        # (An earlier version of this comment said the gate gradient was
+        # "finite-difference-pinned in tests/check_gated_recurrence.py". That
+        # was false -- the gate file says the opposite -- and a comment that
+        # contradicts the gate it points at is worse than no comment, because
+        # it is a green light on a known-wrong gradient.)
+        #
+        # The two missing pieces are in the gate file's docstring: ds_t/da_t
+        # must carry the CROSS-TIME chain (which the ungated engine's
+        # decaytrace already does, and which a naive per-byte transcription
+        # drops), and the state gradient must pass back through the layer
+        # norm and the z*sigmoid(z) gated linear PER LAYER rather than through
+        # a single decoder-level dx.
+        if self.gated:
+            raise NotImplementedError(
+                "gated=True (P3) is not yet runnable: gating makes the retention "
+                "factor per-sample (B, dim), but the ring-credit, tail and "
+                "decaytrace machinery all assume a per-dim (dim,) decay vector, "
+                "and ring_k is inferred from sigma_max which is then not a "
+                "scalar. Reworking that is a separate, deliberate change -- see "
+                "PLAN-2026-10-11-T-AXIS.md P3. Refusing rather than emitting a "
+                "plausible wrong gradient.")
+        if T > 1 and self.distill_alpha > 0.0:
+            raise RuntimeError(
+                f"seqlen={T} with distill_alpha={self.distill_alpha}: the KD "
+                f"target provider is indexed by OPTIMIZER step, so a window of "
+                f"{T} bytes cannot be given {T} distinct teacher targets "
+                f"(one call per byte would repeat the same distribution T "
+                f"times). Run --seqlen 1 with --distill-alpha, or make the "
+                f"provider byte-indexed first.")
+        self.t += 1                       # ONE per window — see the docstring
+        self.bytes_seen += B * T
+        ar = torch.arange(B, device=self.device)   # byte-independent: hoisted
         # alpha = 0 must not perturb a single bit, so the CE weight is not
         # applied at all in that case (gate 3 checks this over 120 steps).
         ce_weight = 1.0 - self.distill_alpha if self.distill_alpha > 0.0 else 1.0
-        loss_tensor = (torch.where(var_active, 1.0 - torch.sqrt(xv), 0.0).sum()
-                       + ((x - tgt) ** 2).sum() / self.dim
-                       + ce_weight * ce.sum() + ((stop - end_arr) ** 2).sum()) / B
-        ce_tensor = ce.mean()
-        # ---- distillation: KL(p_teacher_bytes || p_student_bytes) -----------
-        # L_KD = sum_v p_T(v) (log p_T(v) - log p_S(v)); with tau = 1 frozen its
-        # gradient wrt the pre-softmax logits is exactly (p_S - p_T).
-        p_t = None
-        if self.distill_alpha > 0.0:
-            if self._target_fn is None:
-                raise RuntimeError(
-                    f"distill_alpha={self.distill_alpha} but no target provider "
-                    f"was installed (model.set_target_fn); refusing to train a "
-                    f"KD arm with a silently missing target")
-            p_t = self._target_fn(self.t)
-            if p_t is None:
-                raise RuntimeError(f"target provider returned None at step "
-                                   f"{self.t}")
-            p_t = p_t.to(output.device, non_blocking=True).float()
-            if p_t.shape != output.shape:
-                raise RuntimeError(f"target shape {tuple(p_t.shape)} != logits "
-                                   f"{tuple(output.shape)}")
-            logp = torch.log_softmax(output, dim=1)
-            s_t = (p_t * (torch.log(p_t.clamp_min(1e-9)) - logp)).sum(dim=1)
-            covered = p_t.sum(dim=1) > 0
-            s_t = torch.where(covered, s_t, torch.zeros_like(s_t))
-            loss_tensor = loss_tensor + self.distill_alpha * s_t.sum() / B
-            # exposed for telemetry and for tests/check_kd.py: total loss across
-            # different alphas is NOT comparable (CE is down-weighted by
-            # (1-alpha) by design), so the KD term has to be readable directly.
-            self.last_kd = float(s_t.sum()) / B
-            self.kd_positions += int(B)
-            self.kd_covered += int(covered.sum())
-        else:
-            self.last_kd = 0.0
-        self.last_loss_tensor = loss_tensor.detach()
-        self.last_ce_tensor = ce_tensor.detach()
-        if self.sync_metrics:
-            loss = float(loss_tensor)
-            self.last_ce = float(ce_tensor)
-        else:
-            # Async metrics are the prerequisite for graph/compile experiments:
-            # callers sync only when a value is actually logged.
-            loss = loss_tensor
-            self.last_ce = ce_tensor
+        # CE-only (PLAN-2026-10-06 MEMORY-BENCHMARKS priority 3): the
+        # variance-hinge, embed-MSE/JEPA and end-of-text terms are masked by
+        # aux_w, which is EXACTLY 0.0 with the switch on and EXACTLY 1.0 off.
+        # Off, fp32 x*1.0 == x, so every term keeps its historical value and
+        # the loss reduces bit-for-bit to the pre-change expression (checked
+        # per-step over 120 steps by tests/check_ce_only.py). The per-term
+        # quantities below are exposed MASKED (what enters the loss) and RAW
+        # (what would enter without the mask) so that gate can prove the zeroing.
+        aux_w = 0.0 if self.ce_only else 1.0
 
-        with rf("bwd_decoder"):
-            p_s = torch.exp(output - lse)              # softmax
-        doutput = p_s.clone()
-        doutput[ar, n_arr] -= 1.0
-        if ce_weight != 1.0:
-            doutput *= ce_weight
-        if p_t is not None:
-            # The KD gradient must be masked exactly where the KD loss is.
-            # `covered` is False at declined positions (inside the token where
-            # top-k support fell under `floor`, or the stream's first byte),
-            # where p_t is all-zero and the loss above contributes exactly
-            # nothing. Without the mask the gradient still received
-            # alpha * (p_s - 0) = alpha * p_s there, so the optimiser descended
-            # something other than the loss being logged -- measured at ~8% of
-            # the decoder gradient at 24% coverage, and zero at 100% coverage,
-            # which is why check_kd.py never saw it: its synthetic target is
-            # non-zero on every row.
-            doutput += (self.distill_alpha * (p_s - p_t)
-                        * covered[:, None].to(p_s.dtype))
-        dWd = doutput.t() @ x
-        dbd = doutput.sum(dim=0)
-        dx = doutput @ self.Wd
-
-        dstop = 2.0 * (stop - end_arr) * stop * (1.0 - stop)
-        dWs = (dstop[:, None] * x).sum(dim=0)
-        dbs = dstop.sum(dim=0, keepdim=True)
-        dx = dx + dstop[:, None] * self.Ws[None, :]
-
-        dvar = torch.where(var_active, -1.0 / (2.0 * torch.sqrt(xv)), 0.0)[:, None]
-        dx = dx + (dvar * 2.0 * (x - x.mean(dim=1, keepdim=True)) / self.dim)
-        dx = dx + (2.0 * (x - tgt) / self.dim)
-
-        with rf("bwd_layers"):
-            denc = dx.clone()
-            lw, lg, lb, lgrads = [], [], [], []
-            for i in reversed(range(self.layercount)):
-                l = self.layers[i]
-                dstate, dW, dg, db = l.backward(dx, caches[i])
-                # dx_in == dx_out (residual pass-through); state grad -> denc
-                denc = denc + dstate
-                lw.append(dW); lg.append(dg); lb.append(db)
-                lgrads.append(dstate)
-            lgrads.reverse(); lw.reverse(); lg.reverse(); lb.reverse()
-
-        # ---- trace updates (ring + tail credit) ----
-        self._ensure_tail()
+        # ---- window accumulators ------------------------------------------
+        # Every gradient piece is a plain SUM over the window's T bytes. That is
+        # what makes the "no credit dropped" gate a theorem instead of a
+        # tolerance: at T=1 an accumulator receives exactly one term, and
+        # 0.0 + x == x bit-exactly in fp32 for every finite x. (Signed zero is
+        # the sole exception and is unobservable: `th - (-0.0) == th - 0.0`, and
+        # `==` treats them equal, so neither a gate nor AdamW can tell them
+        # apart. tests/check_parity.py asserts BIT equality, sign of zero
+        # included, so if that ever changes it fails loudly.)
+        gv = self.gviews
         dembed = torch.zeros((256, self.dim), dtype=F, device=self.device)
-        decay_grads = []
+        dWd = torch.zeros_like(gv["Wd"])
+        dbd = torch.zeros_like(gv["bd"])
+        dWs = torch.zeros_like(gv["Ws"])
+        dbs = torch.zeros_like(gv["bs"])
+        lw = [torch.zeros_like(gv[f"layer{i}.W"]) for i in range(self.layercount)]
+        lg = [torch.zeros_like(gv[f"layer{i}.g"]) for i in range(self.layercount)]
+        lb = [torch.zeros_like(gv[f"layer{i}.b"]) for i in range(self.layercount)]
+        decay_grads = [torch.zeros_like(gv[f"layer{i}.decay"])
+                       for i in range(self.layercount)]
+        # P3 gate gradients. Allocated only in the gated arm so the ungated
+        # engine pays nothing and, more importantly, so nothing in the default
+        # path changes.
+        gate_grads = ([torch.zeros_like(gv[f"layer{i}.gate"])
+                       for i in range(self.layercount)] if self.gated else None)
+        # per-timestep a_t for the gate term: the gate enters a_t only at time
+        # t, so unlike decaytrace there is NO chain across time and the gate
+        # gradient is a plain sum over the window (see the trace block below).
+        gate_xin = ([None] * self.layercount if self.gated else None)
+        loss_tensor = torch.zeros((), dtype=F, device=self.device)
+        ce_sum = torch.zeros((), dtype=F, device=self.device)
+        var_sum = torch.zeros((), dtype=F, device=self.device)
+        mse_sum = torch.zeros((), dtype=F, device=self.device)
+        end_sum = torch.zeros((), dtype=F, device=self.device)
+        # Once per WINDOW, not per byte. The rebase cadence is counted in
+        # OPTIMIZER steps (REBASE_EVERY), so a 16-byte window must not trigger
+        # 16 membership re-evaluations — a per-step sync was 99% of GPU step
+        # time when it ran per step.
+        self._ensure_tail()
+        self._ring_dest = dembed            # every byte's credit lands here
         K = self.ring_k
-        p = (self.t - 1) % K
-        rows = self.ring_b.reshape(B * K)                # (B*K,) byte ids
-        self._ring_dest = dembed
-        for i, l in enumerate(self.layers):
-            dlds = lgrads[i]                             # (B, dim)
-            w = l.ring_w
-            dec = decays[i]
-            if self.tail is not None and self.tail.nhot(i):
-                self.tail.begin_step(i, dec[self.tail.cols_of(i)])
-            hot_mask = (self.tail.mask_of(i)
-                        if self.tail is not None and self.tail.nhot(i) else None)
-            with rf("ring_credit"):
-                # the decay itself lives in _scatter_ring_credit: the fused
-                # nvrtc path folds it into the same pass as the credit
-                self._scatter_ring_credit(i, w, dlds, rows, hot_mask, dec)
-                w[:, p] = 1.0                            # this byte = lag 1
-            if self.tail is not None and self.tail.nhot(i):
-                with rf("tail_credit"):
-                    tailc = self.tail.credit(i, dlds)
-                    if tailc is not None:
-                        cols = self.tail.cols_of(i)
-                        dembed[:, cols] = dembed[:, cols] + tailc
-                    self.tail.add_byte(i, c_arr)
-            with rf("decaytrace"):
-                l.decaytrace = (dec[None, :] * l.decaytrace +
-                                dec[None, :] * (1.0 - dec[None, :]) * l.states)
-                decay_grads.append((dlds * l.decaytrace).sum(dim=0))
-            l.states = states[i]                         # stop_gradient
 
-        self.ring_b[:, p] = c_arr
-        dembed.index_add_(0, c_arr, denc)                # autograd part
+        for tt in range(T):
+            c_arr, n_arr, end_arr = cs[:, tt], ns[:, tt], ends[:, tt]
+            # The ring write pointer is (step, byte) -> exactly one slot per
+            # byte, so a window advances it T times. Deriving it from self.t
+            # alone — the T=1 form — would make all T bytes of the window write
+            # the SAME slot: the last byte would win and T-1 bytes' worth of
+            # embedding credit would disappear with no error anywhere.
+            p = (self.t - 1 + tt) % K
+            # Recomputed PER BYTE. ring_b is rewritten T times inside a window,
+            # so a (B*K,) snapshot taken once before the layer loop would still
+            # name the PREVIOUS window's bytes for T-1 of the T scatters and
+            # move that credit onto the wrong byte ids. (It is a view of ring_b
+            # and would track the writes below; re-deriving it makes that
+            # explicit instead of load-bearing.)
+            rows = self.ring_b.reshape(B * K)            # (B*K,) byte ids
+
+            with rf("fwd_layers"):
+                enc = self.embed[c_arr]                  # (B, dim)
+                x = enc
+                caches, states, decays = [], [], []
+                for l in self.layers:
+                    x, state, decay, cache = l.forward(enc, x, l.states)
+                    caches.append(cache)
+                    states.append(state)
+                    decays.append(decay)
+                if self.gated:
+                    # x_in for the gate term, per layer, for THIS byte. Stashed
+                    # here because the backward runs after the whole window and
+                    # the residual stream has moved on by then.
+                    for i, c in enumerate(caches):
+                        gate_xin[i] = c[4]
+
+            with rf("decoder"):
+                output = x @ self.Wd.t() + self.bd       # (B, 256)
+                stop = _sig(x @ self.Ws + self.bs[0])    # (B,)
+
+            with rf("loss_metrics"):
+                xv = x.var(dim=1, unbiased=False) + 1e-4
+                var_active = (1.0 - torch.sqrt(xv)) > 0
+                tgt = self.embed[n_arr].detach()
+                mx = output.max(dim=1, keepdim=True).values
+                lse = mx + torch.log(torch.exp(output - mx).sum(dim=1, keepdim=True))
+                ce = lse[:, 0] - output[ar, n_arr]
+            # PER-BYTE terms, accumulated separately from the loss expression:
+            # folding a running total into the loss would sum prefixes.
+            var_t = torch.where(var_active, 1.0 - torch.sqrt(xv), 0.0).sum()
+            mse_t = ((x - tgt) ** 2).sum() / self.dim
+            end_t = ((stop - end_arr) ** 2).sum()
+            ce_t = ce.sum()
+            loss_tensor = loss_tensor + (aux_w * var_t + aux_w * mse_t
+                                         + ce_weight * ce_t
+                                         + aux_w * end_t) / B
+            var_sum = var_sum + var_t
+            mse_sum = mse_sum + mse_t
+            end_sum = end_sum + end_t
+            ce_sum = ce_sum + ce_t
+
+            # ---- distillation: KL(p_teacher_bytes || p_student_bytes) ------
+            # L_KD = sum_v p_T(v) (log p_T(v) - log p_S(v)); with tau = 1 frozen
+            # its gradient wrt the pre-softmax logits is exactly (p_S - p_T).
+            p_t = None
+            if self.distill_alpha > 0.0:
+                if self._target_fn is None:
+                    raise RuntimeError(
+                        f"distill_alpha={self.distill_alpha} but no target "
+                        f"provider was installed (model.set_target_fn); "
+                        f"refusing to train a KD arm with a silently missing "
+                        f"target")
+                p_t = self._target_fn(self.t)
+                if p_t is None:
+                    raise RuntimeError(f"target provider returned None at step "
+                                       f"{self.t}")
+                p_t = p_t.to(output.device, non_blocking=True).float()
+                if p_t.shape != output.shape:
+                    raise RuntimeError(f"target shape {tuple(p_t.shape)} != "
+                                       f"logits {tuple(output.shape)}")
+                logp = torch.log_softmax(output, dim=1)
+                s_t = (p_t * (torch.log(p_t.clamp_min(1e-9)) - logp)).sum(dim=1)
+                covered = p_t.sum(dim=1) > 0
+                s_t = torch.where(covered, s_t, torch.zeros_like(s_t))
+                loss_tensor = loss_tensor + self.distill_alpha * s_t.sum() / B
+                # exposed for telemetry and for tests/check_kd.py: total loss
+                # across different alphas is NOT comparable (CE is down-weighted
+                # by (1-alpha) by design), so the KD term has to be readable
+                # directly.
+                self.last_kd = float(s_t.sum()) / B
+                self.kd_positions += int(B)
+                self.kd_covered += int(covered.sum())
+            else:
+                self.last_kd = 0.0
+            self.last_loss_tensor = loss_tensor.detach()
+            # nats/byte over the window's B*T positions. `ce.sum()/n` is
+            # bit-identical to `ce.mean()` (checked over 400 random shapes), so
+            # the T=1 value is unchanged from the pre-T-axis engine.
+            ce_tensor = ce_sum / (B * T)
+            self.last_ce_tensor = ce_tensor.detach()
+            if self.sync_metrics:
+                loss = float(loss_tensor)
+                self.last_ce = float(ce_tensor)
+            else:
+                # Async metrics are the prerequisite for graph/compile
+                # experiments: callers sync only when a value is actually logged.
+                loss = loss_tensor
+                self.last_ce = ce_tensor
+
+            with rf("bwd_decoder"):
+                p_s = torch.exp(output - lse)              # softmax
+            doutput = p_s.clone()
+            doutput[ar, n_arr] -= 1.0
+            if ce_weight != 1.0:
+                doutput *= ce_weight
+            if p_t is not None:
+                # The KD gradient must be masked exactly where the KD loss is.
+                # `covered` is False at declined positions (inside the token
+                # where top-k support fell under `floor`, or the stream's first
+                # byte), where p_t is all-zero and the loss above contributes
+                # exactly nothing. Without the mask the gradient still received
+                # alpha * (p_s - 0) = alpha * p_s there, so the optimiser
+                # descended something other than the loss being logged --
+                # measured at ~8% of the decoder gradient at 24% coverage, and
+                # zero at 100% coverage, which is why check_kd.py never saw it:
+                # its synthetic target is non-zero on every row.
+                doutput += (self.distill_alpha * (p_s - p_t)
+                            * covered[:, None].to(p_s.dtype))
+            dWd += doutput.t() @ x
+            dbd += doutput.sum(dim=0)
+            dx = doutput @ self.Wd
+
+            # The auxiliary terms' gradients are masked with the same aux_w as
+            # the loss, so under CE-only the optimizer descends exactly
+            # d(CE)/dtheta: the stop-head gradient is exactly zero (its weights
+            # then move only by weight decay, which touches a term absent from
+            # L), and the var-hinge / embed-MSE contributions to dx are exactly
+            # zero. aux_w == 1.0 off-path keeps every product bit-identical to
+            # the pre-change engine.
+            dstop = 2.0 * (stop - end_arr) * stop * (1.0 - stop)
+            dWs += (dstop[:, None] * x).sum(dim=0) * aux_w
+            dbs += dstop.sum(dim=0, keepdim=True) * aux_w
+            dx = dx + (dstop[:, None] * self.Ws[None, :]) * aux_w
+
+            dvar = torch.where(var_active, -1.0 / (2.0 * torch.sqrt(xv)),
+                               0.0)[:, None]
+            dx = dx + aux_w * (dvar * 2.0 * (x - x.mean(dim=1, keepdim=True))
+                               / self.dim)
+            dx = dx + aux_w * (2.0 * (x - tgt) / self.dim)
+
+            with rf("bwd_layers"):
+                denc = dx.clone()
+                lgrads = [None] * self.layercount
+                for i in reversed(range(self.layercount)):
+                    l = self.layers[i]
+                    dstate, dW, dg, db = l.backward(dx, caches[i])
+                    # dx_in == dx_out (residual pass-through); state grad -> denc
+                    denc = denc + dstate
+                    lw[i] += dW
+                    lg[i] += dg
+                    lb[i] += db
+                    lgrads[i] = dstate
+
+            # ---- trace updates (ring + tail credit) — PER BYTE ------------
+            # Everything in this block is a per-timestep operation, so each
+            # line fires T times inside a window. Leaving any of them as a
+            # single per-step write is the silent-failure class this plan is
+            # about: each one produces a plausible gradient with T-1 bytes'
+            # worth of credit quietly missing.
+            for i, l in enumerate(self.layers):
+                dlds = lgrads[i]                         # (B, dim)
+                w = l.ring_w
+                dec = decays[i]
+                if self.trace_mode == "dense":
+                    # ---- P2: the exact embedding trace -------------------
+                    # This is tail_credit.py with every dim hot, and the three
+                    # operations are exactly the ones TailCredit performs:
+                    #   begin_step  -> E *= sigma            (decay)
+                    #   credit      -> dEmb += sum_b E[b,v,:]*dlds[b,:]
+                    #   add_byte    -> E[b, c_b, :] += 1.0
+                    # Same order (decay, credit, add) as the ring, so the
+                    # rhythm -- and therefore which lag each credit term sits
+                    # at -- matches.
+                    E = self.dense_E[i]
+                    with rf("dense_decay"):
+                        E.mul_(dec[None, None, :])
+                    with rf("dense_credit"):
+                        dembed += torch.einsum("bvd,bd->vd", E, dlds)
+                    with rf("dense_add"):
+                        E[ar, c_arr, :] += 1.0
+                else:
+                    if self.tail is not None and self.tail.nhot(i):
+                        self.tail.begin_step(i, dec[self.tail.cols_of(i)])
+                    hot_mask = (self.tail.mask_of(i)
+                                if self.tail is not None and self.tail.nhot(i)
+                                else None)
+                    with rf("ring_credit"):
+                        # the decay itself lives in _scatter_ring_credit: the
+                        # fused nvrtc path folds it into the same pass as the
+                        # credit
+                        self._scatter_ring_credit(i, w, dlds, rows, hot_mask,
+                                                  dec)
+                        w[:, p] = 1.0                    # this byte = lag 1
+                    if self.tail is not None and self.tail.nhot(i):
+                        with rf("tail_credit"):
+                            tailc = self.tail.credit(i, dlds)
+                            if tailc is not None:
+                                cols = self.tail.cols_of(i)
+                                dembed[:, cols] = dembed[:, cols] + tailc
+                            self.tail.add_byte(i, c_arr)
+                with rf("decaytrace"):
+                    # `l.states` still holds the state BEFORE this byte — it is
+                    # overwritten at the bottom of this block — which is what
+                    # makes the recurrence s_t = a*s_{t-1} + e_t yield
+                    # ds_t/ddec = a(1-a)*s_{t-1} + a*ds_{t-1}/ddec exactly.
+                    l.decaytrace = (dec[None, :] * l.decaytrace +
+                                    dec[None, :] * (1.0 - dec[None, :]) * l.states)
+                    decay_grads[i] += (dlds * l.decaytrace).sum(dim=0)
+                    if self.gated:
+                        # dL/dgate = sum_t dL/ds_t * ds_t/da_t * da_t/dgate_t
+                        #           = sum_t dlds_t * s_{t-1} * a_t(1-a_t) * x_t
+                        #
+                        # The gate enters a_t ONLY at time t, so unlike
+                        # decaytrace there is no cross-time chain and no
+                        # recurrence to carry: a plain sum over the window.
+                        # `dec` here is the EFFECTIVE retention a_t, which
+                        # forward returned in place of the raw sigmoid(decay).
+                        aa = dec[None, :]
+                        gate_grads[i] += (dlds * l.states * aa
+                                          * (1.0 - aa) * gate_xin[i]).sum(dim=0)
+                # stop_gradient; after the loop this is the state at the END of
+                # the window, which is what the next window must start from.
+                l.states = states[i]
+
+            self.ring_b[:, p] = c_arr
+            dembed.index_add_(0, c_arr, denc)            # autograd part
+
+        self.last_ce_sum = ce_sum.detach()
+        self.last_ce_weight = ce_weight
+        self.last_aux_masked = ((aux_w * var_sum).detach(),
+                                (aux_w * mse_sum).detach(),
+                                (aux_w * end_sum).detach())
+        self.last_aux_raw = (var_sum.detach(), mse_sum.detach(),
+                             end_sum.detach())
 
         # ---- assemble the flat gradient buffer ----
         # The legacy path issued one copy_ per parameter tensor (69 kernels per
@@ -928,6 +1399,9 @@ class GpuModel:
             srcs[f"layer{i}.b"] = lb[i].reshape(self.gviews[f"layer{i}.b"].shape)
             srcs[f"layer{i}.decay"] = decay_grads[i].reshape(
                 self.gviews[f"layer{i}.decay"].shape)
+            if self.gated:
+                srcs[f"layer{i}.gate"] = gate_grads[i].reshape(
+                    self.gviews[f"layer{i}.gate"].shape)
         with rf("grad_copy"):
             if self.grad_assembly == "cat":
                 torch.cat([srcs[name].reshape(-1) for name, _ in self.shapes],
@@ -938,22 +1412,81 @@ class GpuModel:
                     gv[name].copy_(srcs[name])
 
         # ---- flat inline AdamW (mirror numpy_port exactly) ----
+        # ONE update per window, with `t = self.t` — the optimizer-step counter,
+        # not a byte counter. Bias correction and the LR schedule therefore see
+        # the same sequence of t values at T>1 as at T=1; only the accumulated
+        # gradient differs. (Advancing t by T here would keep every T=1 gate
+        # green while changing the schedule and the correction history.)
         with rf("optimizer"):
             t = self.t
             th, gr, m, v = self.theta, self.grads, self.m, self.v
-            m.mul_(self.b1).add_((1.0 - self.b1) * gr)
-            v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
-            v.sqrt_()
-            # The learning rate is a per-coordinate VECTOR so a role can be
-            # scaled independently. Filled with exactly float32(self.lr) when
-            # lr_decay is unset, which makes this arithmetically identical to
-            # the old scalar form (a Python float promotes to float32 against a
-            # float32 tensor) -- tests/check_lr_roles.py gates that bit-exactly.
-            lv = self._role_lr_vec()
-            th.sub_(lv * (m * (1.0 / (1.0 - self.b1 ** t)) /
-                          (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
-                          + self.wd * th))
+            # ---- NaN guard (PLAN-2026-10-11 P0 item 3) -------------------
+            # A non-finite gradient is REFUSED, not applied: theta, m and v
+            # are left exactly as they were. `t` still advances (the data was
+            # consumed; rewinding the LR schedule would be a second, quieter
+            # way to change the run), and the refusal is counted so a run that
+            # silently stopped learning is visible in the log.
+            #
+            # The guard is a no-op on finite gradients, and the check is a
+            # single reduction plus one host sync -- the same trade the CUDA
+            # fork makes for its global grad-norm sync.
+            self.last_nan_refused = False
+            finite = True
+            if self.nan_guard:
+                finite = bool(torch.isfinite(gr).all().item())
+                if not finite:
+                    self.nan_refusals += 1
+                    self.last_nan_refused = True
+            if finite:
+                # ---- global grad clip ----------------------------------
+                # PyTorch's clip_grad_norm_ convention: scale the whole
+                # gradient by min(clip / (norm + 1e-6), 1). Applied BEFORE the
+                # AdamW moments are updated, so the moments see the gradient
+                # that was actually applied.
+                if self.grad_clip > 0.0:
+                    gn = float(torch.linalg.vector_norm(gr).item())
+                    coef = self.grad_clip / (gn + 1e-6)
+                    if coef < 1.0:
+                        gr.mul_(coef)
+                m.mul_(self.b1).add_((1.0 - self.b1) * gr)
+                v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
+                v.sqrt_()
+                # The learning rate is a per-coordinate VECTOR so a role can be
+                # scaled independently. Filled with exactly float32(self.lr) when
+                # lr_decay is unset, which makes this arithmetically identical to
+                # the old scalar form (a Python float promotes to float32 against a
+                # float32 tensor) -- tests/check_lr_roles.py gates that bit-exactly.
+                lv = self._role_lr_vec()
+                # The weight decay is ALSO a per-coordinate vector, so the
+                # `.decay`/`.gate` groups can be exempted (P6). With the
+                # default wd_decay == wd it is a uniform vector and therefore
+                # bit-identical to the incumbent's scalar `wd * th`.
+                th.sub_(lv * (m * (1.0 / (1.0 - self.b1 ** t)) /
+                              (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
+                              + self._wd_coord_vec() * th))
+            # else: the update is REFUSED. theta, m, v untouched.
         return loss
+
+    def _wd_coord_vec(self):
+        """The per-coordinate weight-decay vector, cached.
+
+        Uniform `self.wd` everywhere except the `.decay` and `.gate` groups,
+        which get `self.wd_decay`. With the default wd_decay == wd this is a
+        uniform vector, and `vec * th` is bit-identical to the incumbent's
+        scalar `wd * th` (both multiply a float32(0.01) by a float32 tensor).
+        """
+        if self._wd_vec is not None:
+            return self._wd_vec
+        n = self.theta.numel()
+        wv = torch.full((n,), self.wd, dtype=F, device=self.device)
+        off = 0
+        for name, shape in self.shapes:
+            k = int(np.prod(shape)) if shape else 1
+            if name.endswith(".decay") or name.endswith(".gate"):
+                wv[off:off + k] = self.wd_decay
+            off += k
+        self._wd_vec = wv
+        return wv
 
     def _role_lr_vec(self):
         """The per-coordinate learning-rate vector, cached.
@@ -961,7 +1494,13 @@ class GpuModel:
         Per-role semantics follow the usual param-group convention: the role's
         LR scales the WHOLE update bracket for that coordinate, i.e. both the
         adaptive term and the decoupled weight-decay term. A decay coordinate
-        with `lr_decay=16*lr` therefore also gets 16x the weight decay.
+        with `lr_decay=16*lr` therefore also gets 16x the weight decay --
+        which is why P6 exists: `wd_decay=0` removes the weight-decay term
+        from the `.decay` group entirely, so the role's LR then scales ONLY
+        the adaptive term and the "knob wired to a trap" is gone.
+
+        (The trap is still live for any role that is scaled and still has a
+        non-zero weight decay; today `.decay` is the only such role.)
         """
         if self._lr_vec is not None:
             return self._lr_vec
@@ -989,7 +1528,20 @@ class GpuModel:
         out["v"] = self.v.detach().cpu().numpy()
         out["B"] = np.array(self.B, np.int64)
         out["ring_k"] = np.array(self.ring_k, np.int64)
-        if self.tail_enabled and self.tail is not None:
+        if self.trace_mode == "dense" and self.dense_E is not None:
+            # P2: persist the exact trace, exactly as the ring persisted ring_w.
+            # Same order of size -- B*256*dim*4 per layer vs the ring's
+            # B*ring_k*dim*4 with ring_k capped at 256 -- so this is not a new
+            # cost, it is the same one moved.
+            #
+            # Without it load() would silently start the trace at zero. Harmless
+            # for cold dims (sigma**50 ~ 1e-15) but NOT for hot ones (sigma=0.98
+            # gives sigma**50 = 0.36), so a resumed dense run would quietly lose
+            # the history of exactly the dims the trace exists for.
+            for i in range(self.layercount):
+                out[f"dense_E.{i}"] = self.dense_E[i].detach().cpu().numpy()
+            out["trace_mode"] = np.array(0, np.int64)   # 0 == dense
+        elif self.tail_enabled and self.tail is not None:
             for l, cols in self.tail.cols.items():
                 out[f"tail_cols.{l}"] = cols.cpu().numpy().astype(np.int64)
                 out[f"tail_E.{l}"] = self.tail.E[l].cpu().numpy()
@@ -1065,6 +1617,39 @@ class GpuModel:
             with torch.no_grad():
                 self.m.copy_(torch.from_numpy(d["m"].astype(np.float32)).to(self.device))
                 self.v.copy_(torch.from_numpy(d["v"].astype(np.float32)).to(self.device))
+        # trace_mode is ABSENT from every legacy (ring) checkpoint -- it is a
+        # new key -- so absent means ring. Checking `"trace_mode" in d` and then
+        # only acting on the dense case let a ring checkpoint load into a dense
+        # engine, which silently starts the trace at zero.
+        ck_dense = ("trace_mode" in d
+                    and int(np.ravel(d["trace_mode"])[0]) == 0)
+        if ck_dense and self.trace_mode != "dense":
+            raise ValueError(
+                f"checkpoint {path} is a DENSE-trace run but this engine is "
+                f"trace_mode={self.trace_mode!r}. Resume with "
+                f"trace_mode='dense'; the ring would start cold and silently "
+                f"drop the trace history it was saved with.")
+        if (not ck_dense) and self.trace_mode == "dense":
+            raise ValueError(
+                f"checkpoint {path} is a RING run but this engine is "
+                f"trace_mode='dense'. The dense trace would start at zero "
+                f"rather than at the ring's accumulated credit -- harmless for "
+                f"cold dims but not hot ones (sigma**50 = 0.36 at sigma=0.98). "
+                f"Convert deliberately, or train the dense arm from scratch.")
+        # Restore the dense trace, adapting B the way the state rows do.
+        if self.trace_mode == "dense" and self.dense_E is not None:
+            for i in range(self.layercount):
+                k = f"dense_E.{i}"
+                if k not in d:
+                    continue
+                E = d[k].astype(np.float32)
+                if E.shape[0] != self.B:
+                    r = np.zeros((self.B, 256, self.dim), np.float32)
+                    n = min(self.B, E.shape[0])
+                    r[:n] = E[:n]
+                    E = r
+                with torch.no_grad():
+                    self.dense_E[i].copy_(torch.from_numpy(E).to(self.device))
         off = 0
         for name, shape in self.shapes:
             if name in d:

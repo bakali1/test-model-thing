@@ -13,13 +13,18 @@ Usage:  .venv/bin/python tests/check_parity.py [--steps 150] [--B 32]
 Exit code 0 = PASS.
 """
 import argparse
+import os
+import struct
 import sys
 import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, ".")          # repo root
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)         # repo root
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/, for
+#                                                             # _engine_pre_t
 import numpy_port
 import gpu_port
 
@@ -188,6 +193,166 @@ def membership_cadence_test(dim, layers, B, seed, n_hot):
     return np_hot, gp_hot, gp_hot_after
 
 
+# ---------------------------------------------------------------------------
+# GATE 1 of PLAN-2026-10-11 P1: the T axis must not move a single bit at T=1.
+#
+# check_parity.py's job is numpy ≡ torch, and numpy is pinned at T=1 only
+# (~1e-7, fp32 matmul reassociation). The T-axis gate needs a STRONGER claim
+# than that: a `(B,)` call, a `(B,1)` call and the engine that existed BEFORE
+# step_batch grew a t-loop must agree BIT-EXACTLY over a live multi-step run --
+# theta, m, v, ring_b, ring_w, the per-layer states and decaytraces, the tail
+# accumulators, and the per-step loss/ce. `==` tolerances cannot express that,
+# so every tensor is compared as raw int32 bit patterns (which also catches a
+# sign-of-zero flip) and every scalar through its IEEE-754 bits.
+#
+# The pre-T-axis engine is a frozen whole-file copy at
+# tests/_engine_pre_t.py -- see its header for why a copy and not a cleverer
+# reference. Same seed => same init, so the twins are built, not bridged.
+# ---------------------------------------------------------------------------
+def _twin(dim, layers, B, seed, n_hot, mod, ce_only=False, device=None):
+    """Same-seed engine twin in `mod`, hot dims forced so the tail engages."""
+    kw = {} if mod is not gpu_port else {"ce_only": ce_only}
+    if device is not None:
+        kw["device"] = device
+    m = mod.GpuModel(dim=dim, layers=layers, lr=5e-4, seed=seed, **kw)
+    with torch.no_grad():
+        for l in m.layers:
+            for j in range(n_hot):
+                l.decay[j] = 4.0          # pre-sigmoid +4 => sigma ~0.982
+    m.new_states(B)
+    return m
+
+
+def _bitsnap(m):
+    """Every piece of live state the T axis can perturb, as raw bit patterns.
+
+    Compared as int32 views rather than with `==` so that a sign-of-zero flip
+    (the one thing `0.0 + x` can change, and the one thing AdamW provably
+    cannot observe) would still fail the gate instead of hiding in it.
+    """
+    out = {"theta": m.theta, "m": m.m, "v": m.v, "grads": m.grads,
+           "ring_b": m.ring_b}
+    for i, l in enumerate(m.layers):
+        out[f"states.{i}"] = l.states
+        out[f"decaytrace.{i}"] = l.decaytrace
+        out[f"ring_w.{i}"] = l.ring_w
+        if m.tail is not None and i in m.tail.E:
+            out[f"tail_E.{i}"] = m.tail.E[i]
+    return {k: v.detach().contiguous().view(torch.int32).clone()
+            for k, v in out.items()}
+
+
+def _fbits(x):
+    return struct.pack("<d", float(x))
+
+
+def t_axis_bitidentity_test(dim, layers, B, seed, n_hot, steps):
+    """(B,) ≡ (B,1) ≡ the pre-T-axis engine, bit for bit, over a live run.
+
+    Five twins on one byte stream:
+      pre  -- tests/_engine_pre_t.py, called the historical 1-D way
+      1d   -- the current engine, called 1-D        (the historical path)
+      w1   -- the current engine, called (B,1)      (the same thing, windowed)
+      ce1d -- current engine, ce_only=True, 1-D
+      cew1 -- current engine, ce_only=True, (B,1)
+    and the TMT_TAIL=0 (ring-only) path is run too, because the tail's
+    per-byte begin_step / credit / add_byte are exactly the operations a T loop
+    can silently under-fire.
+
+    Returns (n_compared, worst_diff_name, worst_ndiff, ok).
+    """
+    import _engine_pre_t
+    cs, ns, ends = byte_streams(steps + 2, B, seed=seed + 5)
+    # The engines in this test are pinned to CPU, and so are the inputs.
+    #
+    # The claim here is BIT identity ("T=1 must be bit-identical to today's
+    # engine"), and bit identity is a CPU claim: on CUDA the ring credit is
+    # accumulated with atomic adds, so two twins stepping the same bytes can
+    # differ in the last bits by reduction ORDER alone, with no bug involved.
+    # Making this test run on a GPU would therefore either fail for a reason
+    # that is not a defect, or -- worse -- be "fixed" by loosening the bar
+    # until it stops testing anything.
+    #
+    # The CUDA version of the same underlying question is tolerance-based and
+    # lives in tests/check_trace_bptt.py --device cuda, which compares the
+    # windowed gradient against an exact CPU reference.
+    dev = "cpu"
+    worst = ["", 0]                      # [what, how many elements differ]
+    n_cmp = [0]
+
+    def note(what, ndiff):
+        n_cmp[0] += 1
+        if ndiff > worst[1]:
+            worst[0], worst[1] = what, ndiff
+
+    for tag, tail_env in (("tail on", "1"), ("TMT_TAIL=0", "0")):
+        # tail_enabled is read from the environment at CONSTRUCTION, so the
+        # ring-only arm is reached by setting it for the duration of the arm and
+        # restoring it after -- not by mutating a live model.
+        prev = os.environ.get("TMT_TAIL")
+        os.environ["TMT_TAIL"] = tail_env
+        try:
+            pre = _twin(dim, layers, B, seed, n_hot, _engine_pre_t, device=dev)
+            m1d = _twin(dim, layers, B, seed, n_hot, gpu_port, device=dev)
+            mw1 = _twin(dim, layers, B, seed, n_hot, gpu_port, device=dev)
+            c1d = _twin(dim, layers, B, seed, n_hot, gpu_port, ce_only=True,
+                        device=dev)
+            cw1 = _twin(dim, layers, B, seed, n_hot, gpu_port, ce_only=True,
+                        device=dev)
+            # (name, windowed model, its 1-D reference). Each model is
+            # stepped exactly ONCE per byte and may serve as the reference for
+            # more than one pair -- stepping it per pair would advance it twice
+            # and compare two different runs.
+            pairs = [("1d-vs-pre", m1d, pre),
+                     ("(B,1)-vs-1d", mw1, m1d),
+                     ("ce_only (B,1)-vs-1d", cw1, c1d)]
+            for t in range(1, steps + 1):
+                c = torch.from_numpy(cs[t]).to(dev)
+                n = torch.from_numpy(ns[t]).to(dev)
+                e = torch.from_numpy(ends[t]).to(dev)
+                cw, nw, ew = c.unsqueeze(1), n.unsqueeze(1), e.unsqueeze(1)
+                # one call per model: 1-D for the pre engine and every 1-D twin,
+                # (B,1) for every windowed twin
+                for m, args in ((pre, (c, n, e)), (m1d, (c, n, e)),
+                                (mw1, (cw, nw, ew)), (c1d, (c, n, e)),
+                                (cw1, (cw, nw, ew))):
+                    m.step_batch(*args)
+                for name, win, ref in pairs:
+                    if _fbits(win.last_loss_tensor) != _fbits(
+                            ref.last_loss_tensor):
+                        note(name + " loss", 1)
+                    if _fbits(win.last_ce) != _fbits(ref.last_ce):
+                        note(name + " last_ce", 1)
+                    if _fbits(win.last_ce_sum) != _fbits(ref.last_ce_sum):
+                        note(name + " last_ce_sum", 1)
+                    for i, (x, y) in enumerate(zip(win.last_aux_masked,
+                                                   ref.last_aux_masked)):
+                        if _fbits(x) != _fbits(y):
+                            note(name + f" last_aux_masked[{i}]", 1)
+                    for i, (x, y) in enumerate(zip(win.last_aux_raw,
+                                                   ref.last_aux_raw)):
+                        if _fbits(x) != _fbits(y):
+                            note(name + f" last_aux_raw[{i}]", 1)
+            # ---- final live state, bit for bit -------------------------------
+            for name, win, ref in pairs:
+                if (win.t, win.bytes_seen) != (ref.t, ref.bytes_seen):
+                    note(name + " counters t/bytes_seen", 1)
+                sa, sb = _bitsnap(win), _bitsnap(ref)
+                for k in sa:
+                    if k not in sb:
+                        continue
+                    note(f"{name} {k}", int((sa[k] != sb[k]).sum()))
+            print(f"  [T=1 bit-identity, {tag}] {steps} steps x {len(pairs)} "
+                  f"pairs: worst differing element {worst[1]} "
+                  f"({worst[0] or 'none'})", flush=True)
+        finally:
+            if prev is None:
+                os.environ.pop("TMT_TAIL", None)
+            else:
+                os.environ["TMT_TAIL"] = prev
+    return n_cmp[0], worst[0], worst[1], worst[1] == 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=150)
@@ -284,6 +449,13 @@ def main():
     ok &= e_exact and first_rel > 0 and abs_rel < 0.5 and loss_ratio < 2.0
     # #8: gpu lags inside the cadence window, then matches on rebase
     ok &= (gp_hot == np_hot - 1) and (gp_after == np_hot)
+    # ---- GATE 1 (PLAN-2026-10-11 P1): T=1 must be bit-identical ----------
+    n_cmp, wname, wdiff, t_ok = t_axis_bitidentity_test(
+        args.dim, args.layers, args.B, 11, args.n_hot, 60)
+    print(f"  T=1 bit-identity: {n_cmp} comparisons, worst differing element "
+          f"{wdiff} ({wname or 'none'}) -> "
+          f"{'PASS' if t_ok else 'FAIL'}")
+    ok &= t_ok
     print("\nPARITY:", "PASS" if ok else "FAIL", flush=True)
     return 0 if ok else 1
 

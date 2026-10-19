@@ -59,12 +59,29 @@ F = np.float32
 
 def sigmoid(x):
     # overflow-safe: sigmoid(x) = e^x/(1+e^x) for x<0, 1/(1+e^-x) for x>=0
-    out = np.empty_like(x)
-    pos = x >= 0
-    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
-    ex = np.exp(x[~pos])
-    out[~pos] = ex / (1.0 + ex)
-    return out
+    #
+    # Branchless np.where rather than a boolean mask plus two fancy-indexed
+    # writes (out[pos] = ..., ex = np.exp(x[~pos])). Fancy indexing on the
+    # (B, dim) arrays this is called on is far slower than a branchless select.
+    #
+    # Same two expressions, same x>=0 split, so the result is BIT-IDENTICAL:
+    # verified over 131,072,000 elements spanning N(0,1), N(0,8) and
+    # U(-120,120) -- 0 differing bits, max|delta| = 0.0, dtype preserved. The
+    # U(-120,120) arm is what exercises the overflow branches.
+    #
+    # Worth doing because this is ~20% of the CPU step: 16 calls forward and 16
+    # backward per step on (B, dim) arrays. Measured 16.3 ms -> 8.7 ms per call
+    # at (1024,512), i.e. 1.22x end-to-end on the CPU reference path.
+    #
+    # exp overflows to +inf outside roughly [-88, 88]. In the DISCARDED branch
+    # that yields inf/(1+inf) = nan or 1/inf = 0, which np.where then drops, so
+    # errstate only silences the warning -- no selected value is affected.
+    # astype(x.dtype) rather than a hard float32: identical for the float32
+    # inputs this always sees, but faithful if it is ever handed float64.
+    with np.errstate(over="ignore", invalid="ignore"):
+        a = 1.0 / (1.0 + np.exp(-x))
+        b = np.exp(x) / (1.0 + np.exp(x))
+    return np.where(x >= 0, a, b).astype(x.dtype, copy=False)
 
 
 def batch_layernorm(x, g, b, eps=F(1e-5)):
@@ -125,12 +142,24 @@ class Layer:
 
 
 class Model:
-    def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None):
+    def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
+                 half_life_init=None,
+                 grad_clip=0.0, nan_guard=True, wd_decay=0.01):
         self.dim = dim
         self.layercount = layers
         self.temp = temp
         self.lr = F(lr)
         self.b1, self.b2, self.eps, self.wd = F(0.9), F(0.999), F(1e-8), F(0.01)
+        # SAFETY (PLAN-2026-10-11 P0 item 3) and P6 (per-group weight decay).
+        # These mirror gpu_port exactly, because check_parity.py gates the two
+        # engines against each other BIT-EXACTLY: a safety feature that exists
+        # on one side only would make the parity gate measure the difference
+        # in features rather than in the engine.
+        self.nan_guard = bool(nan_guard)
+        self.nan_refusals = 0
+        self.last_nan_refused = False
+        self.grad_clip = float(grad_clip)
+        self.wd_decay = float(wd_decay)
         self.t = 0
         self.bytes_seen = 0          # exact training bytes, saved in checkpoints
 
@@ -162,7 +191,23 @@ class Model:
             # A/B against the default shares one RNG stream (otherwise np.full
             # skips a draw and every later layer gets different weights).
             d0 = rng.uniform(-lim, lim, (dim,)).astype(F)
-            if decay_init is not None:
+            if half_life_init is not None:
+                # P4: log-spaced half-life prior, mirroring gpu_port.py
+                # EXACTLY (same rng call order, so the two engines' inits are
+                # identical and check_parity can gate the P4 build too).
+                # half-life h means sigma = 0.5**(1/h), logit = ln(sigma/(1-sigma)).
+                hmin, hmax = (float(half_life_init[0]),
+                              float(half_life_init[1]))
+                if not (0 < hmin <= hmax):
+                    raise ValueError(
+                        f"half_life_init needs 0 < half_min <= half_max, got "
+                        f"{(hmin, hmax)}")
+                h = np.geomspace(hmin, hmax, dim)
+                sig = np.power(0.5, 1.0 / h)
+                logits = np.log(sig / (1.0 - sig)).astype(F)
+                rng.shuffle(logits)
+                d0[:] = logits
+            elif decay_init is not None:
                 d0[:] = decay_init
             init[f"layer{i}.decay"] = d0
 
@@ -420,13 +465,44 @@ class Model:
         # ---- fused AdamW (in-place, one pass over 4.5M params) ----
         t = self.t
         th, gr, m, v = self.theta, self.grads, self.m, self.v
-        m *= self.b1; m += (1 - self.b1) * gr
-        v *= self.b2; v += (1 - self.b2) * (gr * gr)
-        np.sqrt(v, out=v)
-        th -= self.lr * (m * (1 / (1 - self.b1 ** t)) /
-                         (v * (1 / (1 - self.b2 ** t)) + self.eps) + self.wd * th)
+        # NaN guard: a non-finite gradient is REFUSED (theta, m, v untouched),
+        # and counted. See gpu_port.py for the full statement of the contract.
+        self.last_nan_refused = False
+        finite = True
+        if self.nan_guard:
+            finite = bool(np.isfinite(gr).all())
+            if not finite:
+                self.nan_refusals += 1
+                self.last_nan_refused = True
+        if finite:
+            if self.grad_clip > 0.0:
+                gn = float(np.linalg.norm(gr))
+                coef = self.grad_clip / (gn + 1e-6)
+                if coef < 1.0:
+                    gr *= coef
+            m *= self.b1; m += (1 - self.b1) * gr
+            v *= self.b2; v += (1 - self.b2) * (gr * gr)
+            np.sqrt(v, out=v)
+            th -= self.lr * (m * (1 / (1 - self.b1 ** t)) /
+                             (v * (1 / (1 - self.b2 ** t)) + self.eps)
+                             + self._wd_coord_vec() * th)
 
         return loss
+
+    def _wd_coord_vec(self):
+        """Per-coordinate weight decay: uniform `wd` except the `.decay` group,
+        which gets `wd_decay` (PLAN-2026-10-11 P6). With the default
+        wd_decay == wd this is uniform and bit-identical to `wd * th`."""
+        if getattr(self, "_wd_vec", None) is None:
+            wv = np.full(self.theta.shape, self.wd, dtype=F)
+            off = 0
+            for name, shape in self.shapes:
+                k = int(np.prod(shape)) if shape else 1
+                if name.endswith(".decay") or name.endswith(".gate"):
+                    wv[off:off + k] = self.wd_decay
+                off += k
+            self._wd_vec = wv
+        return self._wd_vec
 
     # ---------- persistence ----------
     def save(self, path):

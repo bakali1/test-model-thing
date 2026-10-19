@@ -124,8 +124,48 @@ def trace_pass(B, T, dim, layers, cs, ns, es, decay_init=None):
     return m, off, losses, grads
 
 
-def exact_tbptt(B, T, dim, layers, cs, ns, es, seed=0, decay_init=None):
-    """Same forward, but the state recurrence stays in the autograd graph."""
+def window_pass(B, T, dim, layers, cs, ns, es, warm=0, decay_init=None):
+    """ONE step_batch call carrying a (B,T) window; return its gradient.
+
+    This is the P1 shape: T consecutive bytes per stream, one AdamW update. The
+    parameters are frozen (lr=0) for the same reason as trace_pass, and the
+    `warm` bytes before the window are fed the historical 1-D way so that the
+    carried state is not itself a windowed artefact.
+    """
+    m = GpuModel(dim=dim, layers=layers, device="cpu", ring_credit="full",
+                 seed=0, decay_init=decay_init)
+    m.new_states(B)
+    m.lr = 0.0
+    off = offsets(m)
+    for t in range(warm):
+        m.step_batch(cs[t], ns[t], es[t])
+    cw = torch.from_numpy(np.ascontiguousarray(cs[warm:warm + T].T))
+    nw = torch.from_numpy(np.ascontiguousarray(ns[warm:warm + T].T))
+    ew = torch.from_numpy(np.ascontiguousarray(es[warm:warm + T].T))
+    losses = [float(m.step_batch(cw, nw, ew))]
+    return m, off, losses, m.grads.detach().clone()
+
+
+def exact_tbptt(B, T, dim, layers, cs, ns, es, seed=0, decay_init=None,
+                warm=0, cut=True):
+    """Same forward, but the state recurrence stays in the autograd graph.
+
+    `warm` bytes are run first purely to build the carried state; the returned
+    gradient is of the T window losses ONLY, starting from that state. warm=0 is
+    the historical call and starts from zeros.
+
+    `cut` says how much history the reference keeps:
+      cut=True  -- the warm-up runs under no_grad, so the carried state is a
+                   CONSTANT and theta gets no credit for it. That is the
+                   truncated-window objective: the graph is cut at the window
+                   edge.
+      cut=False -- the warm-up stays in the graph, so the window's losses do
+                   reach theta through the pre-window bytes. This is the exact
+                   counterpart of what the ENGINE does (its ring and decaytrace
+                   carry that credit), and it is therefore the reference the
+                   windowed gradient must match. The two differ by exactly the
+                   window-boundary term this gate reports.
+    """
     m = GpuModel(dim=dim, layers=layers, device="cpu", ring_credit="full",
                  seed=0, decay_init=decay_init)
     m.new_states(B)
@@ -145,7 +185,32 @@ def exact_tbptt(B, T, dim, layers, cs, ns, es, seed=0, decay_init=None):
               for _ in range(layers)]
     total = 0.0
     per_step = []
-    for t in range(T):
+    # ---- optional warm-up: build the carried state ------------------------
+    # Under no_grad when cut=True (the state becomes a constant and theta gets
+    # no credit for it); inside the graph when cut=False (theta keeps the
+    # cross-window credit the engine's ring/decaytrace also keeps).
+    for t in range(warm):
+        c = cs[t]
+        n = ns[t]
+        enc = views["embed"][c]                          # (B, dim)
+        x = enc
+        new_states = []
+        for i in range(layers):
+            W = views[f"layer{i}.W"]
+            g = views[f"layer{i}.g"]
+            b = views[f"layer{i}.b"]
+            decay = _sig(views[f"layer{i}.decay"])
+            state = states[i] * decay + enc
+            h, _cache = _layer_norm(state, g, b)
+            z = h @ W.t()
+            y = z * torch.sigmoid(z)
+            x = x + y
+            new_states.append(state)
+        states = new_states
+        if cut:
+            states = [s.detach() for s in states]
+    # ---- the window itself, inside the graph -------------------------------
+    for t in range(warm, warm + T):
         c = cs[t]
         n = ns[t]
         enc = views["embed"][c]                          # (B, dim)
@@ -193,6 +258,10 @@ def main():
     ap.add_argument("--dim", type=int, default=32)
     ap.add_argument("--B", type=int, default=8)
     ap.add_argument("--corpus", default=None)
+    ap.add_argument("--warm", type=int, default=8,
+                    help="bytes fed before the T window so the carried state "
+                         "is non-zero; the window-boundary term is measured "
+                         "against this state. 0 = no history.")
     ap.add_argument("--decay-init", type=float, default=None,
                     help="pre-sigmoid decay init. 3 => sigma=0.95, a ~14-byte "
                          "half-life — the LONG-memory regime the memory "
@@ -296,9 +365,154 @@ def main():
     print("     non-scale-invariant optimizer: under SGD the decay rows would get")
     print("     an effective learning rate B x larger than every other parameter.")
     ok &= exact_ok and all(np.isfinite(r[1]) and np.isfinite(r[2]) for r in rows)
+
+    # ---- GATE 2 (PLAN-2026-10-11 P1): T>1 windowed vs exact BPTT --------
+    ok &= t_axis_section(args, cs, ns, es)
     print("\n== verdict:", "PASS (measurement valid; see the docstring — this is "
           "a tracer, not a bar)" if ok else "FAIL", "==")
     return 0 if ok else 1
+
+
+def t_axis_section(args, cs, ns, es):
+    """GATE 2 of PLAN-2026-10-11 P1: the windowed gradient vs exact BPTT.
+
+    One `step_batch` call on a (B,T) window, against exact autograd BPTT of the
+    SAME T window losses. Three numbers are reported per parameter group,
+    because they fail for different reasons and only one of them is a bug:
+
+      within, fresh     -- engine vs exact BPTT, both from a zero state. The
+                           ring is empty, so every byte credited is inside the
+                           window. MUST be fp32-tight for T <= ring_k.
+      within, carried   -- engine vs exact BPTT with the warm-up kept IN the
+                           graph (cut=False), so the reference carries the same
+                           cross-window credit the engine's ring and decaytrace
+                           carry. MUST also be fp32-tight for T <= ring_k; this
+                           is the operating condition a real run is in.
+      boundary/history  -- exact(carried, graph kept) minus exact(carried, graph
+                           cut): the share of the window's gradient that enters
+                           theta through state from BEFORE the window. It is
+                           NOT an error -- it cancels out of the "within,
+                           carried" comparison by construction -- it is the
+                           size of the cross-window credit the engine retains,
+                           which is what a longer T would recover and exactly
+                           what P2's dense trace has to preserve.
+
+    Degradation is expected in exactly one place and it is the pre-existing T=1
+    truncation, not a T-axis regression: past ring_k lags the ring drops embed
+    credit, so `within` grows once the window (or the history behind it) is
+    longer than K. Both regimes are reported.
+
+    The engine's gradient is a SUM over B while the reference loss is a mean
+    over B, so the engine side is divided by B before comparing -- the same
+    equal-footing correction section 2 uses.
+    """
+    B, dim, layers = args.B, args.dim, args.layers
+    warm = getattr(args, "warm", 8)
+    Ts = [t for t in (1, 4, 8, 16) if warm + t <= args.steps]
+    m0, off, _l, _g = trace_pass(B, 2, dim, layers, cs, ns, es,
+                                 args.decay_init)
+    K = m0.ring_k
+    # a second warm-up long enough that the history BEHIND the window exceeds
+    # ring_k, so the pre-existing lag truncation is visible as its own number
+    T_long = 2
+    warm_long = args.steps - T_long - 2
+    print(f"\n== GATE 2 (P1): windowed (B,T) gradient vs exact truncated BPTT ==")
+    print(f"  B={B} dim={dim} layers={layers} | ring_k={K} (lags past K are "
+          f"dropped by the ring -- the T=1 truncation, not a T-axis change)")
+    names = [n for n, _ in m0.shapes]
+    worst_within = 0.0
+    worst_within_name = ""
+    ok = True
+
+    def one(T, w, label, gate=True):
+        nonlocal ok, worst_within, worst_within_name
+        # the engine, twice: once with no history (empty ring) and once with the
+        # carried state a real run would have
+        _m0, _off, wl0, g_win0 = window_pass(B, T, dim, layers, cs, ns, es,
+                                             warm=0, decay_init=args.decay_init)
+        _mw, _off, wl, g_win = window_pass(B, T, dim, layers, cs, ns, es,
+                                           warm=w, decay_init=args.decay_init)
+        _mz, _off2, plz, g_z, _v = exact_tbptt(B, T, dim, layers, cs, ns, es,
+                                               decay_init=args.decay_init)
+        _mg, _off3, plg, g_g, _v2 = exact_tbptt(B, T, dim, layers, cs, ns, es,
+                                                decay_init=args.decay_init,
+                                                warm=w, cut=False)
+        _mc, _off4, plc, g_c, _v3 = exact_tbptt(B, T, dim, layers, cs, ns, es,
+                                                decay_init=args.decay_init,
+                                                warm=w, cut=True)
+        # forward agreement FIRST: the windowed loss must be the sum of the T
+        # per-byte losses the reference computes, or nothing below means anything
+        dl = abs(wl[0] - sum(plg))
+        scale = max(1e-9, abs(sum(plg)))
+        if dl / scale >= 1e-5:
+            print(f"  [FAIL] {label}: windowed loss {wl[0]:.6f} != exact "
+                  f"{sum(plg):.6f} (rel {dl/scale:.2e}); the reference is not "
+                  f"faithful to the windowed forward")
+            ok = False
+            return
+        rows = []
+        for name in names:
+            s, n = off[name]
+            a0 = g_win0[s:s + n].numpy().astype(np.float64) / B   # equal footing
+            aw = g_win[s:s + n].numpy().astype(np.float64) / B
+            z = g_z[s:s + n].numpy().astype(np.float64)
+            gg = g_g[s:s + n].numpy().astype(np.float64)
+            cc = g_c[s:s + n].numpy().astype(np.float64)
+            rms = float(np.sqrt((gg ** 2).mean())) + 1e-30
+            rows.append((name,
+                         float(np.abs(a0 - z).max()) / rms,    # within, fresh
+                         float(np.abs(aw - gg).max()) / rms,   # within, carried
+                         float(np.abs(gg - cc).max()) / rms,   # boundary
+                         rms))
+        wf = max(r[1] for r in rows)
+        wc = max(r[2] for r in rows)
+        wb = max(r[3] for r in rows)
+        nf = max(rows, key=lambda r: r[1])[0]
+        nc = max(rows, key=lambda r: r[2])[0]
+        if gate:
+            if wc > worst_within:
+                worst_within, worst_within_name = wc, f"{label} {nc}"
+            if wf > worst_fresh[0]:
+                worst_fresh[0], worst_fresh[1] = wf, f"{label} {nf}"
+            if T <= K and (wc >= 5e-3 or wf >= 5e-3):
+                ok = False
+        print(f"  {label:<20} within(fresh) {wf:8.2e} [{nf}]   "
+              f"within(carried) {wc:8.2e} [{nc}]   "
+              f"boundary/history {wb:7.2e}   fwd {dl/scale:.1e}")
+        if label in (f"T={Ts[0]} warm={warm}", f"T={max(Ts)} warm={warm}"):
+            for name, wf_, wc_, wb_, rms in rows:
+                if name.startswith("layer0.") or name in ("embed", "Wd"):
+                    print(f"      {name:<14} within(fresh) {wf_:8.2e}   "
+                          f"within(carried) {wc_:8.2e}   boundary {wb_:7.2e}"
+                          f"   exactRMS {rms:.2e}")
+
+    worst_fresh = [0.0, ""]
+    for T in Ts:
+        one(T, warm, f"T={T} warm={warm}")
+    if warm_long > K:
+        one(T_long, warm_long, f"T={T_long} warm={warm_long}*", gate=False)
+        print(f"      * warm={warm_long} > ring_k={K}: the history behind the "
+              f"window outruns the ring, so within(carried) grows. That is the "
+              f"pre-existing lag truncation, and it is the same loss the T=1 "
+              f"engine takes every step.")
+    print(f"  worst within(carried), T<=ring_k: {worst_within:.3e} at "
+          f"{worst_within_name}")
+    print(f"  worst within(fresh),   T<=ring_k: {worst_fresh[0]:.3e} at "
+          f"{worst_fresh[1]}")
+    print(f"  [{'PASS' if ok else 'FAIL'}] a window of T<=ring_k bytes "
+          f"reproduces exact BPTT of its own losses to the same bar as the T=1 "
+          f"engine (5e-3), with AND without carried state")
+    print("  -> within(carried) is the load-bearing number: it is a real run's")
+    print("     condition, and it is exact because the residual stream does not")
+    print("     cross timesteps -- the only cross-time path is the recurrent")
+    print("     state, which the ring and the decaytrace carry exactly for every")
+    print("     lag < ring_k. The boundary column is HISTORY, not error: it is")
+    print("     the share of the window's exact gradient that enters theta")
+    print("     through state from BEFORE the window, it cancels out of the")
+    print("     within(carried) comparison by construction, and it is what a")
+    print("     longer T would recover -- i.e. exactly what P2's dense trace has")
+    print("     to preserve when the ring is deleted.")
+    return ok
 
 
 if __name__ == "__main__":
