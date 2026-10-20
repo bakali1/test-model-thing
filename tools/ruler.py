@@ -160,6 +160,23 @@ def main():
         _print_meta(v)
     _hr()
 
+    # 3b. THE FSP BAG CELL (only if the checkpoint has an FSP head)
+    if "fsp.W" in getattr(m, "views", {}):
+        print("\n3b. FSP BAG  (did the auxiliary learn the PRIOR or the "
+              "CONTEXT?)")
+        print("   the target is the bag of the next 64 bytes; the head is the "
+              "model's own")
+        print("   baselines: the global byte-frequency prior and a local "
+              "4-gram prior, on the")
+        print("   same positions, as SET F1 (the head at its 0.5 threshold "
+              "and at top-k)")
+        v = E.fsp_bag_accuracy(model=m, raw_path=RAW, tau=64, r=16,
+                               sample_count=512)
+        if v and v.get("value") is not None:
+            _print_meta(v)
+    else:
+        print("\n3b. FSP BAG  (skipped: this checkpoint has no FSP head)")
+
     # 4. LANGUAGE CE
     print("\n4. LANGUAGE CE  (long_range_language, L=512)")
     print("   protocol: [marker][filler 509 B][controlled][terminator] -> "

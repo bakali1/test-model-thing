@@ -652,6 +652,138 @@ def model_associative_retrieval_accuracy(m, d=128, seed=0, sample_count=1024,
 # ---------------------------------------------------------------------------
 # LANGUAGE CE (task D)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# the FSP bag cell: did the auxiliary learn the PRIOR, or the context?
+# ---------------------------------------------------------------------------
+def _bag_f1(pred, true):
+    """Instance-level F1 of a predicted byte-set against the true byte-set.
+
+    pred/true: (N, 256) binary. The bag of the next tau bytes holds ~22
+    distinct symbols, so a predictor that emits the globally common bytes
+    already scores ~0.75 -- which is exactly why the head has to be compared
+    against a prior, not against zero.
+    """
+    tp = float((pred * true).sum())
+    p = float(pred.sum())
+    r = float(true.sum())
+    prec = tp / p if p > 0 else 0.0
+    rec = tp / r if r > 0 else 0.0
+    if prec + rec <= 0:
+        return 0.0
+    return 2.0 * prec * rec / (prec + rec)
+
+
+def model_fsp_bag(m, raw_path, tau=64, r=16, seed=0, sample_count=1024,
+                  L=512, verbose=True):
+    """Score the model's OWN FSP head against the future byte-bag, and
+    against two static baselines.
+
+    THE QUESTION (the D7 test). The byte-level FSP target is mostly a static
+    letter-frequency prior: a bag of 64 bytes is ~22 distinct symbols and
+    those symbols are largely the common ones, so a head that ignores the
+    state entirely and learns the unigram distribution already scores well.
+    Measured on our corpus: the global prior explains F1 0.7505, a
+    current-byte-conditioned prior 0.7541, a local 4-gram 0.7690. So the
+    question this cell answers is NOT "is the FSP loss low" but "does the
+    head beat the priors" -- and if it does not, the auxiliary loss was
+    satisfied by the prior and the arm's null result says nothing about the
+    hypothesis.
+
+    Returns None when the checkpoint has no FSP head (a non-FSP arm).
+    """
+    if "fsp.W" not in m.views:
+        return None
+    from numpy_port import batch_layernorm
+    data = np.frombuffer(open(raw_path, "rb").read(), np.uint8)
+    rng = np.random.default_rng(seed)
+    n_seq = int(sample_count)
+    need = L
+    total_avail = (len(data) - need) // L
+    if total_avail < n_seq:
+        n_seq = max(1, total_avail)
+    starts = rng.choice(total_avail, size=n_seq, replace=False) * L
+    X = np.stack([data[s:s + L] for s in starts]).astype(np.int64)
+    positions = [t for t in range(0, L - 1 - tau, r)]
+
+    # the true bags
+    bags = np.zeros((n_seq, len(positions), 256), np.float32)
+    for j, t in enumerate(positions):
+        for kk in range(tau):
+            col = X[:, t + 1 + kk]               # (n_seq,)
+            bags[np.arange(n_seq), j, col] = 1.0
+
+    # the head's prediction, from the state it was trained to read
+    res = _frozen_forward(m, X, snap_positions=set(positions))
+    dim = m.Wd.shape[1]
+    last = m.layers[-1]
+    head = []
+    for j, t in enumerate(positions):
+        st = res["states"][t][:, -dim:]            # the LAST layer's state
+        h, _c = batch_layernorm(st, m.views["fsp.g"], m.views["fsp.b0"])
+        z = h @ m.views["fsp.W"] + m.views["fsp.b"]
+        head.append(1.0 / (1.0 + np.exp(-z)))
+    head = np.stack(head)                          # (n_seq, n_pos, 256)
+    flat_true = bags.reshape(-1, 256)
+    flat_head = head.reshape(-1, 256)
+
+    # baselines on the SAME positions
+    k = int(round(flat_true.sum(axis=1).mean()))
+    freq = np.bincount(data, minlength=256).astype(np.float64)
+    top_global = np.argsort(-freq)[:k]
+    pred_global = np.zeros_like(flat_true)
+    pred_global[:, top_global] = 1.0
+
+    # a local 4-gram prior: which bytes follow THIS 4-gram in the corpus
+    d = data.astype(np.int64)
+    key = ((d[:-4] << 24) | (d[1:-3] << 16) | (d[2:-2] << 8) | d[3:-1])
+    follow = d[4:]
+    order = np.argsort(key, kind="stable")
+    ks, ss = key[order], follow[order]
+    uniq = np.unique(ks)
+    starts_ = np.searchsorted(ks, uniq, side="left")
+    bounds = np.searchsorted(ks, uniq, side="right")
+    tab = {}
+    for u, a, b in zip(uniq, starts_, bounds):
+        vals, counts = np.unique(ss[a:b], return_counts=True)
+        tab[int(u)] = (vals, counts)
+    pred_4gram = np.zeros_like(flat_true)
+    for j, t in enumerate(positions):
+        if t < 4:
+            continue
+        for i in range(n_seq):
+            kk = int((X[i, t - 4] << 24) | (X[i, t - 3] << 16)
+                     | (X[i, t - 2] << 8) | X[i, t - 1])
+            e = tab.get(kk)
+            if e is None:
+                continue
+            vals, counts = e
+            order2 = np.argsort(-counts)[:k]
+            pred_4gram[i * len(positions) + j, vals[order2]] = 1.0
+
+    topk = np.argsort(-flat_head, axis=1)[:, :k]          # (N, k)
+    pred_head_topk = np.zeros_like(flat_head)
+    np.put_along_axis(pred_head_topk, topk, 1.0, axis=1)
+
+    out = {
+        "f1_head_threshold": _bag_f1((flat_head >= 0.5).astype(np.float32),
+                                     flat_true),
+        "f1_head_topk": _bag_f1(pred_head_topk, flat_true),
+        "f1_global_prior": _bag_f1(pred_global, flat_true),
+        "f1_local_4gram": _bag_f1(pred_4gram, flat_true),
+        "n_positions": int(flat_true.shape[0]),
+        "bag_size": k,
+        "tau": int(tau),
+        "r": int(r),
+    }
+    if verbose:
+        print(f"  [fsp_bag] head(threshold) F1={out['f1_head_threshold']:.4f}  "
+              f"head(top-{k}) F1={out['f1_head_topk']:.4f}  "
+              f"global prior F1={out['f1_global_prior']:.4f}  "
+              f"local 4-gram F1={out['f1_local_4gram']:.4f}  "
+              f"({out['n_positions']:,} positions)")
+    return out
+
+
 def model_language_ce(m, L=512, seed=0, sample_count=1024, verbose=True):
     """Next-byte cross-entropy on long_range_language(L) sequences:
     [marker][filler...][controlled][terminator], scored over all L-1

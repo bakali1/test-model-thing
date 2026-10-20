@@ -37,7 +37,16 @@
 #     dense -- so 50 would weight the positive class ~6x over the paper's own
 #     balance and push the head toward "these 22 common bytes are certainly
 #     coming". Solving for the same positive-mass fraction gives 8.4. Use 8.
-#   * r=16, tau=64, alpha=0.1: the paper's values, unchanged.
+#   * r=16, tau=64: the paper's values, unchanged.
+#   * alpha 0.1 -> 1.0. At the paper's alpha the auxiliary is a ~1%
+#     perturbation of the parameters on this corpus: the measured alpha ladder
+#     (dim 64, 4 layers, B=32, 200 steps on real bytes, max|delta embed| vs
+#     the alpha=0 arm) is 3.7e-05 at alpha=0.1, 1.8e-04 at 0.5, 7.3e-04 at
+#     2.0, 3.5e-03 at 10.0 -- linear in alpha, and small enough at 0.1 that
+#     the arm would be a null for a reason that has nothing to do with the
+#     hypothesis. The byte-level scale of the two terms differs from the
+#     token-level one the paper tuned on, so alpha is re-set by measurement
+#     here, not copied. (Run --fsp-alpha 0.1 to reproduce the paper's number.)
 #   * The head reads the LAST layer's state (the one closest to the output)
 #     through its OWN LayerNorm parameters (fsp.g, fsp.b0). Borrowing the
 #     layer's would make the auxiliary a knob on the local read-out -- the
@@ -78,8 +87,8 @@ B="${B:-1024}"                  # the incumbent's batch size
 STEPS="${STEPS:-161333}"        # 1 epoch over the 4-file corpus (165 MB)
 R="${R:-16}"                    # FSP position every r bytes
 TAU="${TAU:-64}"                # the target is the next tau bytes
-ALPHA="${ALPHA:-0.1}"
-POSW="${POSW:-8}"               # class-balanced for a 256-byte vocabulary
+ALPHA="${ALPHA:-1.0}"
+POSW="${POSW:-8.5}"               # class-balanced for a 256-byte vocabulary
 cd "$REPO"
 mkdir -p "$OUT"
 

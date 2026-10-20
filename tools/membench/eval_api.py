@@ -38,7 +38,8 @@ import math
 
 from . import generators as G
 from . import model_backend
-from .model_backend import (model_retention_curve, model_selective_copy_accuracy,
+from .model_backend import (model_fsp_bag, model_retention_curve,
+                             model_selective_copy_accuracy,
                             model_associative_retrieval_accuracy,
                             model_language_ce, model_transfer_ce,
                             model_cross_domain_ce, load_frozen)
@@ -235,6 +236,45 @@ def associative_retrieval_accuracy(d, seed=_SEED_DEFAULT,
 # --------------------------------------------------------------------------
 # language CE (task D)
 # --------------------------------------------------------------------------
+def fsp_bag_accuracy(model=None, raw_path=None, tau=64, r=16,
+                     seed=_SEED_DEFAULT, sample_count=1024, L=512):
+    """Does the model's OWN FSP head predict the future byte-bag better than
+    a static prior can?
+
+    The D7 test. A bag of 64 bytes holds ~22 distinct symbols, and those
+    symbols are largely the common ones, so a head that ignores the state
+    entirely and learns the unigram distribution already scores well. The
+    cell therefore reports the head's F1 AGAINST two static baselines
+    measured on the same positions: the global byte-frequency prior and a
+    local 4-gram prior. A head that does not beat them has learned the
+    prior, and the auxiliary loss was satisfied without the state carrying
+    anything.
+
+    Baseline (returned without a model): None -- this cell has no chance
+    level, it is a comparison between predictors, not an absolute score.
+    """
+    if raw_path is None:
+        raise ValueError("fsp_bag_accuracy needs raw_path (the held-out "
+                         "corpus the bag is measured on)")
+    meta = _meta(
+        seed, sample_count,
+        cue_type="none: the target is the bag of the next tau bytes, not a "
+                 "cue-target pair",
+        gap_distribution=f"the FSP target window is tau={int(tau)} bytes",
+        distractor_type="none",
+        chance_level={"note": "no chance level: the cell compares the "
+                              "model's FSP head against static priors"})
+    r = _run_model(model, model_fsp_bag, raw_path=raw_path, tau=tau, r=r,
+                    seed=seed, sample_count=sample_count, L=L)
+    if r is not None:
+        return r
+    _require_model(model, "fsp_bag_accuracy")
+    return _finish(meta, metric="fsp_bag_accuracy", value=None,
+                   unit="F1 of the predicted byte-set (no chance level)",
+                   source="a model without an FSP head cannot be scored here",
+                   model=model)
+
+
 def language_ce(L=512, seed=_SEED_DEFAULT, sample_count=_COUNT_DEFAULT,
                 model=None):
     """Next-byte CE on long_range_language sequences of length L. Baseline

@@ -9,15 +9,16 @@ note as `flashlm.paper.txt`, per the convention in `docs/ideas/papers/`).
 paper, written in parallel by another pass. **This note is the project-relevance
 half**: the audit of the engine, the cost table, the experiment and the verdict.
 A runbook for the same arm already exists in parallel — `docs/runbooks/fsp.sh`; this
-note agrees with its recipe and **corrects its `pos_weight` calibration** (§2.2 D4)
-and adds the blocker it does not mention (**D1: the ruler cannot read an FSP
-checkpoint**).
-**Date of this note:** 2026-10-20.
+note agrees with its recipe and **corrects its `pos_weight` calibration** (§2.2 D4),
+**adds the α recommendation** the runbook does not make (§2.2 D6, §3.2), and audits
+the implementation the runbook launches (§2.2).
+**Date of this note:** 2026-10-20 (the working tree was moving under me during the
+audit; every finding carries its status and timestamp).
 **What I did:** read the paper (full text + figures none), read `docs/INDEX.md`,
 `docs/plans/PLAN-2026-10-11-T-AXIS.md` (§§0–7) and `RESULTS.md` (the 2026-10-12
 memory ruler, the 2026-10-13 T-axis A/B, the 2026-10-13 P4 usage arms), audited the
-engine, and ran **CPU-only** micro-experiments (20–40 steps at dim 32) to check the
-claims I make below.
+engine, and ran **CPU-only** micro-experiments (20–40 steps at dim 32; 200 steps at
+dim 64 / 4 layers for the α ladder) to check the claims I make below.
 **What I did NOT do:** modify engine code, run a GPU job, touch the network.
 
 **Ledger status (read `docs/ideas/papers/INDEX.md` first):** that ledger's rule is
@@ -243,31 +244,31 @@ gradients, per layer. That is a rewrite of `_scatter_ring_credit` / `_ring_credi
 
 **Verdict on cost: FSP is the cheapest *evidenced* idea, and it is already written.**
 
-### 2.2 The FSP path is ALREADY in the working tree — uncommitted, and it has five defects
+### 2.2 The FSP path is ALREADY in the tree — an audit of it, and what is still open
 
-`git status` shows `M gpu_port.py`, `M train_gpu.py` (232 insertions) with a complete
-FSP implementation: `--fsp-alpha`, `--fsp-r` (16), `--fsp-tau` (64),
-`--fsp-pos-weight` (50), `--fsp-layer` (-1 = last); the head is `fsp.W` (dim → 256)
-+ `fsp.b`, created in `GpuModel._build` **only when `fsp_alpha > 0`** (so the default
+The implementation landed as commit **`8024051` ("the FSP objective, and the P3 gate
+gradient's mechanism, finally known", 2026-10-20 11:48)**, in parallel with this
+note: `--fsp-alpha`, `--fsp-r` (16), `--fsp-tau` (64), `--fsp-pos-weight`,
+`--fsp-layer` (-1 = last); the head is `fsp.W` (dim -> 256), `fsp.b`, `fsp.g`,
+`fsp.b0`, created in `GpuModel._build` **only when `fsp_alpha > 0`** (so the default
 theta layout is untouched, the same rule the P3 gate uses); the loss is
 BCE-with-logits on a binary multi-hot; the head reads the **last layer's state**
-through that layer's own LayerNorm; and `Trainer._fsp_args` builds the target from
-`mats[t0+1 : t0+1+tau]` with a scatter into a (B, 256) buffer.
+through its **own** LayerNorm; `Trainer._fsp_args` builds the target from
+`mats[t0+1 : t0+1+tau]` with a scatter into a (B, 256) buffer; and
+`tests/check_fsp.py` (new) gates it. The runbook is `docs/runbooks/fsp.sh`.
 
-**I audited it (CPU only, dim 32 / layers 2, 20–40 steps). Findings:**
+**The tree moved under me while I was auditing it** (the FSP work was being written
+and committed between 11:38 and 11:48 today, and a second commit `1ac6372` landed
+the P3 gate gradient at 11:51). So each finding below carries its status *as of
+12:00 today*, and the audit is reproducible from Appendix C.
 
-**D1 — the arm is UNMEASURABLE with our own instrument. This is the blocker.**
-`tools/ruler.py` runs on `numpy_port` (`tools/membench/model_backend.load_frozen` →
-`numpy_port.Model.load`), and `numpy_port.py` has **not** been given the FSP keys
-(re-verified against the working tree at 11:45 today: `grep -n fsp numpy_port.py` →
-no hits; the numpy_port changes in the tree are for the P3 gate, not for FSP).
-The FSP head lives in `theta`, so the checkpoint's `m`/`v` are longer than a
-numpy_port model, and the length check at `numpy_port.py` (the `raise ValueError`
-inside `load`) fires. Reproduced verbatim:
+**D1 - "the arm is UNMEASURABLE" - FOUND AT 11:38, FIXED IN PARALLEL (commit `8024051`).**
+At 11:38 the ruler could not load an FSP checkpoint at all: the head lives in
+`theta`, so the checkpoint's `m` / `v` are longer than a numpy_port model, and
+`numpy_port.Model.load` refused it. Reproduced verbatim at the time:
 
 ```
 $ TMT_RULER_CKPT=/tmp/fsptest/fsp.npz .venv/bin/python tools/ruler.py
-...
   File ".../tools/membench/model_backend.py", line 65, in load_frozen
     m.load(ckpt)
   File ".../numpy_port.py", line 555, in load
@@ -276,131 +277,178 @@ ValueError: checkpoint /tmp/fsptest/fsp.npz holds 27,361 parameters but this mod
 was built with 18,913 (dim=32, layers=2); pass matching --dim/--layers
 ```
 
-So the arm can be **trained** and cannot be **read**. Until `numpy_port.Model` learns
-`fsp.W`/`fsp.b` (add them to `init`/`self.shapes` when the checkpoint carries them —
-the same "only in the armed arm" rule) and `model_backend.load_frozen` builds the
-model accordingly, every ruler cell — retention curve, selective copy, associative
-retrieval, long-range language CE, held-out CE — is unavailable for this arm.
-*This is the first thing to fix, and it is a two-file, ~10-line change.*
+The parallel pass gave `numpy_port` the FSP keys and added `tests/check_fsp.py`
+check (5) - "the arm is measurable: the ruler's loader reads the checkpoint" -
+which pins exactly this. **I ran that gate: ALL CHECKS PASS** (finite-difference
+checks on the head's own gradient, a check that the auxiliary reaches the decay
+logits, alpha = 0 bit-identical to the default engine, the loss equals the BCE it
+claims, and the load check). With the fix, `tools/ruler.py` now loads an FSP
+checkpoint and runs. (On my 2-layer toy it then raised `LinAlgError: Singular
+matrix` in the copy readout - that is a property of the toy size, not of the FSP
+arm: the toy state's Gram matrix is singular to machine precision for the **alpha =
+0** arm too (effective rank 18.7 of 64 at dim 64 / 4 layers). At the real dim 512 x
+16 layers the state is 8192-dim and the ridge has ample rank.)
 
-**D2 — the FSP loss reaches exactly one of sixteen layers' memories.** The gradient
-path is correct as written (the state gradient is added to `lgrads[fsp_layer]`, which
-is what the ring credits to the embedding and what the decaytrace turns into the
-decay logits' gradient), but it is added **after** the backward loop, so it does not
-enter `dx`: layers 0–14 receive **no** FSP gradient at all. Measured (20 steps,
-dim 32, layers 2, FSP on vs off):
+**D2 - the FSP loss reaches exactly ONE of sixteen layers' memories. STILL OPEN**
+(as of `8024051`).
 
-| key | max abs difference (FSP vs no-FSP) |
+The gradient path is correct as written (the state gradient is added to
+`lgrads[fsp_layer]`, which is what the ring credits to the embedding and what the
+decaytrace turns into the decay logits' gradient), but it is added **after** the
+backward loop, so it does not enter `dx`: the other layers receive no FSP gradient.
+Measured directly, at the gradient level, same data, alpha = 0.1 vs alpha = 0
+(dim 32, 2 layers, one window):
+
+| parameter | max abs difference in the GRADIENT (FSP on vs off) |
 |---|---|
-| `layer0.W` | **0.000e+00** (bit-identical) |
-| `layer0.decay` | **0.000e+00** (bit-identical) |
-| `embed` | 2.384e-07 (the FSP gradient does reach the embedding credit) |
-| `layer1.decay` (the FSP layer) | 7.451e-08 (it reaches that layer's decay logits) |
-| `layer1.g` (the FSP layer's LN gain) | 4.292e-06 |
+| `embed` | 5.163e-03 |
+| `layer1.decay` (the FSP layer) | 6.189e-04 |
+| `layer0.decay` | **0.000e+00** |
+| every `layer*.W`, `layer*.g`, `layer*.b` | **0.000e+00** |
+| `Wd`, `bd`, `Ws`, `bs` (decoder + stop head) | **0.000e+00** |
 
-So FSP as implemented trains **the last layer's memory and nobody else's**. If the
-hypothesis is "give the long-lived channels a job", one of sixteen channels getting
-the job is a thin test. A `--fsp-layer` sweep (last vs every 4th) or a per-layer FSP
-head would be the honest version; **NOT STATED** in the paper, and the paper's model
-is a single-stack transformer where "the state" is one thing.
+So FSP as implemented shapes **the last layer's memory and nobody else's**; the
+other 15 layers' decay logits move only indirectly, through the changed embedding
+(measured `max|delta layer0.decay| = 1.3e-07` after 200 steps, five orders of
+magnitude below the FSP layer's). If the hypothesis is "give the long-lived channels
+a job", one of sixteen channels getting the job is a thin test of it. A
+`--fsp-layer` sweep or a per-layer head would be the honest version; **NOT STATED**
+in the paper, whose model is a single-stack transformer where "the state" is one
+thing.
 
-**D3 — the FSP loss is not a pure auxiliary: it moves the last layer's LayerNorm
-gain, and therefore the local read-out.** `lg[fsp_layer] += dg_fsp` and
-`lb[fsp_layer] += db_fsp` put the FSP gradient into the *shared* LN parameters of
-the layer the head reads. Measured: `layer1.g` moves by 4.3e-6 and `Wd` moves by
-1.5e-8 as a result. So an FSP arm's held-out CE can move for a reason that has
-nothing to do with memory (the LN gain of the last layer is a local-model knob).
-Cheap fix: give the FSP head its **own** normalisation parameters (`fsp.g` dim,
-`fsp.b0` 1) instead of borrowing the layer's; that removes the confound and adds
-513 parameters. **NOT STATED** in the paper.
+**D3 - "the FSP loss moves the shared LayerNorm gain" - FIXED IN PARALLEL (`8024051`).** The
+earlier version put the FSP gradient into the *shared* LN parameters of the layer
+the head reads (measured at the time: `layer1.g` moved by 4.3e-6, `Wd` by 1.5e-8, so
+an FSP arm's held-out CE could move for a reason unrelated to memory). The head now
+has **its own** normalisation (`fsp.g`, `fsp.b0`), so the auxiliary can no longer
+perturb the local read-out - confirmed by the measurement in D2, where `Wd`, `bd` and
+every `layer*.g` now show a **0.000e+00** FSP contribution. The confound is gone.
 
-**D4 — `--fsp-pos-weight 50` is the paper's number and it is mis-calibrated for
-bytes.** The paper's 50 is tuned to a BoW target over a 4,096-token vocabulary: at
-τ = 64 tokens the target is at most 64/4096 = 1.56 % dense, so positives outnumber
-negatives ~1:63 and a 50× positive weight makes the positive class carry ≈44 % of
-the loss.
+**D4 - `--fsp-pos-weight 50` is the paper's number and it is mis-calibrated for
+bytes. STILL OPEN** (as of `8024051`: the CLI default is still 50).
+
+The paper's 50 is tuned to a BoW target over a 4,096-token
+vocabulary: at tau = 64 tokens the target is at most 64/4096 = 1.56 % dense, so
+positives outnumber negatives ~1:63 and a 50x positive weight makes the positive
+class carry ~44 % of the loss.
 
 **Measured on our corpus** (`data/wikipedia_clean/wikistories/wiki_tinystories_001.txt`,
-two independent estimators, 250k positions, τ = 64): the byte-bag holds **21.9
+two independent estimators, 250k positions, tau = 64): the byte-bag holds **21.9
 distinct byte values of 256 on average** (a 1000-window random sample: mean 21.87,
-min 15, max 30) — i.e. the target is **8.55 % dense**, not the 22 % asserted in the
-parallel runbook `docs/runbooks/fsp.sh` (which claims "≈57 distinct values = 22 %
-positives"; that is wrong by ~2.6×, and it is the difference between a calibrated
+min 15, max 30) - i.e. the target is **8.55 % dense**, not the 22 % asserted in the
+parallel runbook `docs/runbooks/fsp.sh` (which claims "~57 distinct values = 22 %
+positives"; that is wrong by ~2.6x, and it is the difference between a calibrated
 knob and a mis-set one). Consequences at d = 0.0855:
 
 | calibration | value | positive mass |
 |---|---:|---:|
-| the paper's literal 50 | 50 | **82 %** — strongly all-positive; the head learns "everything is coming" |
-| exactly balanced, w = (1−d)/d | **10.7** | 50 % |
+| the paper's literal 50 (the CLI default today) | 50 | **82 %** - strongly all-positive; the head learns "everything is coming" |
+| exactly balanced, w = (1-d)/d | **10.7** | 50 % |
 | matching the paper's own effective balance (44.25 %) | **8.5** | 44 % |
 
 So use **`--fsp-pos-weight 8.5`** (paper-matched) or **10.7** (balanced); **not 50**,
-and not the runbook's 3.5 (which comes from the wrong density — at d = 0.0855 it
-under-weights positives 2.4× relative to balance). The knob is monotone in the
-head's operating point, so this only sets where the head sits, not what it learns —
-but at 50 the FSP term is roughly 6× over-weighted relative to the paper's own
-balance and it dominates the loss early.
+and not the runbook's 3.5 (which comes from the wrong density - at d = 0.0855 it
+under-weights positives 2.4x relative to balance). The knob is monotone in the
+head's operating point, so it sets where the head sits, not what it learns - but at
+50 the FSP term is roughly 6x over-weighted relative to the paper's own balance and
+it dominates the loss early.
 
-**D5 — the FSP loss is never logged.** `GpuModel.last_fsp` is computed
-(`gpu_port.py:1520`) and nothing prints it: `grep -n "last_fsp" train_gpu.py` → no
-hits. Without it, an arm cannot distinguish "FSP learned the target" from "FSP did
-nothing", which is the first thing one wants to know. The KD term sets the precedent:
-"the KD term has to be readable directly" (`gpu_port.py`, the KD block).
+**D5 - "the FSP loss is never logged" - FIXED IN PARALLEL (`8024051`).** `train_gpu.py:620-625`
+now prints `| fsp {m.last_fsp:.3f}` whenever `m.fsp_positions` is non-zero. That is
+the number to watch on the arm: if it does not fall, the head learned nothing.
+
+**D6 - NEW, and the most important thing in this section: at the paper's alpha = 0.1
+the auxiliary is measurably MARGINAL in this architecture.** The FSP term's *direct*
+gradient contribution is 0.28 % of the CE gradient at `embed` and 1.3 % at the FSP
+layer's decay logits, it appears on only **one step in 16**, and it is exactly zero
+everywhere else (D2). Measured end to end (dim 64, 4 layers, B = 32, 200 steps on
+real TinyStories bytes, alpha ladder, all other settings identical):
+
+| alpha | max abs delta `embed` vs the alpha = 0 arm | max abs delta `layer3.decay` | the FSP term itself |
+|---:|---:|---:|---|
+| 0.1 (the paper's) | 3.7e-05 (0.009 % of the parameter scale) | 9.0e-06 | 1.118 -> 1.193 (it **rises**) |
+| 0.5 | 1.8e-04 | 4.5e-05 | - |
+| 2.0 | 7.3e-04 | 1.8e-04 | - |
+| 10.0 | 3.5e-03 | 8.8e-04 | 1.118 -> 1.177 |
+
+Two readings. (i) The perturbation scales linearly in alpha, and at the paper's alpha
+it is ~1e-4 in absolute terms - **an arm run at alpha = 0.1 is predicted to be a
+null on every ruler cell, for a reason that has nothing to do with the paper's
+hypothesis.** (ii) The FSP term *rising* over those 200 steps is not evidence that
+the head cannot learn: in 200 steps the head receives only 12 FSP updates (one per
+16 steps), far too few; the real arm gives it ~10,000. So the toy run cannot answer
+"does the head learn the target?" - only the real arm can, and only if `last_fsp` is
+watched. But it *does* answer "is alpha = 0.1 big enough to move anything?", and the
+answer at this scale is: not by much.
+
+**D7 - NEW: at byte level the FSP target is mostly a static letter-frequency prior
+(Appendix B).** Measured on our corpus: the 64-byte future bag is **8.55 % dense**
+(21.9 of 256 symbols), a **context-free global prior already scores F1 = 0.7505**,
+conditioning on the **current byte** adds only **+0.36 F1 points** (0.7541), and a
+**local 4-gram context** adds **+1.85** (0.7690). The head reads a state that is
+dominated by the current byte (the residual stream passes `enc` straight through:
+`return x_in + y, ...`, `gpu_port.py`), so most of what the head can score is
+available **without any long-range information at all**. The FSP loss therefore
+pushes the state toward a *sample-independent summary* - which is precisely the
+thing a copy readout cannot use. This is the strongest reason to expect a null, and
+it is testable in the frozen model (Appendix B's F1 probe).
 
 **What is correct** (so the implementation is not thrown away): the target
-construction is right (the row-major `(τ, B)` → batch index `i % B` mapping is
-correct; repeated bytes are clamped to 1; the FSP positions are `{0, r, 2r, …}` in
+construction is right (the row-major `(tau, B)` -> batch index `i % B` mapping is
+correct; repeated bytes are clamped to 1; the FSP positions are `{0, r, 2r, ...}` in
 *byte* position, which is what the paper's P is); the head is created only when
-`fsp_alpha > 0`; and — checked — **the default path is untouched**: 20 steps at the
-same seed with the committed engine vs the working-tree engine give **23/23
-checkpoint keys bit-identical** (`max|diff| = 0.000e+00` on `theta` components, `m`,
-`v`, `state.*`, `ring_k`). That matters right now: the P4 long run in flight on Colab
-embeds the engine, and this change cannot have perturbed it.
+`fsp_alpha > 0`; the head's own gradient is finite-difference-verified
+(`tests/check_fsp.py` check 1) and the auxiliary demonstrably reaches the decay
+logits (check 2); and - checked independently - **the default path is untouched**:
+20 steps at the same seed with the committed engine vs the working-tree engine give
+**23/23 checkpoint keys bit-identical** (`max|diff| = 0.000e+00` on the `theta`
+components, `m`, `v`, `state.*`, `ring_k`). That matters right now: the P4 long run
+in flight on Colab embeds the engine, and this change cannot have perturbed it.
 
-### 2.3 What the FSP path *should* look like, at file/function level
+### 2.3 What is still missing, at file/function level
 
-Nothing below has been implemented — this is the specification.
+The tree now has the implementation and a gate. What it does **not** have, and what
+this section specifies (nothing below has been implemented by me):
 
-| file · function | change | new buffer |
+| file · function | change still needed | new buffer |
 |---|---|---|
-| `numpy_port.py` · `Model.__init__` / `_build` (L144–215) | accept `fsp_alpha`; add `init["fsp.W"] = (dim,256)`, `init["fsp.b"] = (256,)` **only when armed**, mirroring the `gated` precedent | theta +131,328 floats; `m`/`v` +131,328 each |
-| `numpy_port.py` · `Model.load` (L526) | nothing to add if the keys are in `self.shapes` — the length check then matches | — |
-| `numpy_port.py` · `Model.step_batch` (L324) | the FSP read-out + BCE, for parity with `gpu_port` (`tests/check_parity.py` gates the two engines bit-exactly) | — |
-| `gpu_port.py` · `GpuModel._build` (L618) | already done (D2/D3 caveats) | as above |
-| `gpu_port.py` · `GpuModel.step_batch` (L1004) | already done | — |
-| `train_gpu.py` · `Trainer._fsp_args` (L373) | already done; needs the **log** of the FSP term | per-step (B, 256) float32 multi-hot (1 MB at B=1024) + (B, 64) int64 gather (512 KB) |
-| `train_gpu.py` · `Trainer.train` (L340) | log `m.last_fsp` and `m.fsp_positions` every `--log-every` | — |
-| `train_gpu.py` · `main` (L586) | `--fsp-pos-weight` default → 8.0 (D4) | — |
-| `tools/membench/model_backend.py` · `load_frozen` (L56) | build the numpy model with the FSP head when the checkpoint carries it | — |
-| `tools/membench/eval_api.py` | **new cell**: `fsp_bag_accuracy(model, tau=64)` — the frozen model's own FSP head scored against the future bag, reported as F1 against the two baselines I measured in §B (global prior 0.7505, local 4-gram context 0.7690) | — |
-| `tests/check_fsp.py` | **new gate** (four claims, below) | — |
+| `numpy_port.py` · `Model.__init__` / `_build` | **done in parallel** (the FSP keys + `fsp.g` / `fsp.b0`) | theta +132,353 floats (512x256 + 256 + 512 + 512); `m`/`v` likewise |
+| `numpy_port.py` · `Model.step_batch` | the FSP read-out + BCE, for parity with `gpu_port` (`tests/check_parity.py` gates the two engines bit-exactly) | - |
+| `gpu_port.py` · `GpuModel._build` / `step_batch` | **done**; the open item is D2 (which layer's memory gets shaped) | - |
+| `train_gpu.py` · `Trainer._fsp_args` / `train` | **done** (the log is in); the open item is D4 (the `--fsp-pos-weight` default is still 50) | per-step (B, 256) float32 multi-hot (1 MB at B=1024) + the (tau, B) int64 gather |
+| `tools/membench/eval_api.py` | **new cell, still missing**: `fsp_bag_accuracy(model, tau=64)` - the frozen model's own FSP head scored against the future bag, reported as F1 against the two baselines I measured in Appendix B (global prior 0.7505, local 4-gram context 0.7690). This is the cell that tells us whether the head learned the *prior* or anything else, and it is the direct test of D7 | - |
+| `tests/check_fsp.py` | **done in parallel** (5 checks, ALL PASS when I ran it) | - |
+| `tests/check_fsp.py` | one check still worth adding: that the FSP contribution to the **non-FSP** layers' decay gradients is **exactly zero** (this pins D2 as a measured property rather than an accident) | - |
 
-**The four gates the arm must pass before it touches a GPU** (the repo's convention:
-every feature has a gate; see `docs/plans/PLAN-2026-10-11-T-AXIS.md` §2 P0):
+**The gates the arm must pass before it touches a GPU** (the repo's convention: every
+feature has a gate; see `docs/plans/PLAN-2026-10-11-T-AXIS.md` §2 P0). What is
+already covered by `tests/check_fsp.py` (which I ran: ALL CHECKS PASS):
 
-* **G1 (default path untouched):** `--fsp-alpha 0` over ≥120 steps is bit-identical
-  to the current engine — *already verified on CPU over 20 steps (23/23 keys, 0.000e+00);
-  the gate should extend this to 120 steps and to CUDA.*
-* **G2 (parity):** `numpy_port` and `gpu_port` agree bit-exactly **with** the FSP
-  arm on (`tests/check_parity.py`) — *currently impossible: numpy_port has no FSP.*
-* **G3 (target correctness):** the multi-hot for position p equals the set of byte
-  values in bytes[p+1 : p+1+τ], against a numpy reference, for T=1 and T>1.
-* **G4 (the gradient reaches the memory):** assert that `dL/d(decay)` of the FSP
-  layer is non-zero when the FSP term is on and exactly zero when it is off, and
-  that it is *zero* for the other layers (this pins D2 as a measured property rather
-  than an accident).
+* **G1 (default path untouched):** alpha = 0 leaves the theta layout, the loss and
+  the gradient bit-identical - covered by the gate's check (3), and independently
+  verified by me over 20 steps against the **committed** engine (23/23 checkpoint
+  keys, `max|diff| = 0.000e+00`).
+* **G2 (the head's gradient):** finite-difference-verified - the gate's check (1).
+* **G3 (the auxiliary reaches the memory):** the gate's check (2) shows the decay
+  logits' gradient changing under the FSP term.
+* **G4 (the loss is the BCE it claims):** the gate's check (4).
+* **G5 (the arm is measurable):** the gate's check (5) - the ruler's loader reads an
+  FSP checkpoint.
+* **G6 (target correctness against a numpy reference, T = 1 and T > 1):** *not
+  covered; worth 20 lines.*
+* **G7 (the non-FSP layers' decay gradients are exactly untouched):** *not covered;
+  worth 5 lines and it is the D2 pin.*
 
-**Parameter overhead, measured against the paper's:** `fsp.W` (512×256) + `fsp.b`
-(256) = **131,328 parameters = 2.93 %** of 4,481,793, against the paper's "1.7 %
-parameter overhead" for its 65K-parameter head on a 3.74M model. Note the paper's own
-description is internally inconsistent: Eq. (1) says `f` is "a linear projection into
-vocabulary space" (which for a 4,096-token vocab and d = 256 would be ~1.05 M
-parameters, not 65 K), while §3.1 says "one d × d linear projection (65K parameters
-for d = 256), sharing the output embedding matrix" (65K matches the stated 1.7 %).
-Which of the two the authors implemented is **NOT STATED**; for us the direct
-d → 256 head is the cheaper reading and is what the working tree does.
-
----
+**Parameter overhead, measured against the paper's:** `fsp.W` (512x256) + `fsp.b`
+(256) + `fsp.g` (512) + `fsp.b0` (512) = **132,353 parameters = 2.95 %** of
+4,481,793, against the paper's "1.7 % parameter overhead" for its 65K-parameter head
+on a 3.74M model. Note the paper's own description is internally inconsistent:
+Eq. (1) says `f` is "a linear projection into vocabulary space" (which for a
+4,096-token vocab and d = 256 would be ~1.05 M parameters, not 65 K), while §3.1
+says "one d x d linear projection (65K parameters for d = 256), sharing the output
+embedding matrix" (65K matches the stated 1.7 %). Which of the two the authors
+implemented is **NOT STATED**; for us the direct d -> 256 head is the cheaper
+reading and is what the working tree does.
 
 ## 3. The decisive experiment
 
@@ -408,48 +456,68 @@ d → 256 head is the cheaper reading and is what the working tree does.
 
 > **H1 (the paper's claim, at byte level):** adding an auxiliary long-horizon
 > objective to the training signal changes what the *state* is for, and therefore
-> changes the memory measurements — retention up, and the copy/retrieval cells above
+> changes the memory measurements - retention up, and the copy/retrieval cells above
 > their vetoes.
 
 > **H0 (the alternative):** the auxiliary loss is a local-frequency prior wearing a
-> long-horizon costume; it changes CE a little and changes nothing the ruler can see.
+> long-horizon costume; it changes CE a little and changes nothing the ruler can
+> see.
 
 The paper cannot distinguish H1 from H0 (it has no memory metric). **We can**, and the
 ruler already exists. That is the whole value of running this arm.
 
-### 3.2 The arms — one new arm, two controls already in flight
+### 3.2 The arms - one new arm, two controls already in flight
 
 Everything is matched to the **P4 long run in flight** (`docs/runbooks/p4-long.sh`):
 from scratch, seed 0, B = 1024, `--seqlen 1`, `--ring-k 18`, `TMT_TAIL=0`, the same
-4-file corpus glob, the same 1-epoch byte budget (161,333 steps × 1024 B = 165 MB),
+4-file corpus glob, the same 1-epoch byte budget (161,333 steps x 1024 B = 165 MB),
 the same `--warmup 20 --no-tagged --device cuda`.
 
 | arm | init | `--wd-decay` | FSP | status |
 |---|---|---|---|---|
-| **`A_p4_wd0_fsp`** | P4 (`--half-min 2 --half-max 512`) | 0.0 | `--fsp-alpha 0.1 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5` | **the new arm** (one epoch); the same arm as `docs/runbooks/fsp.sh` |
-| `A_p4_wd0` | P4 | 0.0 | off | **the control — already in flight** (identical recipe, identical seed, identical bytes) |
-| `B_default_wd001` | default | 0.01 | off | **the second control — already in flight** (the memory-free, CE-cheap arm) |
-| `C_p4_wd001` | P4 | 0.01 | off | in flight; tells us the erosion arm's CE, for reference |
+| **`A_p4_wd0_fsp`** | P4 (`--half-min 2 --half-max 512`) | 0.0 | `--fsp-alpha 1.0 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5` | **the new arm** (one epoch) |
+| `A_p4_wd0` | P4 | 0.0 | off | **the control - already in flight** (identical recipe, identical seed, identical bytes) |
+| `B_default_wd001` | default | 0.01 | off | **the second control - already in flight** (the memory-free, CE-cheap arm) |
+| `C_p4_wd001` | P4 | 0.01 | off | in flight; the erosion arm's CE, for reference |
 
 Because `A_p4_wd0` is *already running with the same seed and the same byte budget*,
-**the FSP arm costs one extra arm and no extra control** — the control is not
+**the FSP arm costs one extra arm and no extra control** - the control is not
 rebuilt, it is reused. That is the cheapest possible A/B of this idea in this project.
 
-**Do not add a separate "FSP with shuffled targets" arm unless the primary readout
-is positive.** If the primary readout is ambiguous, the cheapest disambiguator is a
+**Why alpha = 1.0 and not the paper's 0.1** (this is the one place where this note
+departs from the paper, and it is a measured departure). D6 measured the auxiliary's
+perturbation directly: at alpha = 0.1 the FSP term moves the parameters by ~3.7e-05
+after 200 steps (0.009 % of the parameter scale), and the ladder is linear in alpha
+(0.5 -> 1.8e-04, 2.0 -> 7.3e-04, 10 -> 3.5e-03). An arm run at alpha = 0.1 is
+therefore **predicted to be a null on every ruler cell for a reason that has nothing
+to do with the paper's hypothesis** (the auxiliary is too small to move the model, not
+too small to be right). At alpha = 1.0 the perturbation is 10x larger, so:
+
+* a **null at alpha = 1.0 is informative** - it says the mechanism does not move the
+  memory at a weight where it could;
+* a **null at alpha = 0.1 is not** - it says only that 0.1 was too small.
+
+The arm keeps the paper's r = 16, tau = 64 and its head; only the weight is changed,
+and the weight is a knob, not a hypothesis. **If the GPU has a second free slot, run
+the paper's alpha = 0.1 as `A_p4_wd0_fsp_a01`** (identical command with
+`--fsp-alpha 0.1`); it is worth running *after* the alpha = 1.0 arm and only if the
+alpha = 1.0 arm shows `last_fsp` falling.
+
+**Do not add a separate "FSP with shuffled targets" arm unless the primary readout is
+positive.** If the primary readout is ambiguous, the cheapest disambiguator is a
 *shuffled-target* arm (same loss magnitude, targets permuted across streams): it
 separates "any extra loss term regularises" from "the long-range target specifically
-matters". Cost: one more arm. (This is the repo's standing practice — "the control
+matters". Cost: one more arm. (This is the repo's standing practice - "the control
 arm that was missing", `RESULTS.md` 2026-10-04.)
 
 ### 3.3 The byte budget and the commands
 
-Byte budget: **161,333 steps × B=1024 × T=1 = 165,199,232 B ≈ 165 MB = 1 epoch over
-the 4-file corpus** — the same budget as the three in-flight arms, so all four CEs
+Byte budget: **161,333 steps x B=1024 x T=1 = 165,199,232 B ~ 165 MB = 1 epoch over
+the 4-file corpus** - the same budget as the three in-flight arms, so all four CEs
 are comparable.
 
 ```bash
-# --- the new arm (D), on the Colab T4, same recipe as docs/runbooks/p4-long.sh ---
+# --- the new arm, on the Colab T4, same recipe as docs/runbooks/p4-long.sh ---
 cd /content
 export TMT_TAIL=0
 export OMP_NUM_THREADS=2
@@ -459,7 +527,7 @@ python3 train_gpu.py runs/taxis/A_p4_wd0_fsp.npz train \
   --dataset "data/wikipedia_clean/wikistories/wiki_tinystories_*.txt" \
   --batch 1024 --seqlen 1 --steps 161333 --warmup 20 --no-tagged \
   --ring-k 18 --half-min 2 --half-max 512 --wd-decay 0.0 \
-  --fsp-alpha 0.1 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5 \
+  --fsp-alpha 1.0 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5 \
   --device cuda --seed 0 > runs/taxis/A_p4_wd0_fsp.log 2>&1
 
 # --- the ruler, on all four arms (TMT_RULER_CKPT selects the checkpoint) ---
@@ -470,26 +538,24 @@ for name in A_p4_wd0_fsp A_p4_wd0 B_default_wd001 C_p4_wd001; do
 done
 ```
 
-**Two operational notes, both verified today.**
+**Three operational notes, all verified today.**
 
 1. **`TMT_RULER_RAW` is dead in the current ruler.** `tools/ruler.py:36` reads it
    (`RAW = os.environ.get("TMT_RULER_RAW", ...)`) and **never uses it**: the
    held-out CE cell evaluates `sorted(glob.glob("data/eval/**/*", recursive=True))`
-   at 3 slices × 20,000 B, and the cross-domain cell globs `data/*.txt` excluding
+   at 3 slices x 20,000 B, and the cross-domain cell globs `data/*.txt` excluding
    `sample.txt`. Setting the variable changes nothing. Keep setting it (the recipe
    does) but do not believe it is doing anything.
-2. **The D arm cannot be read by the ruler until D1 is fixed** (§2.2). The training
-   command above is fine; the ruler command will raise `ValueError: checkpoint …
-   holds N parameters but this model was built with M` until `numpy_port` learns the
-   FSP keys. **Fix D1 before launching**, or the arm will be trained and
-   unmeasurable — which is exactly how this project has lost time before ("Four
-   bugs the ruler exposed, none caught by the gates", `RESULTS.md` 2026-10-12).
-
-**GPU contention:** the three in-flight arms run concurrently on one T4. A fourth arm
-adds roughly the same footprint as one of them (ring buffer (B=1024, K=18, 512)
-fp32 × 16 layers ≈ 604 MB, plus states and the optimizer's 3 × 4.48 M fp32 ≈ 54 MB,
-tail off). Check `nvidia-smi` before adding it; if free memory is under ~2 GB, run D
-after A finishes rather than beside it.
+2. **The arm is measurable now** (D1 was fixed in parallel): `numpy_port` reads the
+   FSP checkpoint and `tools/ruler.py` runs on it. The gate `tests/check_fsp.py`
+   pins that (check 5) - I ran it, ALL CHECKS PASS. But the gate does **not** yet
+   cover the numpy/torch parity of the FSP path, and the ruler's new FSP cell
+   (§3.4) does not exist yet; add them before the arm's readout is quoted.
+3. **GPU contention:** the three in-flight arms run concurrently on one T4. A fourth
+   arm adds roughly the same footprint as one of them (ring buffer
+   (B=1024, K=18, 512) fp32 x 16 layers ~ 604 MB, plus states and the optimizer's
+   3 x 4.48 M fp32 ~ 54 MB, tail off). Check `nvidia-smi` before adding it; if free
+   memory is under ~2 GB, run the arm after A finishes rather than beside it.
 
 ### 3.4 The instrument, and exactly what each cell decides
 
@@ -498,73 +564,67 @@ numbers, which is the only reason the numbers are comparable):
 
 | ruler cell | what it measures | what a move means |
 |---|---|---|
-| §1 retention curve, d = 8/32/128/512, 64 samples | matched-pair Δh ÷ control floor | **the write side**: are the long-lived channels now *carrying* something the model uses, or just present? (control: 5.5 % at d=128 for `A_p4_wd0`) |
+| §1 retention curve, d = 8/32/128/512, 64 samples | matched-pair delta-h / control floor | **the write side**: are the long-lived channels now *carrying* something the model uses, or just present? (control: 5.5 % at d=128 for `A_p4_wd0`) |
 | §2 selective copy, d = 8/32/128/512, 128 samples | readout accuracy vs its permuted-label veto | **the read side**: the only cell that can show addressing |
-| §3 associative retrieval, same grid | key→payload accuracy vs veto | the read side, harder |
+| §3 associative retrieval, same grid | key->payload accuracy vs veto | the read side, harder |
 | §4 long-range language CE, L = 512 | nats/byte on a marker task (chance 5.5248) | "planning": the paper's own claim |
-| §5 held-out CE | 3 slices × 20,000 B over `data/eval/**` | the local objective; the paper's own metric |
-| §5 cross-domain CE | 9 novels × 8,000 B | generalisation |
-| **NEW (proposed)** `fsp_bag_accuracy(τ=64)` | the frozen model's own FSP head vs the future bag, F1 | whether the FSP head learned anything beyond the prior (§B) |
+| §5 held-out CE | 3 slices x 20,000 B over `data/eval/**` | the local objective; the paper's own metric |
+| §5 cross-domain CE | 9 novels x 8,000 B | generalisation |
+| **the training log's `fsp` term** | `last_fsp` every `--log-every` | **does the head learn the target at all?** (D5) |
+| **NEW (proposed)** `fsp_bag_accuracy(tau=64)` | the frozen model's own FSP head vs the future bag, F1 | whether the head learned anything beyond the prior (Appendix B: global prior 0.7505, local 4-gram context 0.7690) |
 
 **The decision rule, fixed in advance (this is the point of writing it down now):**
 
-* **H1 supported** iff (a) the D arm's held-out CE is **not worse** than `A_p4_wd0`'s
-  by more than 0.05 nats (the paper's claim is a *gain*, so a loss is already a
-  partial refutation), **and** (b) at least one of: the d=128 retention ratio rises
-  above 5.5 %, or a copy cell's readout beats its permuted-label veto (which no
-  model in this log has ever done).
-* **H0 supported** iff the D arm's held-out CE is ≥ A's, and the ruler cells are
-  unchanged within noise. **Then FSP is closed** and the month's priority stays
-  exactly where the plan put it (write path / readout).
+* **Read the `fsp` term first.** If `last_fsp` does not fall over the arm, the head
+  learned nothing and **every other cell is uninterpretable** - the verdict is "the
+  arm was too weak", not "FSP does not work". (At toy scale the head gets 12 FSP
+  updates in 200 steps and the term does not move; the real arm gives it ~10,000.)
+* **H1 supported** iff (a) the FSP arm's held-out CE is **not worse** than
+  `A_p4_wd0`'s by more than 0.05 nats (the paper's claim is a *gain*, so a loss is
+  already a partial refutation), **and** (b) at least one of: the d=128 retention
+  ratio rises above 5.5 %, or a copy cell's readout beats its permuted-label veto
+  (which no model in this log has ever done).
+* **H0 supported** iff the held-out CE is >= the control's and the ruler cells are
+  unchanged within noise, **with `last_fsp` falling** (otherwise it is the "too
+  weak" verdict). **Then FSP is closed** and the month's priority stays exactly where
+  the plan put it (write path / readout).
 * **Ambiguous** (CE moves, ruler does not): the paper's objective helped the *local*
-  model only, which is consistent with the paper's own finding ("the CE ruler is
-  known … to be structurally insensitive to long-range memory" — our ruler's §8
-  note) and tells us nothing about memory. Do not promote FSP; do not denounce it.
-* **The pre-flight gate (G5, §3.5) can refuse before any GPU time is spent.**
+  model only, which is consistent with the paper's own finding and tells us nothing
+  about memory. Do not promote FSP; do not denounce it.
+* **The pre-flight (§3.5) can refuse before any GPU time is spent.**
 
-### 3.5 The pre-flight gate that should run first (5 minutes, CPU, no GPU)
+### 3.5 The pre-flight that should run first (minutes, CPU, no GPU)
 
-Before spending a T4 hour on the D arm, run the §B measurement on our own corpus:
-**how much of the 64-byte future bag is predictable without any long-range
-information?** I ran it (script in §B):
+Three CPU measurements, none of which needs a GPU, and all of which are in
+Appendix B / D6:
 
-* the bag is **8.55 % dense** (21.9 distinct byte values of 256; two independent
-  estimators agree: 21.87 over 1,000 random 64-byte windows, 21.88 over 250k
-  sliding positions — the parallel runbook's "≈57 distinct = 22 %" is wrong by 2.6×);
-* a **context-free global prior** already achieves **F1 = 0.7505**;
-* conditioning on the **current byte only** gives **F1 = 0.7541** (+0.36 points);
-* conditioning on a **4-gram local context** gives **F1 = 0.7690** (+1.85 points over
-  the prior).
-
-**Interpretation (the skeptical core of this note):** at byte level, ~75 % of the FSP
-target is explained by *which letters are common in English*, and the current byte
-alone buys 0.36 points on top of that. The residual that a *long-range* mechanism
-could exploit is the ~1.9 F1 points between the local-context predictor and the
-prior — and the head reads a state that is dominated by the current byte (the
-residual stream passes `enc` straight through: `return x_in + y, …`,
-`gpu_port.py:249`). So the FSP head can get most of what is achievable **without any
-long-range information at all**, and the gradient that reaches the long-lived state
-dimensions is correspondingly small.
-
-That is not a reason to skip the arm. It is a reason to (a) run it as a **falsifiable
-test with a pre-written decision rule**, not as a promising direction; (b) fix the
-pos-weight calibration (D4) so the loss is not dominated by the prior;
-(c) **log** the FSP term (D5) so we can see the head's loss fall — if it falls to
-the prior's level and stops, that is the measurement, and it is decisive.
+1. **How much of the 64-byte future bag is predictable without long-range
+   information?** Measured: the bag is 8.55 % dense; a **context-free global prior
+   already scores F1 = 0.7505**; the **current byte** adds +0.36 points (0.7541); a
+   **local 4-gram context** adds +1.85 (0.7690). So ~97 % of what a local model can
+   achieve is available with no long-range information at all, and the head reads a
+   state dominated by the current byte.
+2. **How big is the auxiliary's effect at the paper's weight?** Measured: at
+   alpha = 0.1 it moves the parameters by 3.7e-05 after 200 steps; the ladder is
+   linear in alpha.
+3. **Does the state stay sample-dependent under the FSP loss?** Measured: the state
+   matrix's effective rank is the same under FSP and under CE-only at toy scale
+   (18.7 of 64 in both), so there is no collapse to report - but the toy is 100x
+   smaller than the real model, so this is worth re-checking on the real arm through
+   the ruler's copy cells.
 
 **If the pre-flight says the target is >90 % prior-explainable (it is 97 % of the
-locally-achievable F1), the honest recommendation is: run the D arm anyway, but
-spend the parallel GPU slot on the write-path arm instead** — the one our own
-measurements point at (`RESULTS.md` 2026-10-13: "the remaining deficit is
-architectural, not a batching, credit or optimization problem"), and the one this
-paper explicitly declines to support (§7.1).
+locally-achievable F1), the honest recommendation is: run the arm anyway, but spend
+the parallel GPU slot on the write-path arm instead** - the one our own measurements
+point at (`RESULTS.md` 2026-10-13: "the remaining deficit is architectural, not a
+batching, credit or optimization problem"), and the one this paper explicitly
+declines to support (§7.1).
 
 ### 3.6 Cost
 
 One arm, one epoch, ~165 MB. At the in-flight arms' rate that is one more T4 slot.
-The instrument fixes (D1, D3, D4, D5, G1–G4) are a few hours of CPU work, not GPU.
-
----
+The instrument work (the `fsp_bag_accuracy` cell, the parity check for the FSP
+path, the two missing gate checks) is a few hours of CPU, not GPU.
 
 ## 4. Where the paper is already contradicted by our measurements, and where it would have explained something we could not explain
 
@@ -598,6 +658,15 @@ The instrument fixes (D1, D3, D4, D5, G1–G4) are a few hours of CPU work, not 
 * **The paper's own architecture has no perplexity.** Table 2 (p. 6) has no
   v11/CumMix row. Any claim of the form "CumMix is better than X" is
   **CLAIM-NOT-SUPPORTED** by this paper.
+* **"FSP gives the model a global planning incentive" (§7.1: "Token-level
+  cross-entropy provides a strong local gradient but no global planning
+  incentive")** — at *token* level, plausible; at *byte* level, measured against
+  our own corpus, the target is **75 % a static letter-frequency prior** and the
+  current byte alone adds **+0.36 F1 points** over that prior (Appendix B). The
+  "global planning" content of the objective is therefore ~2 F1 points wide at
+  byte level. This is a contradiction of the mechanism *at our tokenization*, not
+  of the paper (whose vocabulary is 4,096 BPE tokens, where a 64-token window is
+  a genuinely sparse, topical bag).
 
 ### 4.2 Where the paper *would* have explained something we could not explain
 
@@ -625,10 +694,10 @@ This is the paper's real value to us, and it is worth more than its experiment.
   holds a long-memory signal and still cannot use it". FSP puts a read-out on the
   state, so it speaks to *holding-and-shaping*; but its target is a **bag**, so it
   cannot teach addressing. Our copy cells need exact content at an exact offset. If
-  the D arm moves the copy cells, the paper will have taught us something nobody
+  the FSP arm moves the copy cells, the paper will have taught us something nobody
   else has; if it moves only the CE, it has not.
 
-### 4.3 Four CLAIM-NOT-SUPPORTED annotations for the ledger (recommended)
+### 4.3 Five CLAIM-NOT-SUPPORTED annotations for the ledger (recommended)
 
 1. "CumMix improves quality" — Table 2 has no CumMix/v11 perplexity row.
 2. "Auxiliary losses improve long-range capability" — no recall/retrieval/associative
@@ -640,69 +709,82 @@ This is the paper's real value to us, and it is worth more than its experiment.
    internally inconsistent (§3.1's "d × d linear projection (65K parameters)" vs
    Eq. (1)'s "projection into vocabulary space", which for a 4,096-token vocab would
    be ~1.05 M parameters); the 2,750 tok/s equality in Table 2 is unexplained.
+5. "FSP gives a global planning incentive" — this is the paper's own mechanism claim
+   and it is **NOT STATED** for any tokenization other than 4,096-way BPE. At byte
+   level it is 75 % a static letter-frequency prior (Appendix B), so the claim cannot
+   be carried over to TMT without re-measuring it (which is what §2.2 D7 does).
 
 ---
 
 ## 5. Verdict
 
-> **The paper does NOT change the project's next month. It adds ONE arm — a
-> CPU-gated, instrument-fixed FSP arm (`A_p4_wd0_fsp`) — to run in parallel with the
-> P4 long run now in flight, and it changes nothing else.**
+> **The paper does NOT change the project's next month. It adds ONE arm - a
+> CPU-gated, instrument-fixed FSP arm (`A_p4_wd0_fsp`, alpha = 1.0) - to run in
+> parallel with the P4 long run now in flight, and it changes nothing else.**
 
-**The ONE experiment to add in parallel with the P4 long run on Colab** (the
-fourth arm, same recipe, same seed, same 165 MB budget, one extra epoch):
+**The ONE experiment to add in parallel with the P4 long run on Colab** (the fourth
+arm, same recipe, same seed, same 165 MB budget, one extra epoch):
 
 ```
 python3 train_gpu.py runs/taxis/A_p4_wd0_fsp.npz train \
   --dataset "data/wikipedia_clean/wikistories/wiki_tinystories_*.txt" \
   --batch 1024 --seqlen 1 --steps 161333 --warmup 20 --no-tagged \
   --ring-k 18 --half-min 2 --half-max 512 --wd-decay 0.0 \
-  --fsp-alpha 0.1 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5 \
+  --fsp-alpha 1.0 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5 \
   --device cuda --seed 0
 ```
 
 against the **already-running** `A_p4_wd0` (same bytes, same seed, no FSP) as its
 control, and the already-running `B_default_wd001` as the memory-free control;
-instrument `tools/ruler.py` with `TMT_RULER_CKPT`, once D1 (numpy_port learns the
-FSP keys) is fixed; decision rule fixed in §3.4 **before** the run starts.
+instrument `tools/ruler.py` with `TMT_RULER_CKPT`, plus the new `fsp_bag_accuracy`
+cell and the training log's `fsp` term; decision rule fixed in §3.4 **before** the
+run starts.
 
 **Why it is worth one arm and not more:**
 
 * it is the **cheapest** of the paper's ideas in this codebase and it is **already
-  written** (§2.2) — the marginal cost is one GPU arm plus ~10 lines of instrument
-  fix;
+  written and gated** (§2.2) - the marginal cost is one GPU arm plus a few hours of
+  instrument work;
 * it is the **only** external claim that aligns with our own null record ("the
   objective, not the architecture") and it gives a *mechanism* for the one result we
   could not explain (the CE penalty of the long channels, §4.2);
-* it is **falsifiable here** in a way it was not falsifiable in the paper — the
-  ruler has copy cells with vetoes that no model in this log has ever beaten, so
-  "FSP helps" and "FSP is a prior in a long-horizon costume" are separable;
-* and it is cheap enough that being wrong is cheap. **The paper's evidence does not
-  support promoting FSP to a priority** — its own architecture has no reported
-  perplexity, its only positive result is a PPL number in a 2-hour CPU budget with a
-  subjective coherence judgement on three prompts, and it contains no long-range
-  capability benchmark at all.
+* it is **falsifiable here** in a way it was not falsifiable in the paper - the ruler
+  has copy cells with vetoes that no model in this log has ever beaten, so "FSP
+  helps" and "FSP is a prior in a long-horizon costume" are separable;
+* and it is cheap enough that being wrong is cheap.
+
+**Why it must not be promoted on the paper's evidence:**
+
+* the paper's own architecture has **no reported perplexity** (no v11 row in Table
+  2); its only positive result is a PPL number in a 2-hour CPU budget with a
+  subjective coherence judgement on three prompts; and it contains **no long-range
+  capability benchmark of any kind** (0 occurrences of recall / retrieval /
+  associative / copy / needle);
+* the FSP target at byte level is measurably **~75 % a static letter-frequency
+  prior** and only +1.9 F1 points are attributable to anything beyond a local
+  context (Appendix B);
+* the auxiliary as implemented reaches **exactly one of sixteen layers' memories**
+  (D2) and, at the paper's alpha = 0.1, moves the parameters by ~1e-4 (D6) - so the
+  faithful arm would be a null for reasons unrelated to the paper's hypothesis.
 
 **What the paper does *not* change:** the priority order from
-`PLAN-2026-10-11-T-AXIS.md` §7.3 — the write path and the readout stay ahead of the
+`PLAN-2026-10-11-T-AXIS.md` §7.3 - the write path and the readout stay ahead of the
 init, the T axis and the ring. If anything the paper is a *reason to be careful*
 about spending the month on architecture-side write-path work: "21
-architecture-only experiments—spanning attention, linear attention, recurrence,
-convolution, delta rules, and their combinations—never achieved more than marginal
+architecture-only experiments-spanning attention, linear attention, recurrence,
+convolution, delta rules, and their combinations-never achieved more than marginal
 improvements" (§7.1) is the closest thing we have to an external prior that says
 "the P3 gate and the hierarchical wiring are not where the month goes". But it is a
 PPL-only result in an undertrained regime, and we have measured (in a regime the
 paper would recognise as its own) that architecture changes *do* move our memory
-metric by 15×. So: use the paper as a *hedge* on the write path, not as a veto.
+metric by 15x. So: use the paper as a *hedge* on the write path, not as a veto.
 
-**One caveat to carry into the arm's launch:** if the D arm's primary readout is
+**One caveat to carry into the arm's launch:** if the FSP arm's primary readout is
 "CE improved, ruler unchanged", the correct conclusion is **not** "FSP works". Our own
 ruler says why (its §8): "the CE ruler is known (from the n-gram anchor) to be
 structurally insensitive to long-range memory, so the CE numbers here tell you about
 the ruler, not about memory". A CE win with a flat ruler is the paper's result
 reproduced, and the paper's result is not about memory.
-
----
 
 ## Appendix A — quote ledger (page = the PDF's own page)
 
@@ -779,30 +861,62 @@ density 0.0855 gives **w = 8.5**; exact balance gives **w = (1−d)/d = 10.7**;
 the paper's literal 50 gives **82 %** positive mass at our density (all-positive
 bias). → **use `--fsp-pos-weight 8.5`** (or 10.7), not 50.
 
-## Appendix C — how to reproduce the §2.2 audit (CPU only, ~2 minutes)
+## Appendix C — how to reproduce the §2.2 audit (CPU only, ~10 minutes)
 
 ```bash
-# 1. the FSP path runs
+# 0. the gate that now exists (5 checks; I ran it: ALL CHECKS PASS)
+.venv/bin/python tests/check_fsp.py
+
+# 1. the FSP path trains
 .venv/bin/python train_gpu.py /tmp/fsptest/fsp.npz train \
   --dataset "data/wikipedia_clean/wikistories/wiki_tinystories_001.txt" \
   --batch 8 --dim 32 --layers 2 --steps 40 --warmup 2 --no-tagged --ring-k 8 \
-  --fsp-alpha 0.1 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 50 \
+  --fsp-alpha 0.1 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5 \
   --device cpu --seed 0 --log-every 10
 
-# 2. the ruler CANNOT read it (D1)
+# 2. the ruler can read it (D1; the parallel fix + tests/check_fsp.py check 5)
 TMT_RULER_CKPT=/tmp/fsptest/fsp.npz .venv/bin/python tools/ruler.py
-#   ValueError: checkpoint ... holds 27,361 parameters but this model was built with 18,913
 
 # 3. the default path is untouched (G1): committed engine vs working-tree engine,
 #    same seed, 20 steps -> all 23 checkpoint keys bit-identical (max|diff| = 0.000e+00)
 git show HEAD:gpu_port.py > /tmp/oldrepo/gpu_port.py   # and numpy_port.py, train_gpu.py, ...
 ```
 
+**D2 / D6 — the two measurements that are not a gate** (they are the reason the arm
+is run at alpha = 1.0 and not at the paper's 0.1). Gradient level, same data,
+alpha = 0.1 vs alpha = 0 (dim 32, 2 layers, one window):
+
+```python
+import torch, gpu_port
+def grads(alpha):
+    m = gpu_port.GpuModel(device='cpu', dim=32, layers=2, seed=0,
+                          fsp_alpha=alpha, fsp_r=1, fsp_tau=4,
+                          fsp_pos_weight=8.5, fsp_layer=-1)
+    g = torch.Generator().manual_seed(7)
+    cs = torch.randint(0,256,(8,2),generator=g); ns = torch.randint(0,256,(8,2),generator=g)
+    ends = torch.zeros(8,2); tgt = torch.zeros(8,2,256); tgt[:,0,17]=1; tgt[:,0,200]=1
+    m.new_states(8); m.lr = 0.0
+    m.step_batch(cs, ns, ends, fsp=((1,1),tgt))
+    return {k: v.detach().clone() for k,v in m.gviews.items()}
+g0 = grads(0.0); g1 = grads(0.1)
+for k in g0:
+    d = (g1[k]-g0[k]).abs().max().item()
+    if d: print(k, d)          # -> embed 5.163e-03, layer1.decay 6.189e-04, and NOTHING else
+```
+
+**D6 — the alpha ladder** (dim 64, 4 layers, B = 32, 200 steps on real bytes;
+`max|delta embed|` against the alpha = 0 arm): alpha = 0.1 -> 3.7e-05, 0.5 ->
+1.8e-04, 2.0 -> 7.3e-04, 10.0 -> 3.5e-03. Linear in alpha, and tiny at the paper's
+value.
+
 ## Appendix D — what this note did not do
 
-* No engine code was modified (the FSP implementation in the working tree is
-  **someone else's uncommitted work**; this note audits it and specifies the
-  missing pieces, it does not change it).
+* No engine code was modified by me. The FSP implementation this note audits was
+  written and committed **in parallel** (`8024051`, 2026-10-20 11:48) — this note
+  audits it and specifies the missing pieces; it does not change it. The two
+  findings that are still open against that commit are **D2** (the auxiliary reaches
+  one layer's memory, not sixteen) and **D4** (the `pos_weight` calibration), plus
+  the missing instrument cell (§2.3).
 * No GPU job was run; every number produced here is CPU-only and is labelled as
   such.
 * The network was not touched; `docs/ideas/papers/INDEX.md` (the ledger) was not
