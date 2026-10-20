@@ -3641,3 +3641,55 @@ So the P3 gate is not blocked by a mystery: it needs (i) the gatetrace, (ii) a
 correct batch reduction, and (iii) — still, and still validly — the per-sample
 plumbing for the ring credit, the tail and `ring_k` inference. (i) and (ii) are
 small; (iii) is the real rework, and it is unchanged by this discovery.
+
+### The instrument the hypothesis needs: the FSP bag cell
+
+The audit's **D7** is the sharpest objection to the FSP arm, and it is a
+property of the *byte-level* translation rather than of the paper: the target
+is the bag of the next 64 bytes, and that bag holds ~22 distinct symbols of
+256 — and those symbols are largely the common ones. So a head that ignores
+the state entirely and learns the unigram distribution already scores well.
+**The question the arm therefore has to answer is not "is the FSP loss low"
+but "does the head beat the priors"** — because a head that does not was
+satisfied by the prior, and the arm's null result would say nothing about the
+hypothesis.
+
+So the ruler grew a cell (section 3b) that scores the model's **own** head on
+the future bag and puts it next to two static baselines measured on the same
+positions:
+
+```
+[fsp_bag] head(threshold) F1=...  head(top-22) F1=...
+            global prior F1=...     local 4-gram F1=...
+```
+
+The metric is instance-level **set F1** (precision/recall over the multi-hot),
+each predictor using its own decision rule: the head at its trained 0.5
+threshold and at top-k, the priors at top-k with k = the mean bag size. On our
+corpus the global prior reaches **F1 ≈ 0.82**, so the head has to clear that
+bar to have learned anything contextual at all. A 200-step smoke model scores
+0.17 — far below, exactly as it should.
+
+Two calibration decisions came out of the same audit and are applied to the
+queued arm:
+
+* **α = 1.0, not the paper's 0.1.** The measured α-ladder (dim 64, 4 layers,
+  B=32, 200 steps on real bytes, max|Δembed| against the α=0 arm) is
+  3.7e-05 / 1.8e-04 / 7.3e-04 / 3.5e-03 at α = 0.1 / 0.5 / 2 / 10 — linear in
+  α, and small enough at the paper's value that the arm would be a null for a
+  reason that has nothing to do with the hypothesis. The byte-level scale of
+  the two loss terms differs from the token-level one the paper tuned on, so
+  α is re-set by measurement here, not copied. The paper's value stays
+  available as a flag.
+* **pos_weight = 8.5, not 50.** The bag density on our corpus is 8.55% dense
+  (21.9 of 256 symbols); the paper's 50 is tuned for a 4096-token vocabulary
+  where the same window is ~1.6% dense. Solving for the paper's own
+  positive-mass fraction on *our* density gives 8.5.
+
+**The first arm's known limitation (D2), pre-registered.** The auxiliary
+reaches **one of the sixteen** layers' memories (the layers' states are
+independent recurrences, so a head on the last layer trains that layer's
+decay logits and the shared embedding's credit, and no other layer's decay).
+A null result is therefore ambiguous between "the objective does not work" and
+"one of sixteen memories got the job". The per-layer variant — 16× the head's
+flops — is pre-specified as a **second** arm, not a variant of this one.
