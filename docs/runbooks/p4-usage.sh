@@ -50,21 +50,34 @@
 #   same seed. Their VERDICT is the spread; arm 0 is what makes their CE
 #   comparable.
 #
-# WHY B=256 AND --trace-mode dense
-#   Two reasons, and the second is the important one.
+# WHY B=256, --ring-k 14, AND TMT_TAIL=0
+#   Three constraints, each found by running the arm and measuring it.
 #
-#   1. MEMORY. The P4 init drives ring_k to 256 (it is inferred from
+#   1. MEMORY: the P4 init drives ring_k to 256 (it is inferred from
 #      sigma_max), and the ring's per-layer buffer is (B, 256, dim): 8.6 GB
-#      at B=1024, 2.15 GB at B=256. On a 4 GB card the P4 arm OOMs at
-#      B=1024. The dense trace is the same object size (2.15 GB at B=256)
-#      and fits, at 2.46 GB peak.
+#      at B=1024, 2.15 GB at B=256. The P4 arm OOM'd on a 4 GB card at
+#      B=1024. B=256 with ring_k=14 is 117 MB.
 #
-#   2. THE CREDIT REACH MUST BE HELD CONSTANT. With the ring, the default
-#      init gets ring_k=14 and the P4 init gets ring_k=256 -- so the arms
-#      would differ in how far back credit reaches, and the 2x2 would be
-#      measuring the trace reach as well as the init. The dense trace has no
-#      cap, so BOTH arms get the same exact credit and the only difference
-#      is the init and the weight decay. That is the 2x2.
+#   2. THE CREDIT REACH MUST BE HELD CONSTANT ACROSS THE 2x2. With the
+#      inferred ring_k, the default init gets 14 and the P4 init gets 256 --
+#      so the arms would differ in how far back credit reaches, and the 2x2
+#      would measure the trace reach as well as the init. Hence the EXPLICIT
+#      --ring-k 14 for every arm: identical credit reach, so the only
+#      difference between the arms is the init and the weight decay.
+#
+#   3. THE TAIL MUST BE OFF, or the arm takes 18 hours. The P4 init makes
+#      239 dims per layer "hot" (sigma**K > 1%), so the tail's accumulator is
+#      (B, 256, 239) per layer -- 1.0 GB at B=256 -- and its per-byte work
+#      dominates everything else: with the tail on, the P4 arm ran at under
+#      250 B/s, and the DENSE trace (which is the same object with every dim
+#      hot) ran at 127 B/s. With TMT_TAIL=0 the same arm runs at 3490 B/s.
+#
+#   Is dropping the tail a handicap on the answer? NO, and the reason
+#   matters: the SPREAD's fate is decided by the `.decay` gradient, which
+#   comes from the unbounded `decaytrace` recurrence -- not from the ring and
+#   not from the tail. The tail only affects the EMBEDDING's credit. So the
+#   tail can be off and the spread's fate is still measured correctly, and
+#   both arms of the 2x2 share the setting, so their CEs are comparable.
 #
 # USAGE
 #   bash docs/runbooks/p4-usage.sh
@@ -83,12 +96,12 @@ mkdir -p "$OUT"
 
 run_arm () {   # name  half_min  half_max  wd_decay
   local name="$1" hmin="$2" hmax="$3" wd="$4"
-  echo "=== arm $name: half_min=$hmin half_max=$hmax wd_decay=$wd (FROM SCRATCH, B=$B, dense) ==="
+  echo "=== arm $name: half_min=$hmin half_max=$hmax wd_decay=$wd (FROM SCRATCH, B=$B, ring_k=14, tail off) ==="
   local hl=()
   if [ "$hmin" != "0" ]; then hl=(--half-min "$hmin" --half-max "$hmax"); fi
-  $V train_gpu.py "$OUT/$name.npz" train --dataset "$D" --batch "$B" \
-     --seqlen 1 --steps "$STEPS" --warmup 20 --no-tagged \
-     --trace-mode dense "${hl[@]}" --wd-decay "$wd" \
+  TMT_TAIL=0 $V train_gpu.py "$OUT/$name.npz" train --dataset "$D" \
+     --batch "$B" --seqlen 1 --steps "$STEPS" --warmup 20 --no-tagged \
+     --ring-k 14 "${hl[@]}" --wd-decay "$wd" \
      --device cuda --seed 0 > "$OUT/$name.log" 2>&1
   tail -2 "$OUT/$name.log"
   $V tools/inspect_halflives.py "$OUT/$name.npz"

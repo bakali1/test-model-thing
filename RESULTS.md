@@ -3319,3 +3319,187 @@ effect are not separable at one byte budget. That is the honest shape of the
 experiment, and it is why the arms are T=1, 4, 16 rather than 1 and 16: the
 monotone ordering across three points is what distinguishes "the package is
 better" from "the credit effect is real".
+
+---
+
+## The T-axis A/B: T=1 wins at this scale, and the reason is the updates (2026-10-13)
+
+The plan's P1 puts `seqlen` (T) first because the T axis is the prerequisite
+for multi-token prediction, and because lowering B in exchange was supposed
+to make the ring deletable. The GPU measurement killed the second half
+(finding 9 above) and left the first. This is the quality half: three arms
+from the same trained incumbent, all consuming the same 8.39 MB of the same
+corpus in the same order, differing only in T.
+
+**Family A — matched BYTES (8.39 MB each, resumed from the incumbent at
+t=919,897, ring_k=18, held-out CE 1.2094 ± 0.0143):**
+
+| arm | windows | bytes | optimizer updates | within-window credit | held-out CE |
+|---|---:|---:|---:|---:|---:|
+| incumbent | 0 | 0 | 0 | — | 1.2094 ± 0.0143 |
+| **T=1** | 8192 | 8.39 MB | **8192** | 0 B | **1.1272 ± 0.0225** |
+| T=4 | 2048 | 8.39 MB | 2048 | 4 B | 1.2210 ± 0.0211 |
+| T=16 | 512 | 8.39 MB | 512 | 16 B | 1.1867 ± 0.0203 |
+
+**Family B — matched UPDATES (512 each, resumed from the same incumbent):**
+
+| arm | windows | bytes | updates | held-out CE |
+|---|---:|---:|---:|---:|
+| T=1 | 512 | 0.52 MB | 512 | 1.1377 ± 0.0180 |
+| T=4 | 512 | 2.10 MB | 512 | 1.1350 ± 0.0170 |
+| T=16 | 512 | 8.39 MB | 512 | 1.1867 ± 0.0203 |
+
+**What this says.**
+
+1. **T=1 wins, and by more than noise.** T=1 at 1.1272 is 0.059–0.094 nats
+   better than T=4 and T=16 at matched bytes (2.6–3.8σ), and T=16 is also
+   behind at matched updates (0.050, 2.5σ). The two families agree, and they
+   were built to be biased in opposite directions (matched bytes gives T=16
+   16× fewer updates → less overfitting → *for* T=16; matched updates gives
+   it 16× more bytes of an already-seen corpus → more repetition → *against*
+   T=16). A split verdict would have told us which effect dominates; both
+   point the same way.
+2. **The effect is the update count, not the credit.** At matched updates,
+   T=1 (0.52 MB) and T=4 (2.10 MB) are indistinguishable (1.1377 vs 1.1350,
+   0.15σ) — the extra bytes bought nothing at equal updates — while the arm
+   with 16× fewer updates per byte is behind. The within-window credit is
+   exact (tests/check_trace_bptt.py: 5e-3 within the window, verified on CPU
+   and CUDA), and it does not pay for the updates it costs.
+3. **The regime caveat, which is the honest headline.** The incumbent sits at
+   ~5.7 epochs of its 165 MB corpus, and T=1's extra 0.05 epoch *improved*
+   the held-out CE by 0.082 nats — so this model is still UNDERFITTING, not
+   overfitting. In that regime, starving an arm of optimizer updates is
+   simply a handicap, and the T axis pays that handicap for a credit effect
+   that does not show up. The regime where T's update-starvation becomes an
+   ADVANTAGE is the overfitting one — upstream measured 14 epochs > 24 epochs
+   (#23) and 1.63 BPB > 1.82 BPB — and the incumbent is 2.4 epochs short of
+   it (941 MB more, ≈ 3 days on the MX150, ≈ 1 day on a T4). **This A/B
+   therefore does not rule the T axis out; it locates the regime where the
+   question is worth asking.** That is the next experiment, not this one.
+4. **The T=1 arms' own gain is mostly early.** T=1 at 512 updates already
+   reads 1.1377, against 1.1272 at 8192 updates: the difference (0.0105) is
+   inside the error bars, so 0.05 epoch of extra training bought ~0.08 nats
+   and the first 0.03 epoch bought most of it.
+
+**What this does NOT change.** The T axis is still free (1.09× per byte at
+constant B), still the prerequisite for a *windowed* MTP, and its gradient is
+still exact within the window. It just does not pay for itself as a way to
+buy memory in a model that is still underfitting.
+
+### The P4 init has the memory bill the plan priced for the dense trace
+
+Found by an OOM while launching the P4 arms, and it belongs in the plan's
+section 1 table:
+
+`ring_k` is inferred from `sigma_max`, and the log-spaced init pushes
+`sigma_max` to 0.9986, so **ring_k saturates at 256** and the ring's
+per-layer buffer becomes `(B, 256, dim)` — **8.6 GB at B=1024**, 2.15 GB at
+B=256. The P4 arm OOM'd on a 4 GB card at B=1024. The plan priced that bill
+for the *dense* trace and did not notice that the **ring** costs the same
+once `ring_k` saturates, so "delete the ring and lower B" was never going to
+be free at `--half-max 512`.
+
+And the dense path was paying it twice: `new_states` allocated the ring's
+`(B, 256, dim)` buffer *and* the dense trace *and* the tail's `(B, 256, H)`
+accumulator — 2.15 GB + 2.15 GB + 1.0 GB at B=256 — for buffers the dense
+path never reads. All three are now allocated empty on that path. Measured
+peak CUDA with the P4 init:
+
+| B | ring | dense |
+|---|---|---|
+| 256 | 3.55 GB | **2.46 GB** (was OOM) |
+| 512 | OOM | OOM |
+| 1024 | OOM | OOM |
+
+`check_dense_trace.py` and `check_parity.py` both still PASS (the dense
+path's 0.00e+00 agreement with ring+tail is unchanged — the gate compares a
+dense model against a ring+tail model, and it is the dense model that no
+longer carries a dead buffer).
+
+**This changes the P4 experiment, not just its budget.** With the ring, the
+default init gets `ring_k=14` and the P4 init gets `ring_k=256` — so the 2×2
+would have measured the *credit reach* as well as the init. The dense trace
+has no cap, so at B=256 both arms get the same exact credit and the only
+difference is the init and the weight decay. That is the 2×2.
+
+---
+
+## The P4 usage arms: the init buys the capacity, the weight decay destroys it, and training does not (2026-10-13)
+
+The capacity probe (above) measured the CAPACITY half of P4 with no training.
+This is the USAGE half: the first training run of a log-spaced-init model that
+has ever happened, and the first measurement of whether the spread survives
+the optimizer. Three arms, all FROM SCRATCH (a different init cannot resume an
+incumbent), 8.39 MB each = 0.2 epoch of the 41 MB file, B=256, ring_k=14,
+tail off, same seed, same file:
+
+| arm | init | `wd_decay` | mean half-life | dims > 8 B | held-out CE |
+|---|---|---:|---:|---:|---:|
+| (reference) fresh P4, untrained | 2…512 B | — | 92.30 B | 6144 | — |
+| **`armFS_p4_wd0`** | 2…512 B | **0.0** | **89.48 B** | **6103** | 1.8834 ± 0.0309 |
+| `armFS_p4_wd001` | 2…512 B | 0.01 | 39.07 B | 5485 | 1.6907 ± 0.0333 |
+| `armFS_default_wd001` (control) | default | 0.01 | 1.02 B | 0 | 1.4085 ± 0.0271 |
+
+### The retention curve — the memory verdict
+
+matched-pair signal ÷ random-byte control floor, the ruler's own instrument:
+
+| model | d=8 | d=32 | d=128 | d=512 |
+|---|---:|---:|---:|---:|
+| fresh P4, untrained | 49.2% | 21.0% | 5.8% | 1.05% |
+| **trained P4, `wd_decay=0`** | **36.6%** | **17.1%** | **5.5%** | **0.91%** |
+| trained P4, `wd_decay=0.01` | 35.4% | 15.4% | 4.0% | 0.34% |
+| trained default init (control) | 0.43% | 0.00% | 0.00% | 0.00% |
+| TRAINED incumbent (t=919,897, 5.7 epochs) | 4.8% | 1.7% | 0.36% | 0.0007% |
+
+**Three results, and they re-order the plan.**
+
+1. **The bottleneck has moved.** A model trained with the P4 init retains a
+   signal **128 bytes out** — 5.5% of the control floor, **15× the
+   incumbent's 0.36%**, and against **0.00%** for the default-init control
+   trained on the same bytes with the same seed. The incumbent's ruler
+   verdict ("the model does not retain information past ~64 bytes") was a
+   statement about the *incumbent's init*, and it is no longer the ceiling of
+   what this architecture can do.
+2. **P6 is the mechanism, and it is now measured.** The weight decay on the
+   decay logits is what erodes the spread: without the exemption the mean
+   half-life falls 92.30 → 39.07 B (−58%) in 0.2 epoch, and the d=128
+   retention falls from 5.5% to 4.0% (−27%); with it, 92.30 → 89.48 B (−3%)
+   and 5.8% → 5.5%. `sigma(0) = 0.5` is exactly a 1-byte half-life, so that
+   weight decay is a systematic pull toward no memory — the plan's argument,
+   confirmed by a 2×2 rather than by a mechanism sketch. **P4 and P6 are one
+   change, not two.**
+3. **Finding 7 does not reproduce here.** "Gradient descent undoes the
+   log-spaced init within one epoch" was measured on TinyStories with TBPTT
+   K=32 and 3 seeds. With the weight decay exempted, the spread is
+   essentially intact after 8.39 MB (0.2 epoch): 89.48 B against a fresh
+   92.30 B, and 5.5% against a fresh 5.8% at d=128. Whatever destroyed the
+   spread in that experiment, the weight decay is a sufficient explanation
+   for it here.
+
+### What it does NOT fix
+
+**The model now holds a long-memory signal and still cannot use it.** Every
+copy/retrieval arm is at chance for every model in this log, including the
+P4 arms: the readout never beats its own permuted-label veto (selective copy
+and associative retrieval, d=8…512). And the long channels cost local CE:
+the P4 arms read 1.8834 and 1.6907 nats/byte against the default-init
+control's 1.4085 at the same byte budget. So:
+
+* the **capacity** axis is now closed — the model has channels that can hold
+  a 512 B signal, and they survive training;
+* the **usage** axis is untouched, and the bottleneck has moved to the
+  WRITE/READ path: a state that is a linear, order-losing EMA of raw byte
+  embeddings can hold a signal's *magnitude* out to 128 B, but a linear
+  readout of an order-losing sum cannot answer "what did I see 128 bytes
+  ago". This is the plan's §5 fallback arriving on schedule — the remaining
+  deficit is architectural, not a batching, credit or optimization problem —
+  and it names two candidates: **P3's gate** (an input-dependent retention
+  factor, i.e. the write side) and the **hierarchical wiring** (the CUDA
+  fork's answer, where the state carries features rather than bytes, the read
+  side).
+
+**The honest one-line reading:** the plan's P4+P6 is done and measured, the
+memory problem is no longer a capacity problem, and the next month is about
+the write path and the readout — not about the init, not about the T axis,
+and not about the ring.

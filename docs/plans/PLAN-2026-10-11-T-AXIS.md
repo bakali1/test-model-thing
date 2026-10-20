@@ -46,6 +46,9 @@ fork `SimonVitzethum/test-model-thing-CUDA` at `2cfdf41` (`tmt-cuda/`,
 | 10 | The gate suite had **never run on a GPU**: four device bugs (the probe, the P1 gate, the parity gate, and three gates that silently became CUDA gates) and five hardcoded absolute paths. | 2026-10-12 | Every gate in §2 is a **CPU** gate until it says otherwise; "the P1 gate passes" meant "on a CPU". `check_seqlen_credit.py --device cuda` now exists and passes with identical numbers. |
 | 11 | **The P4 init buys the capacity the plan says it buys.** 0-training probe (fresh model, default vs P4 init): retention 0.4%/0%/0% vs **49%/21%/5.8%** of the control floor at d=8/32/128. And the TRAINED incumbent retains **4.8%/1.7%/0.36%** — *less than a fresh P4 model at every distance*. | 2026-10-12, `tools/capacity_probe.py`, `tests/check_p4_capacity.py` | The capacity half of "the cause is the init" is **confirmed**. The sufficiency half is **false**: training gives the capacity back. P4 must be paired with P6 (and probably P3) or the spread is trained away. |
 | 12 | **MTP needs no T window.** Upstream's `50338c8` adds `mtp=K` heads that predict the byte K positions ahead *from the same representation* — no window is involved. | 2026-09-22, `tmt-cuda` `origin/zig-kernels` | P5's premise ("possible only because P1 exists") is **false**. P5 can run in parallel with P1, and upstream's implementation is a reference. |
+| 13 | **A trained model with the P4 init retains a signal 128 B out.** 0-training probe: 49.2/21.0/5.8% of the control floor at d=8/32/128 (default init: 0.40/0/0%). After 8.39 MB of training with `wd_decay=0`: **36.6/17.1/5.5/0.91%** — against the TRAINED incumbent's 4.8/1.7/0.36/0.0007% and the default-init control's 0.43/0/0/0%. | 2026-10-13, `runs/taxis/`, `docs/runbooks/p4-usage.sh` | **The capacity axis is CLOSED.** The bottleneck has moved from "no long-lived channel" to "a channel it cannot read out of". P4+P6 are ONE change and both are done. Finding 7 does not reproduce. |
+| 14 | **The weight decay on the decay logits is what erodes the spread.** Same init, same bytes: `wd_decay=0.01` → mean half-life 92.30 → **39.07 B** (−58%) and d=128 retention 5.8 → 4.0%; `wd_decay=0` → **89.48 B** (−3%) and 5.8 → 5.5%. | 2026-10-13 | P6 is not a cleanup, it is the mechanism. The plan's P4 without P6 measures the wrong thing. |
+| 15 | **The T axis does not pay at this scale.** Matched bytes: T=1 **1.1272**, T=4 1.2210, T=16 1.1867 nats/byte (incumbent 1.2094). Matched updates: T=1 1.1377, T=4 1.1350, T=16 1.1867. The two families are biased in opposite directions and both say T=1. | 2026-10-13, `docs/runbooks/taxis-ab.sh` | The effect is the **update count**, not the credit. But the incumbent is at 5.7 epochs and still *underfitting*, and the regime where T's update-starvation becomes an advantage is the overfitting one (upstream: 14 epochs > 24). **This locates the regime, it does not settle the axis.** |
 
 ---
 
@@ -546,14 +549,44 @@ what the next person should read.
    lesson generalises past this repo: a gate that has only ever run on one
    device is a statement about that device.
 
+### 7.2b What the measurements changed about the order (2026-10-13)
+
+The P4 usage arms moved the memory problem. Before them, the plan's opening
+move was P4 (the init). After them:
+
+* **P4 + P6 are DONE and measured.** A trained model with the log-spaced init
+  and the decay group exempt from weight decay holds a signal 128 B out —
+  15x the incumbent, against 0% for the default-init control on the same
+  bytes. The capacity axis is closed.
+* **The bottleneck moved to the WRITE/READ path.** Every copy/retrieval arm
+  is still at chance for every model, including the P4 arms, and the long
+  channels cost local CE (1.8834 / 1.6907 vs the control's 1.4085 at the
+  same byte budget). A linear, order-losing EMA of raw byte embeddings can
+  hold a signal's magnitude out to 128 B, and a linear readout of an
+  order-losing sum cannot answer "what did I see 128 bytes ago". So the next
+  month is about the write path and the readout, not about the init.
+* **P1's A/B says T=1 wins HERE** (1.1272 vs 1.1867/1.2210), and the reason
+  is the update count rather than the credit. The regime caveat is the
+  honest part: the incumbent is at 5.7 epochs and still underfitting, and the
+  overfitting regime (upstream's 14-epoch point) is where T's update
+  starvation would become an advantage. That is a ~1-day T4 run away, not a
+  ~3-day MX150 run.
+* **P2's dense trace is cheaper than the ring in MEMORY but not in COMPUTE.**
+  It is O(B*256*dim) element-ops per byte -- 536M per byte at B=256, 18x the
+  ring's credit work -- and it measured 127 B/s against the ring's 3490 B/s.
+  The plan priced the dense trace's memory and never its compute.
+
 ### 7.3 The corrected priority order
 
 1. **P0-3** (NaN guard + clip) — DONE.
 2. **P6** (per-group wd) — DONE. It is a prerequisite for a P4 arm, not a
    cleanup: without it, the weight decay undoes the P4 init and the A/B
    measures the wrong thing.
-3. **The P4 usage A/B** — `(wd_decay 0.01/0.0) × (default init / P4 init)`,
-   with the retention ruler as the verdict, not only CE.
+3. **~~The P4 usage A/B~~ — DONE 2026-10-13.** `(wd_decay 0.01/0.0) ×
+   (default init / P4 init)`, with the retention ruler as the verdict, not
+   only CE. Verdict: the init buys the capacity, the weight decay destroys
+   it, training does not, and the model still cannot use what it now holds.
+   The next item is therefore the WRITE PATH, not the init.
 4. **P1's A/B at B=1024** — the T axis, measured at matched bytes with the
    update count reported.
 5. **P7** (document resets) — the only credit condition upstream measured as
