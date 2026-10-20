@@ -254,6 +254,12 @@ def main():
     print("is wrong by a factor that scales with the memory it is supposed to")
     print("create is worse than no gate at all.")
     print()
+    print("The exact deviations are draw-dependent -- the CLAIM is the pattern:")
+    print("the plain form is wrong on the engine's own gradient, the trace is")
+    print("exact on it, the plain form is exact on the total gradient, and the")
+    print("trace on the total gradient double counts. Change --seed and the")
+    print("numbers move; the verdict does not.")
+    print()
 
     # The verdict is about the pair the ENGINE can actually form: the gate
     # trace on the readout-only gradient. The other two rows are the

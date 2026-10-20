@@ -22,26 +22,44 @@ WHAT IS VERIFIED HERE
   (c) the gate has real authority over the loss, and the arm refuses BEFORE any
       state moves.
 
-WHAT IS DELIBERATELY NOT CLAIMED
-  The gate gradient. It is implemented in gpu_port.step_batch but is UNVERIFIED,
-  and two independent references agree that it is wrong as written: torch
-  autograd on the same recurrence, and a central finite difference of the loss,
-  both disagree with the engine's formula. Measured at dim=8 layers=2 B=3 T=4
-  with the gate perturbed to linspace(-0.7, 0.9):
+THE GATE GRADIENT: KNOWN NOW, AND PINNED ELSEWHERE
+  This file used to say the gate gradient was UNKNOWN and that the missing
+  pieces were (i) the cross-time chain in ds_t/da_t and (ii) the state
+  gradient passing back through the layer norm and the z*sigmoid(z) gated
+  linear PER LAYER. Both were real, and both are now settled:
 
-      dL/dgate   engine vs autograd   max rel dev 4.59 (layer0), 8.19 (layer1)
-      dL/ddecay  engine vs autograd   max rel dev 2.99 (layer0), 4.74 (layer1)
-      dL/dgate   engine vs finite-diff max rel dev 11.7 (layer0), 22.4 (layer1)
+    * the CHAIN: the gate enters a_t at time t only, but a_t keeps
+      multiplying s_{t-1} into every later state, so the gate's derivative
+      carries the same cross-time chain the decay's `decaytrace` already
+      carries -- plus the x_t factor, because the gate reaches a_t through
+      gate * x_t:
 
-  The missing pieces, for whoever picks this up: ds_t/da_t must carry the
-  cross-time chain (what `decaytrace` already does for the ungated engine, and
-  what a naive per-byte transcription drops), and the state gradient has to pass
-  back through the layer-norm and the z*sigmoid(z) gated linear per layer, not
-  through a single decoder-level dx. This is the same class of bug the T-axis
-  plan is about: a plausible gradient that is quietly wrong.
+          gatetrace_t = a_t*gatetrace_{t-1} + a_t(1-a_t)*x_t*s_{t-1}
+          dL/dgate    = sum_t dL/ds_t * gatetrace_t
 
-  A gate that fails on an unverified gradient is the correct outcome; one that
-  passes by testing only the easy half is not.
+      with the READOUT-ONLY dL/ds_t -- the one the engine's per-byte backward
+      produces, because the states are stop_gradient there. The trace is what
+      rebuilds the chain the engine does not have. (The four-way truth table
+      -- plain/trace x readout-only/total dL/ds_t -- is measured in
+      tools/gate_grad_probe.py: the plain form on the readout-only gradient
+      is wrong, the trace on it is exact, the plain form on the TOTAL gradient
+      is exact too but the engine does not have the total, and the trace on
+      the total double counts the chain.)
+    * the engine's own line was ALSO summing the wrong axis: `dec[None, :]`
+      on a (B, dim) dec broadcasts to (1, B, dim), so `.sum(dim=0)` summed an
+      axis of size 1 -- nothing was summed over the batch, and the result
+      kept a batch axis a (dim,) gate parameter cannot have.
+
+  The gradient is therefore no longer "unknown": it is implemented
+  (gpu_port.gate_gradient / numpy_port.gate_gradient) and pinned against
+  torch autograd AND against a central finite difference of the loss by
+  tests/check_gate_grad.py. That file is the one to read for the gradient;
+  this one keeps the claims that are about the ARM, and the refusal.
+
+  What is still NOT claimed here: that the gated arm can RUN. It cannot, and
+  the blocker is the per-sample CREDIT machinery (the ring credit, the tail
+  and ring_k's inference), not the gradient. That is a separate, larger piece
+  of work -- PLAN-2026-10-11-T-AXIS.md P3.
 
 The plan wrote the update as s = a*s + (1-a)*x. That form cannot satisfy (a):
 (1-a) is not 1.0, so gate=0 would still not reproduce the incumbent and the
@@ -148,8 +166,8 @@ def _loss(m, cs, ns, ends, force_ungated=False):
 
 
 def main():
-    print("P3 GATE (part 1: verified claims only -- the gate gradient is NOT "
-          "claimed, see the module docstring)")
+    print("P3 GATE (part 1: the ARM's claims -- the gate GRADIENT is pinned by "
+          "tests/check_gate_grad.py, see the module docstring)")
     print(f"  dim={DIM} layers={LAYERS} B={B} T={T} seed={SEED}\n")
 
     cs, ns, ends = batch(SEED)
@@ -182,7 +200,7 @@ def main():
           f"{n_gate} params == {LAYERS}*{DIM}")
 
     # ---- (c) the arm refuses, before any state moves --------------------
-    print("\n(c) the gated ARM refuses rather than emitting a wrong gradient")
+    print("\n(c) the gated ARM refuses rather than emitting a wrong credit")
     snap = (a.theta.detach().clone(), a.m.detach().clone(), a.t)
     try:
         a.new_states(B)
