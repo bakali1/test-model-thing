@@ -180,7 +180,8 @@ class Trainer:
                  measure_after=0, verify_final=False, distill_dir=None,
                  distill_alpha=0.0, distill_block=32, distill_repo=None,
                  distill_null_target=False, distill_floor=0.05,
-                 ce_only=False, seqlen=1, **model_kw):
+                 ce_only=False, seqlen=1, fsp_alpha=0.0, fsp_r=16, fsp_tau=64,
+                 fsp_pos_weight=50.0, fsp_layer=-1, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -243,6 +244,38 @@ class Trainer:
                   f"--seqlen together. Measured on CPU at matched B*T "
                   f"(tools/seqlen_probe.py): B=64,T=16 is 0.87x of B=1024,T=1 "
                   f"per byte; B=16,T=64 is 0.45x.")
+        # ---- FSP: the Future State Prediction auxiliary loss -------------
+        #
+        # From FlashLM (Chang, May 2026) §3.1: at every r-th position the
+        # model predicts WHICH bytes appear in the next tau bytes, as a
+        # binary multi-hot, with BCE (pos_weight 50); L = CE + alpha*FSP.
+        #
+        # Why it fits this model: a recurrent byte model has exactly one place
+        # where context can live -- the state -- and next-byte CE only asks the
+        # OUTPUT (one step ahead) to be right. It never asks the STATE to be
+        # usable later, which is the measured gap: the state can HOLD a signal
+        # 128 B out while every copy/retrieval probe stays at chance. FSP puts
+        # a read-out on the state and asks it about the future, so the state
+        # is pushed to carry forward-looking content in a readable form. The
+        # gradient lands on the state, and from there the engine's existing
+        # machinery credits it to the embedding (the ring) and to the decay
+        # logits (the decaytrace) -- i.e. it reaches the MEMORY, not just the
+        # read-out.
+        self.fsp_alpha = float(fsp_alpha)
+        self.fsp_r = int(fsp_r)
+        self.fsp_tau = int(fsp_tau)
+        self.fsp_pos_weight = float(fsp_pos_weight)
+        self.fsp_layer = int(fsp_layer)
+        if self.fsp_alpha > 0.0:
+            model_kw["fsp_alpha"] = self.fsp_alpha
+            model_kw["fsp_r"] = self.fsp_r
+            model_kw["fsp_tau"] = self.fsp_tau
+            model_kw["fsp_pos_weight"] = self.fsp_pos_weight
+            model_kw["fsp_layer"] = self.fsp_layer
+            print(f"  [fsp] Future State Prediction ON: alpha={self.fsp_alpha} "
+                  f"r={self.fsp_r} tau={self.fsp_tau} "
+                  f"pos_weight={self.fsp_pos_weight} layer={self.fsp_layer} "
+                  f"(state read-out -> bag of the next {self.fsp_tau} bytes)")
         self.model = GpuModel(device=str(device), seed=seed, **model_kw)
         self.path = path
         self.seed = int(seed)
@@ -335,7 +368,37 @@ class Trainer:
             t1 = min(t0 + T, L)
             yield (mats[t0:t1].t().contiguous(),
                    mats[t0 + 1:t1 + 1].t().contiguous(),
-                   ets[t0:t1].t().contiguous(), t1 - t0)
+                   ets[t0:t1].t().contiguous(), t1 - t0, t0)
+
+    def _fsp_args(self, mats, t0, Tw):
+        """The FSP target for the window that starts at byte t0.
+
+        The FSP position is the FIRST byte of the window -- the paper's
+        positions {0, r, 2r, ...} along the byte stream -- and its target is
+        the bag of the next `tau` bytes. Only one window in r carries a
+        target, so the scatter below runs on a fraction of the steps.
+
+        Returns (mask, targets) or None. The mask is a host-side tuple of
+        ints (one per byte of the window) because the engine branches on it
+        per byte, and a device mask would need a `.item()` -- a GPU sync per
+        byte, which is exactly the cost the tail-rebase comment warns about.
+        """
+        if self.fsp_alpha <= 0.0 or (t0 % self.fsp_r) != 0:
+            return None
+        hi = min(t0 + 1 + self.fsp_tau, mats.shape[0])
+        fut = mats[t0 + 1:hi]                      # (<=tau, B) int64
+        B = fut.shape[1]
+        tgt = torch.zeros(B, 256, dtype=torch.float32, device=self.device)
+        if fut.numel() > 0:
+            flat = fut.reshape(-1)
+            # row-major over (tau, B): the batch index of flat element i is
+            # i % B, so the flat destination is (batch * 256 + byte value).
+            idx = (torch.arange(flat.numel(), device=self.device) % B) * 256 + flat
+            tgt.view(-1).scatter_(0, idx, 1.0)
+            tgt.clamp_(max=1.0)                    # a repeated byte is still one
+        out = torch.zeros(B, Tw, 256, dtype=torch.float32, device=self.device)
+        out[:, 0, :] = tgt
+        return ((1,) + (0,) * (Tw - 1), out)
 
     def train(self, save, dataset, hub_repo=None):
         m = self.model
@@ -401,8 +464,8 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
-                for c, n_, e_, Tw in self._windows(mats, ets, L):
-                    m.step_batch(c, n_, e_)
+                for c, n_, e_, Tw, t0 in self._windows(mats, ets, L):
+                    m.step_batch(c, n_, e_, self._fsp_args(mats, t0, Tw))
                     wsteps += 1
                     if wsteps >= self.warmup:
                         break
@@ -490,8 +553,9 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
-                for c, n_, e_, Tw in self._windows(mats, ets, L):
-                    loss = m.step_batch(c, n_, e_)
+                for c, n_, e_, Tw, t0 in self._windows(mats, ets, L):
+                    loss = m.step_batch(c, n_, e_,
+                                        self._fsp_args(mats, t0, Tw))
                     if self.telemetry is not None:
                         self.telemetry.observe(loss, m.last_ce)
                         if m.t == self.start_t + self.measure_after:
@@ -552,9 +616,16 @@ class Trainer:
                         # only at the logging boundary, not once per step.
                         loss_value = float(loss_win / n_win)
                         ce_value = float(ce_win / n_win)
+                        fsp_txt = ""
+                        if self.fsp_alpha > 0.0 and m.fsp_positions:
+                            # The FSP term is printed separately, like the CE:
+                            # the two are on different scales (the CE is in
+                            # nats/byte, the FSP is a weighted BCE), and a
+                            # single blended "loss" would hide which one moved.
+                            fsp_txt = f" | fsp {m.last_fsp:.3f}"
                         print(f"  {total/1e6:.1f} MB | {total/dt:.0f} B/s | "
                               f"step {m.t} | loss {loss_value:.3f} | "
-                              f"ce {ce_value:.3f}", flush=True)
+                              f"ce {ce_value:.3f}{fsp_txt}", flush=True)
                         loss_win = ce_win = 0.0
                         n_win = 0
 
@@ -774,6 +845,35 @@ def main():
                          "weight decay at 0, --lr-decay also stops scaling a "
                          "weight-decay term, which is the 'knob wired to a "
                          "trap' this plan flagged.")
+    ap.add_argument("--fsp-alpha", type=float, default=0.0,
+                    help="FSP: the weight of the Future State Prediction "
+                         "auxiliary loss (FlashLM, Chang 2026, §3.1). 0 = off "
+                         "(the default, so every existing arm and checkpoint "
+                         "is untouched). Above 0, the model grows a read-out "
+                         "head on the RECURRENT STATE and is asked, every "
+                         "--fsp-r bytes, to predict WHICH bytes appear in the "
+                         "next --fsp-tau bytes (a binary multi-hot, BCE with "
+                         "--fsp-pos-weight). The total loss is CE + alpha*FSP. "
+                         "The point in a recurrent model: next-byte CE only "
+                         "asks the OUTPUT to be right, never the STATE, so "
+                         "the state can hold a signal 128 B out that no "
+                         "read-out can use. The head's gradient lands on the "
+                         "state, and the engine's existing credit machinery "
+                         "carries it to the embedding and to the decay logits.")
+    ap.add_argument("--fsp-r", type=int, default=16,
+                    help="FSP: take an FSP position every r bytes (the "
+                         "paper's r=16).")
+    ap.add_argument("--fsp-tau", type=int, default=64,
+                    help="FSP: the target is the bag of the next tau bytes "
+                         "(the paper's tau=64).")
+    ap.add_argument("--fsp-pos-weight", type=float, default=50.0,
+                    help="FSP: the BCE positive-class weight (the paper's "
+                         "50). The future window holds a handful of distinct "
+                         "bytes out of 256, so without it the head predicts "
+                         "'nothing is coming' forever.")
+    ap.add_argument("--fsp-layer", type=int, default=-1,
+                    help="FSP: which layer's state the head reads (-1 = the "
+                         "last, i.e. the one closest to the output).")
     ap.add_argument("--distill-repo", default=None,
                     help="HF repo for the teacher's tokenizer.json "
                          "(default $TMT_TEACHER)")
@@ -847,6 +947,11 @@ def main():
                     if args.half_min is not None and args.half_max is not None
                     else None),
                 seqlen=args.seqlen,
+                fsp_alpha=args.fsp_alpha,
+                fsp_r=args.fsp_r,
+                fsp_tau=args.fsp_tau,
+                fsp_pos_weight=args.fsp_pos_weight,
+                fsp_layer=args.fsp_layer,
                 trace_mode=args.trace_mode,
                 grad_clip=args.grad_clip,
                 nan_guard=not args.no_nan_guard,

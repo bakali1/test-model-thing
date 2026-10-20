@@ -115,24 +115,43 @@ class Layer:
         self.g = np.ones(dim, F)
         self.b = np.zeros(dim, F)
         self.decay = rng.uniform(-lim, lim, (dim,)).astype(F)
+        # P3 gate. `gate` is a per-dim vector of LOGITS added to the decay
+        # logit, so a = sigmoid(decay + gate * x_in). It exists only in the
+        # gated arm: the default engine's theta layout -- and therefore
+        # check_parity's numpy==torch identity -- must stay untouched.
+        self.gate = None
+        self.gated = False
 
-    def adopt_views(self, W, g, b, decay):
+    def adopt_views(self, W, g, b, decay, gate=None):
         """Rebind params to views into the model's flat buffer."""
         self.W, self.g, self.b, self.decay = W, g, b, decay
+        self.gate = gate
+        self.gated = gate is not None
 
     def forward(self, enc, x_in, states):
-        """enc, x_in, states: (B, dim). Returns new x, new_states, decay, cache."""
-        decay = sigmoid(self.decay)                      # (dim,)
-        state = states * decay + enc                     # (B, dim)
+        """enc, x_in, states: (B, dim). Returns new x, new_states, a, cache."""
+        if self.gated:
+            # a = sigmoid(decay + gate * x_in): PER-SAMPLE (B, dim), because
+            # the gate makes the retention depend on the input. gate=0 at
+            # init makes this EXACTLY the incumbent: 0.0 * x_in is an exact
+            # zero and decay + 0.0 == decay, so a == sigmoid(decay)
+            # bit-for-bit.
+            a = sigmoid(self.decay[None, :] + self.gate[None, :] * x_in)
+        else:
+            a = sigmoid(self.decay)                      # (dim,)
+        state = states * a + enc                         # (B, dim)
         h, cache = batch_layernorm(state, self.g, self.b)
         z = h @ self.W.T                                 # GEMM (B, dim)
         sig = sigmoid(z)
         y = z * sig                                      # silu
-        return x_in + y, state, decay, (z, sig, h, cache)
+        # x_in is returned because the gate reaches a_t through gate * x_in:
+        # x_in is a factor of the gate's cross-time trace, not just of the
+        # local term (see gate_trace_update).
+        return x_in + y, state, a, (z, sig, h, cache, x_in)
 
     def backward(self, dx_out, cache):
         """dx_out: (B, dim). Returns dx_in, dW, dg, db, dstate."""
-        z, sig, h, ln_cache = cache
+        z, sig, h, ln_cache = cache[:4]
         dx_in = dx_out
         dz = dx_out * sig * (1.0 + z * (1.0 - sig))      # silu'
         dW = dz.T @ h                                    # GEMM (dim, dim)
@@ -141,12 +160,60 @@ class Layer:
         return dx_in, dW, dg, db, dstate
 
 
+# ---------------------------------------------------------------------------
+# The P3 gate gradient -- the numpy mirror of gpu_port's, element for element.
+#
+# The gate makes the retention input-dependent, a_t = sigmoid(decay + gate*x_t),
+# so the gate enters a_t at time t ONLY -- but a_t does not stop at s_t: it
+# multiplies s_{t-1} into s_t, and s_t then keeps propagating, multiplied by
+# every later a. The gate's derivative therefore carries the SAME cross-time
+# chain the decay's `decaytrace` carries, with one extra factor: the gate
+# reaches a_t through gate * x_t, so the chain picks up x_t.
+#
+#     gatetrace_t = a_t * gatetrace_{t-1} + a_t(1-a_t) * x_t * s_{t-1}
+#     dL/dgate    = sum_t dL/ds_t * gatetrace_t
+#
+# dL/ds_t here is the READOUT-ONLY state gradient -- the one the engine's
+# per-byte backward produces, because the states are stop_gradient there. The
+# trace is what rebuilds the chain the engine does not have. (Feeding this the
+# TOTAL state gradient instead would double count the chain: the trace's chain
+# and the total gradient's chain are the same chain.)
+# ---------------------------------------------------------------------------
+def gate_trace_update(gatetrace, a, x_in, s_prev):
+    """One step of the gate's cross-time trace (numpy mirror of gpu_port's).
+
+    `a` is the EFFECTIVE retention a_t: per-SAMPLE (B, dim) in the gated arm
+    and per-dim (dim,) in the ungated one. The trace is per-sample either
+    way, so a per-dim `a` is broadcast over the batch and a per-sample `a` is
+    used as it is.
+    """
+    if a.ndim == 1:
+        a = a[None, :]
+    return a * gatetrace + a * (1.0 - a) * x_in * s_prev
+
+
+def gate_gradient(dlds, gatetrace, a, x_in, s_prev):
+    """The gate gradient for ONE timestep of ONE layer (numpy mirror).
+
+    dlds is the readout-only state gradient dL/ds_t, (B, dim); x_in is the
+    layer's input at this timestep and s_prev the state BEFORE it, both
+    (B, dim). Returns (contribution, new_trace): the contribution is the
+    (dim,) gate gradient for this timestep -- SUMMED OVER THE BATCH, because
+    the gate parameter is per-dim and the batch is the other axis -- and the
+    new trace, which the next timestep (or the next window) continues from.
+    """
+    gt = gate_trace_update(gatetrace, a, x_in, s_prev)
+    return (dlds * gt).sum(axis=0), gt
+
+
 class Model:
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
                  half_life_init=None,
-                 grad_clip=0.0, nan_guard=True, wd_decay=0.01):
+                 grad_clip=0.0, nan_guard=True, wd_decay=0.01, gated=False,
+                 fsp=False):
         self.dim = dim
         self.layercount = layers
+        self.gated = bool(gated)
         self.temp = temp
         self.lr = F(lr)
         self.b1, self.b2, self.eps, self.wd = F(0.9), F(0.999), F(1e-8), F(0.01)
@@ -210,6 +277,26 @@ class Model:
             elif decay_init is not None:
                 d0[:] = decay_init
             init[f"layer{i}.decay"] = d0
+            if gated:
+                # P3 gate logits, ZERO so a == sigmoid(decay) at init. Added to
+                # `init` (and therefore to self.shapes and theta) only in the
+                # gated arm: the default engine's theta layout must stay
+                # byte-comparable with gpu_port's for check_parity. The order
+                # mirrors gpu_port's exactly (gate right after the decay).
+                init[f"layer{i}.gate"] = np.zeros(dim, F)
+
+        if fsp:
+            # The FSP auxiliary head's parameters, in the SAME order as
+            # gpu_port.py's (`fsp.g`, `fsp.b0`, `fsp.W`, `fsp.b`), so a
+            # checkpoint written by the torch engine loads here with the same
+            # layout. The numpy reference does not implement the FSP FORWARD
+            # -- the ruler never runs the auxiliary loss, it only needs the
+            # parameter vector to line up -- and the FSP path itself is pinned
+            # by tests/check_fsp.py against finite differences.
+            init["fsp.g"] = np.ones(dim, F)
+            init["fsp.b0"] = np.zeros(dim, F)
+            init["fsp.W"] = rng.uniform(-lim, lim, (dim, 256)).astype(F)
+            init["fsp.b"] = np.zeros(256, F)
 
         # flat parameter buffer + grads + adam moments (contiguous, in-place ops)
         self.shapes = [(k, v.shape) for k, v in init.items()]
@@ -234,7 +321,8 @@ class Model:
         self.layers = [Layer(dim) for _ in range(layers)]
         for i, l in enumerate(self.layers):
             l.adopt_views(self.views[f"layer{i}.W"], self.views[f"layer{i}.g"],
-                          self.views[f"layer{i}.b"], self.views[f"layer{i}.decay"])
+                          self.views[f"layer{i}.b"], self.views[f"layer{i}.decay"],
+                          self.views.get(f"layer{i}.gate"))
 
         # recurrent state + traces; stream 0 is the persistent "memory" stream
         self.B = 1
@@ -259,6 +347,13 @@ class Model:
         for l in self.layers:
             l.states = np.zeros((B, self.dim), F)
             l.decaytrace = np.zeros((B, self.dim), F)
+            # The gate's cross-time trace, allocated ONLY in the gated arm:
+            # the default engine must not pay the buffer. It lives next to
+            # the decaytrace because it is the same kind of object: the
+            # carrier of the chain the engine's per-byte backward does not
+            # have.
+            if getattr(l, "gated", False):
+                l.gatetrace = np.zeros((B, self.dim), F)
             l.ring_w = np.zeros((B, self.ring_k, self.dim), F)
 
     # ---------- tail credit (exact long-lag embed credit) ----------
@@ -291,10 +386,14 @@ class Model:
         for l in self.layers:
             l.states[:] = 0
             l.decaytrace[:] = 0
+            if getattr(l, "gated", False):
+                l.gatetrace[:] = 0
             l.ring_w[:] = 0
 
     def count(self):
         per_layer = self.dim * self.dim + 3 * self.dim
+        if self.gated:
+            per_layer += self.dim          # the P3 gate vector
         return (256 * self.dim + self.layercount * per_layer +
                 256 * self.dim + 256 + self.dim + 1)
 
@@ -323,6 +422,31 @@ class Model:
     # ---------- training (B streams in lockstep) ----------
     def step_batch(self, cs, ns, ends):
         """cs, ns, ends: lists of length B. One AdamW update for B byte-steps."""
+        # P3 gated recurrence: REFUSED, exactly as gpu_port refuses it, and for
+        # the same reason. Gating makes the retention factor per-sample
+        # (B, dim), while the ring credit, the tail and the ring_k inference
+        # all assume a per-dim (dim,) vector. That is a separate, larger piece
+        # of work; until it lands, refusing is the honest answer.
+        #
+        # What is NOT missing is the gradient: the gate gradient is implemented
+        # below and in gate_gradient() above, in the traced form, and
+        # tests/check_gate_grad.py pins it against torch autograd and against
+        # a central finite difference -- and pins this file's copy against
+        # gpu_port's, element by element.
+        #
+        # The refusal comes FIRST, before self.t += 1, so that a refused call
+        # leaves theta, the moments and the step counter exactly as they were.
+        if self.gated:
+            raise NotImplementedError(
+                "gated=True (P3) is not yet runnable: gating makes the retention "
+                "factor per-sample (B, dim), but the ring-credit, tail and "
+                "decaytrace machinery all assume a per-dim (dim,) decay vector, "
+                "and ring_k is inferred from sigma_max which is then not a "
+                "scalar. Reworking that is a separate, deliberate change -- see "
+                "PLAN-2026-10-11-T-AXIS.md P3. Refusing rather than emitting a "
+                "plausible wrong credit. (The gate GRADIENT itself is not the "
+                "blocker any more: it is the traced form, pinned against "
+                "autograd and finite differences by tests/check_gate_grad.py.)")
         self.t += 1
         B = len(cs)
         self.bytes_seen += B
@@ -335,11 +459,16 @@ class Model:
         # ---- forward ----
         x = enc
         caches, states, decays = [], [], []
+        # The layer INPUT at each timestep, per layer, for THIS byte. The
+        # gate reaches a_t through gate * x_in, so x_in is a factor of the
+        # gate's cross-time trace (see gate_trace_update).
+        xins = []
         for l in self.layers:
             x, state, decay, cache = l.forward(enc, x, l.states)
             caches.append(cache)
             states.append(state)
             decays.append(decay)
+            xins.append(cache[4])
 
         output = x @ self.Wd.T + self.bd                 # (B, 256)
         stop = sigmoid(x @ self.Ws + self.bs[0])         # (B,)
@@ -402,6 +531,9 @@ class Model:
         self._ensure_tail()
         dembed = np.zeros((256, self.dim), F)
         decay_grads = []
+        # P3 gate gradients, per layer, accumulated over the window exactly
+        # like the decay's.
+        gate_grads = []
         K = self.ring_k
         p = (self.t - 1) % K
         scratch = self.ring_vals
@@ -446,6 +578,22 @@ class Model:
             l.decaytrace = (decays[i][None, :] * l.decaytrace +
                             decays[i][None, :] * (1.0 - decays[i][None, :]) * l.states)
             decay_grads.append((dlds * l.decaytrace).sum(axis=0))
+            if self.gated:
+                # The GATE's chain, which the plain sum did not have -- the
+                # numpy mirror of gpu_port's block. The gate enters a_t at
+                # time t only, but a_t keeps multiplying s_{t-1} into every
+                # later state, so the gate's derivative carries the same
+                # cross-time chain the decay's decaytrace carries -- plus the
+                # x_t factor, because the gate reaches a_t through gate * x_t.
+                #
+                # `dlds` is the READOUT-ONLY state gradient (the states are
+                # stop_gradient) and the trace rebuilds the chain the engine
+                # does not have. `decays[i]` is the EFFECTIVE retention a_t:
+                # (B, dim) in the gated arm, (dim,) in the ungated one.
+                # `l.states` still holds the state BEFORE this byte.
+                contrib, l.gatetrace = gate_gradient(
+                    dlds, l.gatetrace, decays[i], xins[i], l.states)
+                gate_grads.append(contrib)
             l.states = states[i]                         # stop_gradient
         self.ring_b[:, p] = c_arr
 
@@ -461,6 +609,8 @@ class Model:
             gv[f"layer{i}.g"][:] = lg[i]
             gv[f"layer{i}.b"][:] = lb[i]
             gv[f"layer{i}.decay"][:] = decay_grads[i]
+            if self.gated:
+                gv[f"layer{i}.gate"][:] = gate_grads[i]
 
         # ---- fused AdamW (in-place, one pass over 4.5M params) ----
         t = self.t
@@ -510,6 +660,11 @@ class Model:
         for i, l in enumerate(self.layers):
             data[f"state.{i}"] = l.states
             data[f"decaytrace.{i}"] = l.decaytrace
+            # The GATE's trace is NOT persisted (see gpu_port.params_dict):
+            # the gated arm refuses to run today, so the buffer is always
+            # zero. It must be added here when the per-sample credit
+            # plumbing lands, or a resumed gated run would silently lose the
+            # chain across the resume.
         data["t"] = np.array(self.t, np.int64)
         data["bytes"] = np.array(self.bytes_seen, np.int64)
         data["m"] = self.m

@@ -3503,3 +3503,141 @@ control's 1.4085 at the same byte budget. So:
 memory problem is no longer a capacity problem, and the next month is about
 the write path and the readout — not about the init, not about the T axis,
 and not about the ring.
+
+---
+
+## A paper, an audit, and the P3 gate gradient finally explained (2026-10-13)
+
+### The paper: FlashLM (Chang, May 2026)
+
+`~/Downloads/output.pdf` is **"FlashLM: CPU-Native Language Models Trained
+From Scratch on Free-Tier Hardware"** — 8 pages, no figures, three tables, a
+self-published preprint. Two notes are in `docs/papers/`:
+`PAPER-NOTE.md` (a full transcription with every equation and every number
+re-checked) and `RELEVANCE-NOTE.md` (the audit of it against this codebase,
+with the cost table and the experiment).
+
+Its thesis is **"the training objective matters more than the architecture"**,
+and its lever is an auxiliary loss, **Future State Prediction (FSP)**: at every
+r-th position (r=16) the model predicts *which tokens appear in the next τ
+positions* (τ=64) as a binary multi-hot, with BCE (pos_weight 50), and
+L = L_CE + 0.1·L_FSP. The claimed result is a 2.5× perplexity improvement
+(25.08 → 10.24) for 1.7% extra parameters.
+
+**The paper's own evidence is weaker than its abstract**, and the audit says so
+plainly: it is a single unseeded run; its own Table 2 contains an
+architecture-only arm (v7.4, Gated DeltaNet + SWA) that reaches **PPL 2.33** —
+a 10.8× improvement, larger than FSP's 2.45× — so the table contradicts the
+thesis printed two pages earlier; another architecture-only arm (v5.2,
+Attention + RoPE, 10.56) is never discussed; the FSP model's coherence verdict
+is "Partial"; three rows share an identical 2,750 tok/s across different model
+sizes; and the FSP head's own shape ("one d×d projection … sharing the output
+embedding matrix") is self-contradictory.
+
+**And yet the idea transfers, because it is aimed at exactly our measured
+gap.** A recurrent byte model has exactly one place where context can live: the
+state. Next-byte CE asks the *output* (one step ahead) to be right and never
+asks the *state* to be usable later. Our measurement is that the state now
+*holds* a signal 128 B out (5.5% of the control floor, 15× the incumbent) and
+*cannot use it* (every copy/retrieval probe at chance). FSP is the cheapest
+objective that can put the state to work: its gradient lands on the state, and
+from there the engine's existing credit machinery carries it to the embedding
+(the ring) and to the decay logits (the decaytrace) — i.e. it reaches the
+**memory**, not just a read-out.
+
+### The implementation, and what the audit found in it
+
+`gpu_port.py` gained an FSP path: a head on the last layer's state
+(`fsp.W`, `fsp.b`, and its own LayerNorm `fsp.g`/`fsp.b0`), a BCE-with-logits
+against a byte-bag multi-hot built by the trainer from the next τ bytes, and
+`--fsp-alpha/--fsp-r/--fsp-tau/--fsp-pos-weight/--fsp-layer`. The head's
+parameters exist in theta **only when alpha > 0**, so the default engine is
+bit-identical (the gate proves it: same loss number, same gradient vector,
+max |diff| = 0).
+
+The relevance audit found five defects in it, and all five are fixed:
+
+| | defect | fix |
+|---|---|---|
+| **D1** | **the arm was unmeasurable**: the ruler runs on the numpy reference, which did not know the FSP keys, so the checkpoint's length check raised | `numpy_port.Model` gained the FSP layout (same order as the torch engine) and `model_backend.load_frozen` detects it; the gate now writes a checkpoint and reads it back through the ruler's own loader |
+| **D2** | the auxiliary reached **one of sixteen** layers' memories (the layers' states are independent recurrences) | documented as the first arm's known limitation, with the per-layer variant pre-specified as a second arm (16× the head's flops) |
+| **D3** | the auxiliary moved the **last layer's LayerNorm gain**, i.e. it was a knob on the local read-out, and the arm's CE could move for a reason unrelated to memory | the head got **its own** normalisation parameters |
+| **D4** | `pos_weight 50` is the paper's number and is mis-calibrated for bytes: our corpus's 64-byte future window holds **22.0 distinct symbols of 256 (8.58% dense)**, not 1.6% as in a 4096-token vocabulary | solving for the paper's own positive-mass fraction gives **8.4**; the runbook uses 8 |
+| **D5** | the FSP term was never logged | the training line prints `fsp <value>` beside the CE |
+
+`tests/check_fsp.py` pins the path against **finite differences**, with no
+reference implementation to trust:
+
+```
+(1) the head's own gradient vs a central finite difference
+    d/dfsp.W[0]   engine -9.521905e-04 vs finite diff -9.727478e-04   rel dev 2.11e-02
+    d/dfsp.b[200] engine -2.670877e-02 vs finite diff -2.669334e-02   rel dev 5.78e-04
+(2) the auxiliary reaches the DECAY logits (the memory), not just the head
+    d/dlayer0.decay[2] engine +3.024431e-02 vs finite diff +3.026962e-02  rel dev 8.36e-04
+    d/dlayer1.decay[2] engine +6.488688e-02 vs finite diff +6.485939e-02  rel dev 4.24e-04
+(3) alpha=0 leaves the default engine bit-identical   (gradient max |diff| = 0.000e+00)
+(4) the reported FSP term equals the BCE it claims to be
+(5) the arm is measurable: the ruler's loader reads the checkpoint
+```
+
+Two things had to be discovered to write that gate, and both are traps worth
+recording:
+
+* **The engine's gradients are the gradient of the batch SUM, while the
+  reported loss is the batch MEAN.** The `/B` in the loss expression is for
+  reporting; the CE, the embedding and the decay rows all follow the sum
+  convention (the repo's P0 gate documents the same asymmetry for the decay
+  rows). A finite difference of the reported loss must therefore be scaled by
+  B, and the FSP gradient must NOT carry a 1/B — otherwise a correct engine
+  looks wrong by exactly B, which is what the first version of this check
+  reported.
+* **The finite-difference step has to be large.** The loss is float32, so its
+  ULP near 13 is ~1e-6 and a central difference of eps multiplies that
+  quantum by 1/(2·eps): at eps=1e-3 the finite difference of a 1e-3 gradient
+  is pure cancellation noise, and two different coordinates come out EXACTLY
+  equal — which is the tell. At eps=0.05 the smallest gradient checked is
+  still resolved to ~1%.
+
+### The P3 gate gradient: the mechanism is now known
+
+The gate's own docstring said the gate gradient was "wrong as written" and
+listed the missing pieces as "the cross-time chain (what `decaytrace` already
+does)" and "the state gradient has to pass back through the layer-norm and the
+z·sigmoid(z) gated linear per layer, not through a single decoder-level dx".
+Both are now measured, and the first one turns out to be exactly right — with
+a precise structure.
+
+The engine's `dL/ds_t` is the **readout-only** part of the state gradient, so
+the true derivative wrt the retention carries the chain from every later
+state, and the gate needs the decaytrace's twin:
+
+```
+gatetrace_t = a_t * gatetrace_{t-1} + a_t(1 - a_t) * x_t * s_{t-1}
+dL/dgate    = sum_t dL/ds_t * gatetrace_t        (with the READOUT-ONLY dL/ds_t)
+```
+
+The four-way truth table (dim=3, B=2, T=5, float64, against torch autograd on
+the same recurrence) is what makes the structure unambiguous:
+
+| formula | state gradient fed in | max rel dev vs autograd |
+|---|---|---:|
+| plain sum (**the engine today**) | readout-only | **0.3467×** ← wrong |
+| gate trace | readout-only | **0.0000×** ← correct |
+| plain sum | total | 0.0000× (correct, but the engine does not have the total) |
+| gate trace | total | 0.2723× (double counts) |
+
+The engine's plain sum is the **local** effect of a_t on s_t only, and the
+chain factor **grows as the retention approaches 1** — which is exactly the
+regime the log-spaced (P4) init creates. A gate that is wrong by a factor that
+scales with the memory it is supposed to create is worse than no gate at all.
+
+There is a second, independent defect in the same line: with a *gated* (i.e.
+per-sample) retention, `dec` has shape (B, dim), so `dec[None, :]` is
+(1, B, dim); multiplying it against (B, dim) broadcast-promotes to (1, B, dim)
+and `.sum(dim=0)` then sums an axis of size 1 — i.e. it sums **nothing over the
+batch**, and the "gradient" comes out (B, dim) instead of (dim,).
+
+So the P3 gate is not blocked by a mystery: it needs (i) the gatetrace, (ii) a
+correct batch reduction, and (iii) — still, and still validly — the per-sample
+plumbing for the ring credit, the tail and `ring_k` inference. (i) and (ii) are
+small; (iii) is the real rework, and it is unchanged by this discovery.

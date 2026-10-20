@@ -60,7 +60,13 @@ def load_frozen(ckpt):
     d = np.load(ckpt)
     dim = int(d["Wd"].shape[1])
     layers = sum(1 for k in d.files if k.startswith("layer") and k.endswith(".W"))
-    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4)
+    # The FSP arm's checkpoint carries the auxiliary head's parameters in
+    # theta, so the model's LAYOUT has to match before the load's length
+    # check can pass. The head is not used to score anything (the ruler never
+    # runs the auxiliary loss) -- it only has to be present, in the same
+    # order, so the parameter vector lines up.
+    fsp = ("fsp.W" in d.files)
+    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4, fsp=fsp)
     m.new_states(1)
     m.load(ckpt)                       # honours the checkpoint's ring_k
     m.new_states(1)                    # zero memory: score the weights

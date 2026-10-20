@@ -245,7 +245,9 @@ class TorchLayer:
         sg = torch.sigmoid(z)
         y = z * sg
         # x_in is returned so the caller can form dL/dgate without re-deriving
-        # the residual stream: dgate_t = dL/da_t * a_t(1-a_t) * x_in_t.
+        # the residual stream: the gate reaches a_t through gate * x_in, so
+        # x_in is a factor of the gate's cross-time trace (see
+        # gate_trace_update), not just of the local term.
         return x_in + y, state, a, (z, sg, h, cache, x_in)
 
     def backward(self, dx_out, cache):
@@ -259,6 +261,62 @@ class TorchLayer:
         dh = dz @ self.W
         dstate, dg, db = _layer_norm_backward(dh, ln_cache)
         return dstate, dW, dg, db
+
+
+# ---------------------------------------------------------------------------
+# The P3 gate gradient.
+#
+# The gate makes the retention input-dependent, a_t = sigmoid(decay + gate*x_t),
+# so the gate enters a_t at time t ONLY -- but a_t does not stop at s_t: it
+# multiplies s_{t-1} into s_t, and s_t then keeps propagating, multiplied by
+# every later a. The gate's derivative therefore carries the SAME cross-time
+# chain the decay's `decaytrace` carries, with one extra factor: the gate
+# reaches a_t through gate * x_t, so the chain picks up x_t.
+#
+#     gatetrace_t = a_t * gatetrace_{t-1} + a_t(1-a_t) * x_t * s_{t-1}
+#     dL/dgate    = sum_t dL/ds_t * gatetrace_t
+#
+# dL/ds_t here is the READOUT-ONLY state gradient -- the one the engine's
+# per-byte backward produces, because the states are stop_gradient there. The
+# trace is what rebuilds the chain the engine does not have. (Feeding this
+# the TOTAL state gradient instead would double count the chain: the trace's
+# chain and the total gradient's chain are the same chain. The four-way truth
+# table is measured in tools/gate_grad_probe.py and pinned by
+# tests/check_gate_grad.py.)
+#
+# These two functions are the engine's OWN implementation of the formula:
+# step_batch calls them, and the test calls the same two, so the test pins
+# the shipped code and not a re-derivation of it.
+# ---------------------------------------------------------------------------
+def gate_trace_update(gatetrace, a, x_in, s_prev):
+    """One step of the gate's cross-time trace.
+
+    `a` is the EFFECTIVE retention a_t. It is per-SAMPLE (B, dim) in the
+    gated arm -- the gate makes a depend on the input, so it is not a single
+    vector any more -- and per-dim (dim,) in the ungated arm. The trace
+    itself is per-sample either way, so a per-dim `a` is broadcast over the
+    batch here and a per-sample `a` is used as it is. Getting this wrong is
+    silent: a (B, dim) `a` broadcast against a (1, dim) view produces
+    (1, B, dim), and the batch axis then survives the sum that is supposed
+    to remove it.
+    """
+    if a.dim() == 1:
+        a = a[None, :]
+    return a * gatetrace + a * (1.0 - a) * x_in * s_prev
+
+
+def gate_gradient(dlds, gatetrace, a, x_in, s_prev):
+    """The gate gradient for ONE timestep of ONE layer.
+
+    dlds is the readout-only state gradient dL/ds_t, (B, dim); x_in is the
+    layer's input at this timestep and s_prev is the state BEFORE it, both
+    (B, dim). Returns (contribution, new_trace): the contribution is the
+    (dim,) gate gradient for this timestep -- SUMMED OVER THE BATCH, because
+    the gate parameter is per-dim and the batch is the other axis -- and the
+    new trace, which the next timestep (or the next window) continues from.
+    """
+    gt = gate_trace_update(gatetrace, a, x_in, s_prev)
+    return (dlds * gt).sum(dim=0), gt
 
 
 def _ring_credit_compiled(dest, w, dlds, hot_mask, rows):
@@ -423,7 +481,9 @@ class GpuModel:
                  device=None, ring_credit="auto", sync_metrics=True,
                  grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0,
                  ce_only=False, seqlen=1, gated=False, trace_mode="ring",
-                 grad_clip=0.0, nan_guard=True, wd_decay=0.01):
+                 grad_clip=0.0, nan_guard=True, wd_decay=0.01,
+                 fsp_alpha=0.0, fsp_r=16, fsp_tau=64, fsp_pos_weight=50.0,
+                 fsp_layer=-1):
         # trace_mode: how per-byte embedding credit is accumulated.
         #   "ring"  -- the incumbent: a K-lag ring buffer plus tail_credit's
         #              private EMA for the "hot" dims where truncation would
@@ -511,6 +571,38 @@ class GpuModel:
         # (default init / P4 init).
         self.wd_decay = float(wd_decay)
         self._wd_vec = None
+        # ---- FSP: the Future State Prediction auxiliary loss ---------------
+        #
+        # From FlashLM (Chang, May 2026), §3.1: at every r-th position the
+        # model predicts WHICH tokens appear in the next tau positions, as a
+        # binary multi-hot, with BCE (pos_weight 50); the total loss is
+        # L_CE + alpha * L_FSP with alpha = 0.1.
+        #
+        # WHY IT IS THE RIGHT IDEA FOR THIS MODEL. A recurrent byte model has
+        # exactly ONE place where context can live: the state. Next-byte CE
+        # only ever asks the OUTPUT (one step ahead) to be right, so it never
+        # asks the STATE to be USABLE later -- and the measured result is
+        # exactly that: the state can HOLD a signal 128 B out (5.5% of the
+        # control floor with the P4 init) while every copy/retrieval probe
+        # stays at chance. FSP puts a read-out on the state and asks it to
+        # predict the future's bag-of-bytes, so the state is pushed to carry
+        # forward-looking content in a linearly readable form.
+        #
+        # The head reads the LAST layer's state (the one closest to the
+        # output) through that layer's own LayerNorm, so no extra
+        # normalisation parameters are introduced; the projection itself is
+        # new (dim -> 256 bytes), and the parameters live in theta ONLY when
+        # alpha > 0, so the default engine's layout stays byte-comparable
+        # with numpy_port's for check_parity.
+        self.fsp_alpha = float(fsp_alpha)
+        self.fsp_r = int(fsp_r)
+        self.fsp_tau = int(fsp_tau)
+        self.fsp_pos_weight = float(fsp_pos_weight)
+        self.fsp_layer = int(fsp_layer)
+        if self.fsp_alpha < 0:
+            raise ValueError(f"fsp_alpha must be >= 0, got {self.fsp_alpha}")
+        self.last_fsp = 0.0
+        self.fsp_positions = 0
         if self.ce_only and self.distill_alpha > 0.0:
             raise ValueError(
                 f"ce_only=True requires distill_alpha == 0, got "
@@ -672,6 +764,24 @@ class GpuModel:
                 # byte-comparable with numpy_port's for check_parity.
                 init[f"layer{i}.gate"] = np.zeros(dim, np.float32)
 
+        if self.fsp_alpha > 0.0:
+            # The FSP head. Appended LAST so the default layout is untouched,
+            # and it exists only when the loss is on (same rule as the gate).
+            # Init: small random projection (like Wd) and a zero bias, so the
+            # head starts as a near-uniform predictor and its first gradient
+            # is informative rather than saturated.
+            #
+            # fsp.g / fsp.b0 are the head's OWN LayerNorm parameters. Borrowing
+            # the layer's would make the auxiliary loss a knob on the local
+            # read-out: the FSP gradient would move layer{g,b}, and the arm's
+            # held-out CE could move for a reason that has nothing to do with
+            # memory. With its own normalisation the head can only affect the
+            # state, which is the thing being tested.
+            init["fsp.g"] = np.ones(dim, np.float32)
+            init["fsp.b0"] = np.zeros(dim, np.float32)
+            init["fsp.W"] = rng.uniform(-lim, lim, (dim, 256)).astype(np.float32)
+            init["fsp.b"] = np.zeros(256, np.float32)
+
         self.shapes = [(k, v.shape) for k, v in init.items()]
         n = sum(int(np.prod(s)) for _, s in self.shapes)
         self.theta = torch.from_numpy(np.concatenate(
@@ -692,6 +802,13 @@ class GpuModel:
         self.embed = self.views["embed"]
         self.Wd, self.bd = self.views["Wd"], self.views["bd"]
         self.Ws, self.bs = self.views["Ws"], self.views["bs"]
+        self.fsp_W = self.views["fsp.W"] if "fsp.W" in self.views else None
+        self.fsp_b = self.views["fsp.b"] if "fsp.b" in self.views else None
+        self.fsp_g = self.views["fsp.g"] if "fsp.g" in self.views else None
+        self.fsp_b0 = self.views["fsp.b0"] if "fsp.b0" in self.views else None
+        if self.fsp_alpha > 0.0:
+            li = self.fsp_layer % max(1, layers)
+            self.fsp_layer = li
         self.layers = [TorchLayer(dim) for _ in range(layers)]
         for i, l in enumerate(self.layers):
             l.W = self.views[f"layer{i}.W"]
@@ -734,6 +851,16 @@ class GpuModel:
         for l in self.layers:
             l.states = torch.zeros((B, self.dim), dtype=F, device=self.device)
             l.decaytrace = torch.zeros((B, self.dim), dtype=F, device=self.device)
+            # The gate's cross-time trace, allocated ONLY in the gated arm:
+            # the default engine must not pay the buffer, and must not grow
+            # an extra live tensor (the T=1 bit-identity gate snapshots every
+            # live buffer, so a new one would have to be pinned there too).
+            # It lives next to the decaytrace because it is the same kind of
+            # object: the carrier of the chain the engine's per-byte backward
+            # does not have.
+            if getattr(l, "gated", False):
+                l.gatetrace = torch.zeros((B, self.dim), dtype=F,
+                                          device=self.device)
             l.ring_w = torch.zeros((B, 0 if dense else self.ring_k,
                                     self.dim), dtype=F, device=self.device)
         if self.trace_mode == "dense":
@@ -956,10 +1083,18 @@ class GpuModel:
         return self._nvrtc_nomask_t
 
     # ---------------- training step --------------------
-    def step_batch(self, cs, ns, ends):
+    def step_batch(self, cs, ns, ends, fsp=None):
         """cs/ns: int64 (B,) or (B,T); ends: fp32, same shape — all on
         self.device. Returns the window's loss (python float, or a device
         tensor when sync_metrics=False). Mirrors numpy_port.step_batch at T=1.
+
+        `fsp` is the optional FSP auxiliary: a tuple (mask, targets) where
+        `mask` is a host-side tuple of ints (one per byte of the window: 1 =
+        this byte is an FSP position) and `targets` is a (B, T, 256) device
+        tensor of binary multi-hots (which bytes appear in the next tau
+        bytes). The mask is a python tuple on purpose: a device mask would
+        need a `.item()` to branch on, and a sync per byte is exactly the
+        cost the tail-rebase comment warns about.
 
         THE T AXIS (PLAN-2026-10-11 P1)
         -------------------------------
@@ -1064,28 +1199,33 @@ class GpuModel:
         # refused run is recoverable; a silently-wrong one is not.
         #
         # The forward, the gate parameter (created only in this arm, so theta's
-        # layout is unchanged otherwise) and the gate gradient are
-        # IMPLEMENTED, but the gate gradient is NOT verified and is KNOWN to
-        # be wrong as written: torch autograd on the same recurrence, and a
-        # central finite difference of the loss, both disagree with the
-        # engine's formula (max rel dev 4.59 / 8.19 for dL/dgate and
-        # 11.7 / 22.4 against finite differences, at dim=8 layers=2 B=3 T=4).
-        # tests/check_gated_recurrence.py deliberately pins only the claims
-        # that hold and ASSERTS the refusal; it does not, and must not, claim
-        # the gradient.
+        # layout is unchanged otherwise) and the GATE GRADIENT are
+        # IMPLEMENTED, and the gate gradient is now KNOWN and VERIFIED:
+        #
+        #   gatetrace_t = a_t*gatetrace_{t-1} + a_t(1-a_t)*x_t*s_{t-1}
+        #   dL/dgate    = sum_t dL/ds_t * gatetrace_t        (readout-only dlds)
+        #
+        # The old formula was a plain sum of the LOCAL effect of a_t on s_t
+        # and it was wrong in two ways at once: it dropped the cross-time
+        # chain (which the decay's decaytrace already carries) and it summed
+        # the wrong axis, so nothing was summed over the batch. The four-way
+        # truth table -- plain/trace x readout-only/total dL/ds_t, measured
+        # against torch autograd -- is in tools/gate_grad_probe.py, and
+        # tests/check_gate_grad.py pins the fixed formula against autograd AND
+        # against a central finite difference of the loss.
+        #
+        # So the REFUSAL is now about the CREDIT machinery only, not about the
+        # gradient: the gated arm still cannot run, because the ring credit,
+        # the tail and ring_k's inference all assume a per-dim retention. That
+        # is a separate, larger piece of work, and until it lands the arm
+        # refuses rather than emitting a plausible wrong credit.
         #
         # (An earlier version of this comment said the gate gradient was
         # "finite-difference-pinned in tests/check_gated_recurrence.py". That
         # was false -- the gate file says the opposite -- and a comment that
         # contradicts the gate it points at is worse than no comment, because
-        # it is a green light on a known-wrong gradient.)
-        #
-        # The two missing pieces are in the gate file's docstring: ds_t/da_t
-        # must carry the CROSS-TIME chain (which the ungated engine's
-        # decaytrace already does, and which a naive per-byte transcription
-        # drops), and the state gradient must pass back through the layer
-        # norm and the z*sigmoid(z) gated linear PER LAYER rather than through
-        # a single decoder-level dx.
+        # it is a green light on a known-wrong gradient. The gradient is now
+        # pinned, by tests/check_gate_grad.py, which is the file that says so.)
         if self.gated:
             raise NotImplementedError(
                 "gated=True (P3) is not yet runnable: gating makes the retention "
@@ -1094,7 +1234,9 @@ class GpuModel:
                 "and ring_k is inferred from sigma_max which is then not a "
                 "scalar. Reworking that is a separate, deliberate change -- see "
                 "PLAN-2026-10-11-T-AXIS.md P3. Refusing rather than emitting a "
-                "plausible wrong gradient.")
+                "plausible wrong credit. (The gate GRADIENT itself is not the "
+                "blocker any more: it is the traced form, pinned against "
+                "autograd and finite differences by tests/check_gate_grad.py.)")
         if T > 1 and self.distill_alpha > 0.0:
             raise RuntimeError(
                 f"seqlen={T} with distill_alpha={self.distill_alpha}: the KD "
@@ -1144,9 +1286,19 @@ class GpuModel:
         # path changes.
         gate_grads = ([torch.zeros_like(gv[f"layer{i}.gate"])
                        for i in range(self.layercount)] if self.gated else None)
-        # per-timestep a_t for the gate term: the gate enters a_t only at time
-        # t, so unlike decaytrace there is NO chain across time and the gate
-        # gradient is a plain sum over the window (see the trace block below).
+        # FSP head gradients. Allocated only when the auxiliary loss is on, so
+        # the default path allocates nothing and changes nothing.
+        dfsp_W = (torch.zeros_like(gv["fsp.W"]) if self.fsp_alpha > 0.0 else None)
+        dfsp_b = (torch.zeros_like(gv["fsp.b"]) if self.fsp_alpha > 0.0 else None)
+        dfsp_g = (torch.zeros_like(gv["fsp.g"]) if self.fsp_alpha > 0.0 else None)
+        dfsp_b0 = (torch.zeros_like(gv["fsp.b0"]) if self.fsp_alpha > 0.0 else None)
+        fsp_sum = torch.zeros((), dtype=F, device=self.device)
+        fsp_n = 0
+        # The layer INPUT at each timestep, per layer, for THIS byte. The gate
+        # reaches a_t through gate * x_t, so x_t is part of the gate's
+        # cross-time trace (see gate_trace_update). Stashed here because the
+        # backward runs after the whole window and the residual stream has
+        # moved on by then.
         gate_xin = ([None] * self.layercount if self.gated else None)
         loss_tensor = torch.zeros((), dtype=F, device=self.device)
         ce_sum = torch.zeros((), dtype=F, device=self.device)
@@ -1193,6 +1345,15 @@ class GpuModel:
                     for i, c in enumerate(caches):
                         gate_xin[i] = c[4]
 
+            # ---- FSP: read the STATE and ask it about the future ---------
+            fsp_cache = None
+            fsp_tgt = None
+            if fsp is not None and self.fsp_alpha > 0.0 and fsp[0][tt]:
+                fsp_tgt = fsp[1][:, tt, :]              # (B, 256) multi-hot
+                fh, fcache = _layer_norm(states[self.fsp_layer],
+                                         self.fsp_g, self.fsp_b0)
+                fsp_cache = (fh @ self.fsp_W + self.fsp_b, fh, fcache)
+
             with rf("decoder"):
                 output = x @ self.Wd.t() + self.bd       # (B, 256)
                 stop = _sig(x @ self.Ws + self.bs[0])    # (B,)
@@ -1217,6 +1378,27 @@ class GpuModel:
             mse_sum = mse_sum + mse_t
             end_sum = end_sum + end_t
             ce_sum = ce_sum + ce_t
+
+            # ---- FSP: the auxiliary loss and its weight -------------------
+            if fsp_cache is not None:
+                flogits, _, _ = fsp_cache
+                # BCE-with-logits against the multi-hot. The positive class is
+                # up-weighted (pos_weight) because the future window contains
+                # a handful of distinct bytes out of 256: without the weight
+                # the loss is dominated by the 200+ absent bytes and the head
+                # predicts "nothing is coming" forever.
+                wpos = torch.where(fsp_tgt > 0.5,
+                                   torch.full_like(fsp_tgt, self.fsp_pos_weight),
+                                   torch.ones_like(fsp_tgt))
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    flogits, fsp_tgt, pos_weight=wpos, reduction="none")
+                # mean over the 256 classes, then summed over the batch --
+                # the same shape as the engine's other per-byte terms, which
+                # are all divided by B below.
+                fsp_t = bce.mean(dim=1).sum()
+                loss_tensor = loss_tensor + self.fsp_alpha * fsp_t / B
+                fsp_sum = fsp_sum + fsp_t
+                fsp_n = fsp_n + 1
 
             # ---- distillation: KL(p_teacher_bytes || p_student_bytes) ------
             # L_KD = sum_v p_T(v) (log p_T(v) - log p_S(v)); with tau = 1 frozen
@@ -1319,6 +1501,40 @@ class GpuModel:
                     lg[i] += dg
                     lb[i] += db
                     lgrads[i] = dstate
+                if fsp_cache is not None:
+                    # The FSP head's gradient lands on the STATE it read, and
+                    # from there the engine's existing machinery does the
+                    # rest: `lgrads[i]` is what the ring credits to the
+                    # embedding and what the decaytrace turns into the decay
+                    # logits' gradient. That is the whole point of putting
+                    # the auxiliary loss on the state -- it reaches the
+                    # MEMORY (the decay) and not just the read-out.
+                    flogits, fh, fcache = fsp_cache
+                    p_fsp = torch.sigmoid(flogits)
+                    wpos = torch.where(fsp_tgt > 0.5,
+                                       torch.full_like(fsp_tgt,
+                                                       self.fsp_pos_weight),
+                                       torch.ones_like(fsp_tgt))
+                    # d/dz of BCEWithLogits = (sigmoid(z) - y) * w / n_classes,
+                    # then alpha.
+                    #
+                    # NO 1/B HERE, and that is not an oversight: the engine's
+                    # gradients are the gradient of the batch SUM, while the
+                    # reported loss is the batch MEAN (the `/B` in the loss
+                    # expression is for reporting). The CE, the embedding and
+                    # the decay rows all follow the SUM convention -- the
+                    # repo's P0 gate documents the same asymmetry for the
+                    # decay rows. Matching it is what keeps alpha the ratio
+                    # the paper means: both terms then scale with the number
+                    # of streams, so alpha compares like with like.
+                    dz = ((p_fsp - fsp_tgt) * wpos / 256.0 * self.fsp_alpha)
+                    dfh = dz @ self.fsp_W.t()
+                    dstate_fsp, dg_fsp, db_fsp = _layer_norm_backward(dfh, fcache)
+                    lgrads[self.fsp_layer] = lgrads[self.fsp_layer] + dstate_fsp
+                    dfsp_g = dfsp_g + dg_fsp
+                    dfsp_b0 = dfsp_b0 + db_fsp
+                    dfsp_W = dfsp_W + fh.t() @ dz
+                    dfsp_b = dfsp_b + dz.sum(dim=0)
 
             # ---- trace updates (ring + tail credit) — PER BYTE ------------
             # Everything in this block is a per-timestep operation, so each
@@ -1376,17 +1592,37 @@ class GpuModel:
                                     dec[None, :] * (1.0 - dec[None, :]) * l.states)
                     decay_grads[i] += (dlds * l.decaytrace).sum(dim=0)
                     if self.gated:
-                        # dL/dgate = sum_t dL/ds_t * ds_t/da_t * da_t/dgate_t
-                        #           = sum_t dlds_t * s_{t-1} * a_t(1-a_t) * x_t
+                        # The GATE's chain, which the plain sum did not have.
                         #
-                        # The gate enters a_t ONLY at time t, so unlike
-                        # decaytrace there is no cross-time chain and no
-                        # recurrence to carry: a plain sum over the window.
-                        # `dec` here is the EFFECTIVE retention a_t, which
-                        # forward returned in place of the raw sigmoid(decay).
-                        aa = dec[None, :]
-                        gate_grads[i] += (dlds * l.states * aa
-                                          * (1.0 - aa) * gate_xin[i]).sum(dim=0)
+                        # The gate enters a_t at time t only, but a_t keeps
+                        # multiplying s_{t-1} into every later state, so the
+                        # gate's derivative carries the same cross-time chain
+                        # the decay's decaytrace carries -- and one extra
+                        # factor, because the gate reaches a_t through
+                        # gate * x_t:
+                        #     gatetrace_t = a_t*gatetrace_{t-1}
+                        #                  + a_t(1-a_t)*x_t*s_{t-1}
+                        #     dL/dgate    = sum_t dL/ds_t * gatetrace_t
+                        #
+                        # `dlds` is the READOUT-ONLY state gradient (the states
+                        # are stop_gradient), and the trace is what rebuilds
+                        # the chain the engine does not have. Feeding this the
+                        # TOTAL state gradient instead would double count the
+                        # chain -- measured in tools/gate_grad_probe.py.
+                        #
+                        # `dec` is the EFFECTIVE retention a_t that forward
+                        # returned in place of the raw sigmoid(decay): (B, dim)
+                        # in the gated arm (a is per-sample there) and (dim,)
+                        # in the ungated one. gate_trace_update handles both.
+                        contrib, l.gatetrace = gate_gradient(
+                            dlds, l.gatetrace, dec, gate_xin[i], l.states)
+                        # The contribution is already summed over the BATCH
+                        # (gate_gradient does `.sum(dim=0)` on the (B, dim)
+                        # product). The old code summed an axis of size 1 --
+                        # `dec[None, :]` on a (B, dim) dec broadcasts to
+                        # (1, B, dim) -- so nothing was summed over the batch
+                        # and the result kept a batch axis it must not have.
+                        gate_grads[i] += contrib
                 # stop_gradient; after the loop this is the state at the END of
                 # the window, which is what the next window must start from.
                 l.states = states[i]
@@ -1396,6 +1632,17 @@ class GpuModel:
 
         self.last_ce_sum = ce_sum.detach()
         self.last_ce_weight = ce_weight
+        if self.fsp_alpha > 0.0:
+            # The FSP term is reported SEPARATELY from the loss, exactly like
+            # the KD term: a total loss is not comparable across alphas, so
+            # the auxiliary term has to be readable on its own.
+            #
+            # Reported as the MEAN over the batch and over the FSP positions
+            # -- the same shape as the CE's per-byte mean -- so the two
+            # auxiliary terms can be compared with each other and with the
+            # CE without a hidden factor of B.
+            self.last_fsp = float(fsp_sum.detach()) / (B * max(1, fsp_n))
+            self.fsp_positions += fsp_n
         self.last_aux_masked = ((aux_w * var_sum).detach(),
                                 (aux_w * mse_sum).detach(),
                                 (aux_w * end_sum).detach())
@@ -1424,6 +1671,11 @@ class GpuModel:
             if self.gated:
                 srcs[f"layer{i}.gate"] = gate_grads[i].reshape(
                     self.gviews[f"layer{i}.gate"].shape)
+        if self.fsp_alpha > 0.0:
+            srcs["fsp.g"] = dfsp_g.reshape(self.gviews["fsp.g"].shape)
+            srcs["fsp.b0"] = dfsp_b0.reshape(self.gviews["fsp.b0"].shape)
+            srcs["fsp.W"] = dfsp_W.reshape(self.gviews["fsp.W"].shape)
+            srcs["fsp.b"] = dfsp_b.reshape(self.gviews["fsp.b"].shape)
         with rf("grad_copy"):
             if self.grad_assembly == "cat":
                 torch.cat([srcs[name].reshape(-1) for name, _ in self.shapes],
@@ -1544,6 +1796,12 @@ class GpuModel:
         for i, l in enumerate(self.layers):
             out[f"state.{i}"] = l.states.detach().cpu().numpy()
             out[f"decaytrace.{i}"] = l.decaytrace.detach().cpu().numpy()
+            # The GATE's trace is NOT persisted: the gated arm refuses to run
+            # today, so the buffer is always zero and there is nothing to
+            # lose. When the per-sample credit plumbing lands, the gate trace
+            # MUST be added here and to load(): a resumed gated run that
+            # started the trace at zero would silently lose the chain across
+            # the resume -- i.e. exactly the bug the trace exists to fix.
         out["t"] = np.array(self.t, np.int64)
         out["bytes"] = np.array(self.bytes_seen, np.int64)
         out["m"] = self.m.detach().cpu().numpy()

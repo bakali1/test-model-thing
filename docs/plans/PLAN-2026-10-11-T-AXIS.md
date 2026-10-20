@@ -576,13 +576,56 @@ move was P4 (the init). After them:
   ring's credit work -- and it measured 127 B/s against the ring's 3490 B/s.
   The plan priced the dense trace's memory and never its compute.
 
+### 7.2c A paper read, and the one idea in it that transfers (2026-10-13)
+
+`~/Downloads/output.pdf` is **FlashLM** (Chang, May 2026), a self-published
+preprint whose thesis is "the training objective matters more than the
+architecture". Its lever is an auxiliary loss, **FSP**: at every 16th position,
+predict WHICH bytes appear in the next 64, as a multi-hot, with BCE, added to
+the CE at alpha = 0.1.
+
+**The paper's evidence is weak and its own table contradicts its thesis**
+(RELEVANCE-NOTE.md audits this: a single unseeded run; an architecture-only arm
+that beats the headline gain and is never discussed; three rows sharing an
+identical tok/s; the FSP model's coherence verdict is "Partial"). So the
+project treats it as a HYPOTHESIS, not a result.
+
+**But the mechanism is aimed at exactly our bottleneck, and that is the whole
+reason it is worth an arm.** Next-byte CE never asks the recurrent STATE to be
+usable; it only asks the output one step ahead to be right. Our measurement is
+that the state now HOLDS a signal 128 B out and every copy/retrieval probe is
+at chance. FSP's gradient lands on the state, and the engine's existing credit
+machinery (the ring, the decaytrace) carries it to the embedding and to the
+decay logits -- so it reaches the MEMORY, not just a read-out.
+
+**Implemented and gated** (`--fsp-alpha/--fsp-r/--fsp-tau/--fsp-pos-weight/
+--fsp-layer`): the head reads the last layer's state through its own
+LayerNorm, the trainer builds the byte-bag target from the next tau bytes, and
+`tests/check_fsp.py` pins the gradient against finite differences -- including
+the two cells that decide the idea: the head's own gradient, and the decay
+logits' gradient (the memory), which agree to 0.04%. The audit's five defects
+are fixed (the arm was UNMEASURABLE before: the ruler could not load the
+checkpoint; the head borrowed the layer's LayerNorm; pos_weight 50 is
+mis-calibrated for bytes -- our 64-byte window holds 22.0 distinct symbols of
+256, so the balanced value is 8, not 50).
+
+**The known limitation of the first arm**: the auxiliary reaches one of the
+sixteen layers' memories (the layers' states are independent recurrences), so a
+null result would be ambiguous. The per-layer variant is pre-specified as a
+SECOND arm, because it costs 16x the head's flops.
+
 ### 7.3 The corrected priority order
 
 1. **P0-3** (NaN guard + clip) — DONE.
 2. **P6** (per-group wd) — DONE. It is a prerequisite for a P4 arm, not a
    cleanup: without it, the weight decay undoes the P4 init and the A/B
    measures the wrong thing.
-3. **~~The P4 usage A/B~~ — DONE 2026-10-13.** `(wd_decay 0.01/0.0) ×
+3. **The FSP arm** — a state read-out objective, the paper's one transferable
+   idea, aimed at the usage half. It runs on the Colab T4 as soon as the P4
+   long run's GPU is free, with arm A (`A_p4_wd0`) as its matched control:
+   same init, same wd, same corpus, same seed, same byte budget, one flag
+   different. `docs/runbooks/fsp.sh` is the protocol.
+4. **~~The P4 usage A/B~~ — DONE 2026-10-13.** `(wd_decay 0.01/0.0) ×
    (default init / P4 init)`, with the retention ruler as the verdict, not
    only CE. Verdict: the init buys the capacity, the weight decay destroys
    it, training does not, and the model still cannot use what it now holds.
