@@ -719,13 +719,23 @@ class GpuModel:
             self._tail_rebase_at = -1
         self.ring_b = torch.zeros((B, self.ring_k), dtype=torch.long,
                                   device=self.device)
-        self.ring_vals = torch.zeros((B, self.ring_k, self.dim), dtype=F,
-                                     device=self.device)  # reusable scratch
+        # The dense trace REPLACES the ring, so the ring's per-layer buffer
+        # and its scratch are allocated EMPTY on that path. They are never
+        # read there (the credit block takes the dense branch, and the tail's
+        # rebase -- the only other reader -- is skipped), and at ring_k=256
+        # they are the same size as the dense trace itself: 2.15 GB at B=256,
+        # 8.6 GB at B=1024. Allocating both is how the P4 arm OOM'd on a 4 GB
+        # card while the dense trace was supposed to be the cheaper of the two.
+        # `states` and `decaytrace` are needed in BOTH modes -- they are the
+        # recurrence and its gradient carrier, not credit.
+        dense = (self.trace_mode == "dense")
+        self.ring_vals = torch.zeros((B, 0 if dense else self.ring_k,
+                                      self.dim), dtype=F, device=self.device)
         for l in self.layers:
             l.states = torch.zeros((B, self.dim), dtype=F, device=self.device)
             l.decaytrace = torch.zeros((B, self.dim), dtype=F, device=self.device)
-            l.ring_w = torch.zeros((B, self.ring_k, self.dim), dtype=F,
-                                   device=self.device)
+            l.ring_w = torch.zeros((B, 0 if dense else self.ring_k,
+                                    self.dim), dtype=F, device=self.device)
         if self.trace_mode == "dense":
             # P2: the exact embedding trace, (B, 256, dim) per layer.
             #
@@ -751,6 +761,18 @@ class GpuModel:
     # ---------------- tail credit --------------------
     def _ensure_tail(self):
         if not self.tail_enabled:
+            return
+        if self.trace_mode == "dense":
+            # The dense trace REPLACES the tail: it is the tail with every dim
+            # hot, so the tail's accumulator would be allocated and then never
+            # read. That is not free: with the P4 init's 239 hot dims per
+            # layer, the tail's (B, 256, H) accumulator is 1.0 GB at B=256 --
+            # a third of a 4 GB card, spent on a buffer the dense path never
+            # touches. (Found by an OOM while running the P4 arms: the RING
+            # at ring_k=256 is 8.6 GB at B=1024, which is the same bill the
+            # plan priced for the dense trace, and the plan's P4 arm was
+            # going to be run at B=1024.)
+            self.tail = None
             return
         if self.tail is None or self.tail.B != self.B:
             self.tail = TorchTail(self.B, self.ring_k, hot_frac=HOT_FRAC,
