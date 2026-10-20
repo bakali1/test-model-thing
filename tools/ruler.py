@@ -33,10 +33,7 @@ from tools.membench import eval_api as E
 
 CKPT = os.environ.get("TMT_RULER_CKPT",
                        "runs/lrroles/arm_lrdecay1x_t919897.npz")
-RAW = os.environ.get(
-    "TMT_RULER_RAW",
-    "/home/baku/programing/opensource/new-llm/test-model-thing/data/eval/"
-    "tinystories_valid.txt")
+RAW = os.environ.get("TMT_RULER_RAW", "data/eval/tinystories_valid.txt")
 
 
 def _hr():
