@@ -229,6 +229,10 @@ class Model:
         self.wd_decay = float(wd_decay)
         self.t = 0
         self.bytes_seen = 0          # exact training bytes, saved in checkpoints
+        # (file index, byte offset within the file) -- the DATA STREAM's
+        # position, persisted in the checkpoint so a resume continues the
+        # corpus. None = unknown (a fresh run).
+        self.data_pos = None
 
         lim = 1.0 / np.sqrt(dim)
         # Ring-buffer trace: retain lag k while its weight (~decay**k) is above
@@ -667,6 +671,12 @@ class Model:
             # chain across the resume.
         data["t"] = np.array(self.t, np.int64)
         data["bytes"] = np.array(self.bytes_seen, np.int64)
+        # The DATA STREAM's position, so a resume continues the corpus
+        # instead of replaying it (see gpu_port.params_dict for why this
+        # matters and what it costs if it is missing).
+        if getattr(self, "data_pos", None) is not None:
+            data["data_file"] = np.array(self.data_pos[0], np.int64)
+            data["data_off"] = np.array(self.data_pos[1], np.int64)
         data["m"] = self.m
         data["v"] = self.v
         data["B"] = np.array(self.B, np.int64)
@@ -705,6 +715,8 @@ class Model:
         # don't have it; fall back to t*B, which is exact unless the batch size
         # changed at some point in the model's history.
         self.bytes_seen = int(d["bytes"]) if "bytes" in d else self.t * self.B
+        if "data_file" in d and "data_off" in d:
+            self.data_pos = (int(d["data_file"]), int(d["data_off"]))
         if "m" in d:
             if d["m"].shape != self.m.shape:
                 raise ValueError(

@@ -603,6 +603,11 @@ class GpuModel:
             raise ValueError(f"fsp_alpha must be >= 0, got {self.fsp_alpha}")
         self.last_fsp = 0.0
         self.fsp_positions = 0
+        # (file index, byte offset within the file) -- the DATA STREAM's
+        # position, set by the trainer and persisted in the checkpoint so a
+        # resume continues the corpus instead of replaying it. None = "no
+        # position known" (a fresh run).
+        self.data_pos = None
         if self.ce_only and self.distill_alpha > 0.0:
             raise ValueError(
                 f"ce_only=True requires distill_alpha == 0, got "
@@ -1804,6 +1809,17 @@ class GpuModel:
             # the resume -- i.e. exactly the bug the trace exists to fix.
         out["t"] = np.array(self.t, np.int64)
         out["bytes"] = np.array(self.bytes_seen, np.int64)
+        # WHERE THE DATA STREAM IS. The trainer restarts the corpus from the
+        # first file on every resume, so without this a resumed run re-reads
+        # the bytes it had already trained on: the arm's UNIQUE data would be
+        # capped at the checkpoint cadence (10 MB at the 10k-step cadence),
+        # and a 165 MB epoch would degenerate into "the same 10 MB, sixteen
+        # times". The pair (file index, byte offset within the file) is the
+        # whole position, because the file order is a deterministic shuffle of
+        # the data seed.
+        if self.data_pos is not None:
+            out["data_file"] = np.array(self.data_pos[0], np.int64)
+            out["data_off"] = np.array(self.data_pos[1], np.int64)
         out["m"] = self.m.detach().cpu().numpy()
         out["v"] = self.v.detach().cpu().numpy()
         out["B"] = np.array(self.B, np.int64)
@@ -1889,6 +1905,8 @@ class GpuModel:
         if "t" in d:
             self.t = int(d["t"])
         self.bytes_seen = int(d["bytes"]) if "bytes" in d else self.t * self.B
+        if "data_file" in d and "data_off" in d:
+            self.data_pos = (int(d["data_file"]), int(d["data_off"]))
         if "m" in d:
             if d["m"].shape[0] != self.m.shape[0]:
                 raise ValueError(

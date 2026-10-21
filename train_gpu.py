@@ -539,8 +539,25 @@ class Trainer:
                 self.telemetry.maybe_emit(m, self.telemetry_every, digest)
 
         t0 = time.time()
+        # THE DATA POSITION. A resume must CONTINUE the corpus, not replay
+        # it: the file loop below always starts at the first file, so without
+        # this a resumed run re-reads bytes it had already trained on and the
+        # arm's UNIQUE data is capped at the checkpoint cadence. The position
+        # is (file index, byte offset within that file); the file order is a
+        # deterministic shuffle of the data seed, so the pair is exact.
+        start_file, start_off = 0, 0
+        if m.data_pos is not None:
+            start_file, start_off = m.data_pos
+            print(f"  [data] RESUMING the stream at file {start_file}, byte "
+                  f"{start_off} (the corpus is NOT replayed from the start)",
+                  flush=True)
+        file_idx = -1
+        logged_resume = False
         while True:
             for file in files:
+                file_idx += 1
+                if file_idx < start_file:
+                    continue                      # already trained on this file
                 with open(file, "r", encoding="utf-8", errors="ignore") as f:
                     data = f.read().encode("utf-8", errors="ignore")
                 if len(data) < self.batch * 4:
@@ -557,6 +574,18 @@ class Trainer:
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
                 for c, n_, e_, Tw, t0 in self._windows(mats, ets, L):
+                    if file_idx == start_file and t0 < start_off:
+                        continue                  # already trained on these bytes
+                    if (not logged_resume and start_off
+                            and file_idx == start_file and t0 == start_off):
+                        # The first window AFTER the resume, and the byte it
+                        # starts on: printed so a gate can assert that the
+                        # stream CONTINUED rather than replayed.
+                        print(f"  [data] the first window after the resume "
+                              f"starts at window {t0} of file {file_idx}, "
+                              f"byte {int(c[0, 0])}", flush=True)
+                        logged_resume = True
+                    m.data_pos = (file_idx, t0)   # persisted with the next save
                     loss = m.step_batch(c, n_, e_,
                                         self._fsp_args(mats, t0, Tw))
                     if self.telemetry is not None:
