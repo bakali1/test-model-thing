@@ -47,3 +47,13 @@ __pycache__/
 # experiment output (756 MB); keep history readable for rig commits
 runs/
 runs/lrroles/*.npz
+# The corpora and the model weights are LOCAL and are deliberately not in
+# git.  They were removed from the history on 2026-10-21 (the pack was
+# ~135 MB of training text and a 52 MB safetensors); the paths below are
+# restored from the local backup and stay untracked.  Regenerate with
+# docs/runbooks/fetch-corpus-box.sh; the weights come from upstream.
+data/wikipedia_clean/
+data/eval/
+data/eval_shift/
+legacy/tinystories_bench.txt
+legacy/smaller-4.5m.safetensors

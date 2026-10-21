@@ -1569,7 +1569,7 @@ specified**, not "distillation can never work here".
 `PLAN-2026-10-04-ROADMAP.md`'s reframe — the standing blocker is gradient SNR
 ≈ 0.05, a *gradient-estimator* problem — is now better supported than the
 distillation route, and the rig has just closed the role-specific-LR axis
-(`5f5fe16`). The teacher-disagreement number above is itself evidence for that
+(`c10cb72`). The teacher-disagreement number above is itself evidence for that
 reading: the thing a better teacher supplies is a *better gradient*, and at
 4.5 M parameters with O(1) state there is a hard ceiling on how much of a
 full-context teacher is usable.
@@ -2006,7 +2006,7 @@ median→p90 span to grid over. Measured median step multiples:
 
 ### The `/B` precondition, and a first arm that actually satisfies it
 
-The P0 action-1 gate (`3f2faca`) found the decay rows' gradient is **exactly B×
+The P0 action-1 gate (`93de9f3`) found the decay rows' gradient is **exactly B×
 too large** — the loss is `/B` but `(dlds * decaytrace).sum(dim=0)` is not.
 Harmless under AdamW (per-parameter and scale-invariant: m → m/B and √v → √v/B
 leave `m/(√v+ε)` unchanged, which is why 889,897 steps ran clean). **Not**
@@ -2920,7 +2920,7 @@ corrected above.
 
 ## RETRACTION — the `/B` decay-role "defect" was not a defect; the SGD memory-role finding is an artifact of its own harness (2026-10-05)
 
-This retracts the claim first recorded in `3f2faca` and repeated in the
+This retracts the claim first recorded in `93de9f3` and repeated in the
 ROADMAP and in the "optimizer axis" section above: that the decay rows'
 gradient was "exactly B× too large relative to every other parameter group".
 

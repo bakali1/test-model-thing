@@ -246,7 +246,7 @@ gradients, per layer. That is a rewrite of `_scatter_ring_credit` / `_ring_credi
 
 ### 2.2 The FSP path is ALREADY in the tree — an audit of it, and what is still open
 
-The implementation landed as commit **`8024051` ("the FSP objective, and the P3 gate
+The implementation landed as commit **`3679409` ("the FSP objective, and the P3 gate
 gradient's mechanism, finally known", 2026-10-20 11:48)**, in parallel with this
 note: `--fsp-alpha`, `--fsp-r` (16), `--fsp-tau` (64), `--fsp-pos-weight`,
 `--fsp-layer` (-1 = last); the head is `fsp.W` (dim -> 256), `fsp.b`, `fsp.g`,
@@ -258,11 +258,11 @@ through its **own** LayerNorm; `Trainer._fsp_args` builds the target from
 `tests/check_fsp.py` (new) gates it. The runbook is `docs/runbooks/fsp.sh`.
 
 **The tree moved under me while I was auditing it** (the FSP work was being written
-and committed between 11:38 and 11:48 today, and a second commit `1ac6372` landed
+and committed between 11:38 and 11:48 today, and a second commit `a2a7266` landed
 the P3 gate gradient at 11:51). So each finding below carries its status *as of
 12:00 today*, and the audit is reproducible from Appendix C.
 
-**D1 - "the arm is UNMEASURABLE" - FOUND AT 11:38, FIXED IN PARALLEL (commit `8024051`).**
+**D1 - "the arm is UNMEASURABLE" - FOUND AT 11:38, FIXED IN PARALLEL (commit `3679409`).**
 At 11:38 the ruler could not load an FSP checkpoint at all: the head lives in
 `theta`, so the checkpoint's `m` / `v` are longer than a numpy_port model, and
 `numpy_port.Model.load` refused it. Reproduced verbatim at the time:
@@ -290,7 +290,7 @@ arm: the toy state's Gram matrix is singular to machine precision for the **alph
 16 layers the state is 8192-dim and the ridge has ample rank.)
 
 **D2 - the FSP loss reaches exactly ONE of sixteen layers' memories. STILL OPEN**
-(as of `8024051`).
+(as of `3679409`).
 
 The gradient path is correct as written (the state gradient is added to
 `lgrads[fsp_layer]`, which is what the ring credits to the embedding and what the
@@ -316,7 +316,7 @@ a job", one of sixteen channels getting the job is a thin test of it. A
 in the paper, whose model is a single-stack transformer where "the state" is one
 thing.
 
-**D3 - "the FSP loss moves the shared LayerNorm gain" - FIXED IN PARALLEL (`8024051`).** The
+**D3 - "the FSP loss moves the shared LayerNorm gain" - FIXED IN PARALLEL (`3679409`).** The
 earlier version put the FSP gradient into the *shared* LN parameters of the layer
 the head reads (measured at the time: `layer1.g` moved by 4.3e-6, `Wd` by 1.5e-8, so
 an FSP arm's held-out CE could move for a reason unrelated to memory). The head now
@@ -325,7 +325,7 @@ perturb the local read-out - confirmed by the measurement in D2, where `Wd`, `bd
 every `layer*.g` now show a **0.000e+00** FSP contribution. The confound is gone.
 
 **D4 - `--fsp-pos-weight 50` is the paper's number and it is mis-calibrated for
-bytes. STILL OPEN** (as of `8024051`: the CLI default is still 50).
+bytes. STILL OPEN** (as of `3679409`: the CLI default is still 50).
 
 The paper's 50 is tuned to a BoW target over a 4,096-token
 vocabulary: at tau = 64 tokens the target is at most 64/4096 = 1.56 % dense, so
@@ -353,7 +353,7 @@ head's operating point, so it sets where the head sits, not what it learns - but
 50 the FSP term is roughly 6x over-weighted relative to the paper's own balance and
 it dominates the loss early.
 
-**D5 - "the FSP loss is never logged" - FIXED IN PARALLEL (`8024051`).** `train_gpu.py:620-625`
+**D5 - "the FSP loss is never logged" - FIXED IN PARALLEL (`3679409`).** `train_gpu.py:620-625`
 now prints `| fsp {m.last_fsp:.3f}` whenever `m.fsp_positions` is non-zero. That is
 the number to watch on the arm: if it does not fall, the head learned nothing.
 
@@ -912,7 +912,7 @@ value.
 ## Appendix D — what this note did not do
 
 * No engine code was modified by me. The FSP implementation this note audits was
-  written and committed **in parallel** (`8024051`, 2026-10-20 11:48) — this note
+  written and committed **in parallel** (`3679409`, 2026-10-20 11:48) — this note
   audits it and specifies the missing pieces; it does not change it. The two
   findings that are still open against that commit are **D2** (the auxiliary reaches
   one layer's memory, not sixteen) and **D4** (the `pos_weight` calibration), plus

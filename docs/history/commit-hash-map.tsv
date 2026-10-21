@@ -1,0 +1,134 @@
+# old_hash	new_hash	date	subject
+a0444c1548646dbabf534062da868e9e8b5d3802	4d2a71ab7faa7678bea176fcccfcc8f7c1f779d6	2026-10-21	the read path's verdict was a broken probe, and the plan now has one goal
+c836c050df165bbcc6d3eb40aaba29b8c2e426fb	2636628e26b1cea5f241bdbc638e73c236c8e349	2026-10-21	C's result in the plan: FSP is a null with a measured cause, and the next candidate moves to the read side
+c61037ac8dded30d9a384225a0b73ce8bc37bd0e	a0c0466b463de456767be85d55747ecb17d78a13	2026-10-21	the Colab/HF plan's audit: what the C run had to survive, and what it had to be corrected for
+442c622f9a747b17a299b23941d6163b635fbc79	916e79a31ea836cb9a991f5dcf69657b17d64996	2026-10-21	C: the P4-vs-FSP A/B on a T4 -- FSP is a null, and the null has a measured cause
+e4aa60dbe13d6ed6993be3311f99827845d5d9b1	b68973e027ad46b7deab5be89cf585a675f5dc72	2026-10-21	the default credit path is now the fastest bit-identical one
+2d29a1b734c05bf66f9e220325df4240cfbfb358	acf8446df8247588e89ad99a37c74b64794851f2	2026-10-21	the gates table: the two new tools belong in it
+db5a2db1eca528eac343b38fe8293cbdc33ed900	a6e0a9ba252cf6163b91ab8994cecddff3e15bc9	2026-10-21	the whole step, once per path: nvrtc is 1.26x the default end to end
+b548e6b8514458b86832772558624e2511ccf93c	6b6a2698972f6246dae6465febc34eb63dea5a63	2026-10-21	the grouped credit, measured on a T4: legal, bit-identical, and SLOWER
+40fd5d5486892aff56da3a6c7b7fa4cfbf5a10b6	9277ae57f4bc46fcaebec2162f099d96763cb8f0	2026-10-21	the speed verdict: the wall is the bytes, not the atomics
+ec663a45dcc6dff2119c2efff8a96df98eaac3d8	c2d26000b2cdf10692eeb7ddf3ab6a20c402fbc9	2026-10-21	the cycle must not fight the allocator for the bridge
+a8de5cc1d86cc1ba4b29b5a21a1780aa85584e02	a49f6feb450b6b6257edc61c3b237a45c07c1ab3	2026-10-21	the bridge is exclusive, so the wait must not reconnect every 30 seconds
+6a631bc7b08f162755ee61ead958aef294a687c4	b27302f2d84fda69ac3916350788a0af130181f7	2026-10-21	the gate also emulates the CUDA kernel's index arithmetic
+add994792e569e70368930d934a4323785fb83dc	e5f0a3d875557b07e24e670c8ee9576eb603e5d2	2026-10-21	the legality analysis, and the correction of the premise it was asked under
+9bff37ca9ab1e8adf8dc435aaca4edf2eea61c1d	029020667567885762435de934c14fb9aeb8ae2d	2026-10-21	the hub's pull was broken, and the arm match was too loose
+c962e777c51300a4cb07f349e74cb87fbd1bebab	a421439a446ded942b1d54241e82b46796bad164	2026-10-21	the harness: the atomic RATE was overstated by the number of layers
+6dbbc27160d8fc083fb02827d884bcf7dc9a534a	22849f02e84720e7cdb67cf463fc5585ac8b7333	2026-10-21	the grouped credit: the same float, with no atomics at all
+a7f11070a4060e581a1cf9fdf6145da856bbcc85	9de1512753670f92eace43521f75370e0ceb8ba4	2026-10-21	a compiler for the CUDA kernels, on a machine with no CUDA
+7fa64bf49b9452dfa85b5d5c75a4fefbb29c9e0c	803028d99f53a4c0ff79a2d5011bd0c59a545b32	2026-10-21	the cycle must ship fresh code and must not believe a failed arm
+20bf467e248a3f6c85d4c973325243a3098b9eb8	c55fafbf494f70d40abb1d68ecb00c672398f317	2026-10-21	the hub's pull must never load another arm's weights, and the A/B must survive recycling
+e557da1f139a66aeeefe7672f8b0e97db3446c71	839aa6565ca6338a77969f5f66a84efa75d484da	2026-10-21	an ABSOLUTE step target, so a resumed run lands on the same budget
+fc36b6048348f03d2b968836605424e65a3fe173	ad575b4b1e3d084334447902a7a15f555257c184	2026-10-21	the harness: it never ran (no _ring_dest), and it measured 256x the contention
+74c6ade88284a1cd173a28bb4b5403399bc0a36f	9d9aac61f0d232cd390f7053d3f91071cb775519	2026-10-21	a harness for the credit's cost, per path, with the atomic arithmetic beside it
+cef2057009ba2c64318af3b01ef5b4e8a4333ecb	c32726ce3f6810bd7f8aa1cdb9e3e375ac80cc1a	2026-10-21	the checkpoint now carries the DATA POSITION, so a resume continues the corpus
+1b12a7f21c8f9166b36cd94b73a749c66f62fd5e	5361b2e011ceeb895386d1acd40d2a84dc90fef5	2026-10-21	the hub's pull was arm-blind, and would have loaded the wrong weights
+aa23086f50a7bb627a0b70cdd80c0ccf03bbd056	62fc1e22cad18e47e1b2d1b4d43edc33312cd7fe	2026-10-21	the FSP log line, and the Colab/HF run plan
+fb6c158ed7e41d8d2a51fcf016bf4fc6c572a38a	882e27e617bb03946c5ef51dc6fae3bd1d715428	2026-10-20	the record: the FSP bag cell, and the two calibration decisions the audit forced
+b8d8a47315fa357413b7d5b5a101760d944ee1b5	ba6e4c87eecd6aee49ede5b6eecfe9f39a20a0ee	2026-10-20	the FSP bag cell: did the auxiliary learn the prior or the context?
+1ac637293e4c67aad14a9ec10e7fc161ee4dfcfc	a2a726654034fb9e1f62b775ad4abac609ba1f86	2026-10-20	the P3 gate gradient: the chain is a trace, and the axis was wrong too
+80240510e4ac8b72475d43adbeb15dbec85c33c7	36794092cb771bc050d4acc653da7f0fa8478efe	2026-10-20	the FSP objective, and the P3 gate gradient's mechanism, finally known
+db13c9bc9546389ea6bf8f944595f52f8800aa5f	21d8d84f41f9a26cedb664706d9a771128849a8d	2026-10-20	the P4 long run: more training, on Colab, at the incumbent's recipe
+cdae0db69ad4ebdcc1d238763a03bf9358865cee	9ce075fd399887fdc8fa593192e43142f2eac9c6	2026-10-20	the P4 usage arms: the init buys the capacity, the weight decay destroys it
+6e81db8c5a9442c8b8c7a1757902e2ca766ef3a6	01f3f4d8602bfca6d4903c8f570ca94b3b436794	2026-10-20	engine: the dense trace was paying for the ring it replaces
+c81531b3380925fb5f97ce237dc1bdf35c59433c	d3b33a51e6ad4bd7e7df5b17b6dfbdf9b8cfde8f	2026-10-19	tests: two more gates that were CPU-only in name only
+2936cf62e82b5f807cfb7c4973de574c5fd6c4aa	c2a1ee71a50483ab51f3be53c6538ba77061fd85	2026-10-19	the T-axis plan, executed: P0 and P6 done, and four corrections
+c91609cb15277161d9857db2cea6a43ad4683ca1	d3d30f9c766cff43f4a1425b2eb83ef3d2a7a2b5	2026-10-19	tools: a 0-training capacity probe for the P4 init, and four device bugs
+7efe73d8c54d30062f8e707ce1cf344092845995	3e633d2af13c2eb1efc4e85d4f829e2ef52f7ba9	2026-10-19	engine: the T axis, the safety features, and the per-group weight decay
+de2ac7437e65eecceb2d24814de6c9c1d78b3336	12d075483dc4e4d8bbe989e002e7c6e548b3ae64	2026-10-06	membench: synthetic long-memory benchmark suite (plan priority 2)
+bdc157debeb6a8228009fc17c9f68d6199db68c5	54dc8244724043074ce1e9bce74a0f880b2f9c8d	2026-10-06	responses: accept external critique (rev 2) and adopt the memory-benchmark plan
+0f29ad7d292faa0707de472608731a61bf281dea	255beb00ef130f56be290cae50b30c05f8128857	2026-10-05	strategic review 2026-10-05: the memory programme is aimed at a phantom
+e65fd8cf22ec1364dfbea5956c9e60ae2c665d6b	a49a4807ab37446e3e115485843bdde677725519	2026-10-05	state_probe: THE RULING -- random bytes are a sensitivity CEILING, not a veto
+490a69abc43159b2aa700863398f0e1babe3b60b	06906783a8fabbc8b348b317425641da1c78c707	2026-10-05	security: two bundle generators wrote a live HF token to disk in plaintext
+6d83d7c870365f793652fa94e63ea948aeb5bc8f	35968ad19766122f63cdb196f0dfde1ac2388cd6	2026-10-05	papers: a VERIFIED shelf of the 18 items the external LLM answers recommended
+da783ae6f3098d4086bffe2e54fdb0ec78be60f5	001afb6e44af86dcb74dfaafcfa557a6848ded52	2026-10-05	state_probe: the 8 B memory horizon is a property of the CUE DISTRIBUTION, not of the model
+6e0eb0eb42279271477c8d2afa4c588a7e7c944d	eb5278d266388db602724d18c6d6026d6a4bd65f	2026-10-05	P1: the over-large-step diagnosis survives its own falsifier, and the ruler's horizon was partly a stimulus artifact
+d00d5cf2452a00a4069af24609649856904d0bad	1ff580aedf76db34eece2bac35ca8ca7be577db9	2026-10-05	state_probe: --cue uniform|corpus-support|corpus-freq, with the modal baseline printed
+7e0cb8aaa5382b8e708db4a8f4ed1ae7cfb1998b	966e6959dacfd5d1fe0821b2d9e5d65faf90b0d2	2026-10-04	measure: the SNR blocker is ~12.6x pessimistic, and it is a step-size problem
+d0850e802d4988af7fa4b7c76f8fa638684a7fa2	bc5a8d2f05756ea4ba622345954e0a1e85b6fe4e	2026-10-04	distill: the A/B on a T4 at frozen B=1024 replicates, and the arms are banked
+93820e02ac13eac396552f97f327b751217f67c1	c5739c20279058f48eb3feef01db5402ba98a283	2026-10-04	distill: fix the MI target at every depth >= 1, mask the KD gradient, add the control arm
+3f2faca08009f6a2e7dc980f16aa8148ea066e10	93de9f3f11fb5f4c7b66c50d3a224d656da1e296	2026-10-04	P0 item 1: the eligibility trace is exact, and the decay rows miss a /B
+f635853d6cc051a6e3ebaf840d88191e4fff970e	fcc81ebd82a2d11f0b7c4cfd296a1d32d0d9ffab	2026-10-03	fix the target (Case I, depth 0 only), then close the KD arm: it still diverges
+80cc8b8fa73f4972c9b103231a8a1c0067482973	67e465d5fad951dba4f9310d361ae4a22d206e84	2026-10-03	Colab T4 smoke: PASS, and it proves the MI target carries no uncertainty
+5f5fe16339a717b17e5705225bb04c9fafc2d6d5	c10cb72469f77a871f3072795da32d24ab6e76cf	2026-10-03	run the role-specific-LR factorial: axis is live, buys nothing, closed
+5175a02ff56d3f8c8810615f6d389f089f149097	9b30cf25810b4e8cd8b9bbe728deb5ac9216f856	2026-10-03	measure KD cost on CPU: +1.5% at B=256, so the plan's +10-30% estimate was 10-20x high
+a9721c84ec95b6b7f02fd117ceace06b1cb6586b	c761cd629906484b9bd9fe091608482be8a4c9f3	2026-10-03	distillation: MI dump + KD term, 3 gates green; steps 1-2 withdrawn
+060c28fbb872f4f7666c6e602c195a2d3be2721d	a7c824965d015feeb6e01eefeea287c58d02b39b	2026-10-03	per-role learning rate (--lr-decay) + Colab factorial + gate
+b0c507477479a7faeddcdcd094206f6b939d3b16	9019c4a31769331a0ae6216173de59f2e3d0ed65	2026-10-03	space: DEFLATE checkpoints (2.0-2.2x, lossless); expose nvrtc in the CLI
+11d2edd0f4600cbd6a4000c5395856bbc043e391	adaa09c27abf63357c1023d14f2b19c668e29480	2026-10-03	perf: fused NVRTC ring credit (+1.33x on a pre-Volta GPU), and 2 bug fixes
+5a626bda1f203b89a8fe0bd7b4955a84c608d4f0	e01f3c8799aa13ade0952742117144f7ac3a494f	2026-10-03	distillation: gate 0 cleared + teacher measured (LFM2.5-230M-Base)
+81ab360336368f7378479b3943c7516f74d5a233	78bdabbde60528aed9c388342cd04eb330ef41b6	2026-09-26	checkpoint in-flight work before handing the repo to an OpenRig rig
+de6236e666958839908767f14c6d9655d3553dfb	23b5d87cb3bd6a461505f3b2989fa9b3ee660491	2026-09-25	organize the repo layout, not just the docs
+56ea7c035f633590ddbafe657172b0582bd2ad9c	cb3de2c2f3dd853ea9fcac5f61c32f31270c8130	2026-09-25	remove the orphaned sha256 sidecars the cleanup missed
+a1d6781686e38aec52026cb90c03dad448fe36c5	7ad173775bd08cb08853fd07e193ba686ef83d3e	2026-09-25	put the models in models/; keep tmt.npz at the root on purpose
+1b8e541412b6ef90823c82b735fc8cb2a4a09373	7bce645fba5e2404151fc0aa93426870d02d7be4	2026-09-25	organize the repo: docs tree, index, and 1.6 GB of dead weight removed
+99408af59363b2ade0c4f70bb5d359f6db32ce42	921294e98687a5dab06cd8055e0e78619513ccdc	2026-09-25	add chat_models.py and record the qualitative inspection
+d87b3f2b5b68a4705bdacec4a45274caa7e2429c	5c34e54b9d4aaee6fdd12d8cd9eec416c68449cd	2026-09-25	CORRECTION: the 'layered mix is dominated' verdict does not survive its control
+f547803d164e41afc11628fa6ed4531fb710fbfd	3da0ac0dbb5f2fee0bd2ffe2449d1ef5e326f675	2026-09-24	union local and remote tags so --at-step can actually move forward
+01f14ef292b4cde37cb3712c8d10d6379dd297c1	44255772665489bd2167e219720378d3be7d60f6	2026-09-24	three-way matched result: the layered mix loses
+7288ec40b5c6b7fe6331823670d58d5d19bde8cf	27080a0e903c7b2b72fd257b7542fe4240ca3cb1	2026-09-24	bake TMT_FS_STEPS in at generation time, not at run time
+b081143d86bbf79df2c6ef2f96bb2f69ca7c2567	78612d09c982cee9900b8a7cc07f02b4a4886e56	2026-09-24	record the 2026-09-24 findings: the from-scratch corpus verdict
+33c31a08182276a9bff23136bea317e0e28aa74a	f66b8a604de7b80446a286db082b7af6e33b32d1	2026-09-24	key the eval cache on the eval args
+70c009d475820b343ef9a3d7e022856d81d2b3fa	bce57d4c65be2ec0fc8dc2c4f4f40af1b39caad1	2026-09-24	fix two sign errors in the verdict logic and a regex that ate commas
+a53bf595ead19ec504ce0ece4976a9584bb6df1a	e8a30e7a42b57a835613998561946854bc32e4a5	2026-09-24	push only the final tag; fix two pull bugs that nearly faked a verdict
+183f5cdd01d9dffd8e93586bb31e638ce656c43f	2bb63d019420d2dc037c65d19dc1e4b30a6ca621	2026-09-24	compare the arms at MATCHED steps, and let a run pin its own count
+d239fc1841cead28186c874e362f619c51857291	b895e6f150941bdfc0b5aeaa23b4229135211ba7	2026-09-24	add fs_verdict.py: score the arms side by side and apply the 0.03 bar
+c2c27b558b629492886ebc7dc83344528ce77401	b88bdb67c3cbb4a608993a778baa2d6813934f8a	2026-09-24	carry forward the earlier session's uncommitted fixes
+846d8ecce2d45c43d0d6a5a5ea39b2d72fb4ec94	846d8ecce2d45c43d0d6a5a5ea39b2d72fb4ec94	2026-09-24	calibrate over 200 steps and stream the training log
+d52ea390a4150ca225f1f707bd17d750a4b472d5	d52ea390a4150ca225f1f707bd17d750a4b472d5	2026-09-24	measure a real rate in calibration: discard warmup before the clock
+fb2bd06559e4f9dfc828492e046a33f7a8592238	fb2bd06559e4f9dfc828492e046a33f7a8592238	2026-09-24	fs bundle: embed the modules, since colab run has no repo on the VM
+6034ed3fe60fa143f11ff10fb0564fefa158f868	6034ed3fe60fa143f11ff10fb0564fefa158f868	2026-09-24	fs bundle: resolve the repo dir when __file__ is absent
+f6c6ac3e9ed24ff85d7f3e9c4579dff0aafbe8b7	f6c6ac3e9ed24ff85d7f3e9c4579dff0aafbe8b7	2026-09-24	add the from-scratch corpus arms (FS-W / FS-N / FS-L), 1h GPU each
+c41f4572c7c423b62dd554931a81a31d7612d164	c41f4572c7c423b62dd554931a81a31d7612d164	2026-09-24	ship the +27% ring path as the default; remove everything that lost
+0d4dd63abcf7e551a278326106e1e75335f77a07	0d4dd63abcf7e551a278326106e1e75335f77a07	2026-09-24	200-step real-data board: a2-compiled +27%, and three more factored-tail bugs
+ffd3f0ddf5bb8404fe256775a5905504d418ed56	ffd3f0ddf5bb8404fe256775a5905504d418ed56	2026-09-24	board run 3: gradient-buffer fusion is within noise; establish the +-3% noise floor
+0798277b6668b0cfe8b31aa32dc93cc7e47ded7f	0798277b6668b0cfe8b31aa32dc93cc7e47ded7f	2026-09-24	profiler: phase attribution via record_function, and honest per-step accounting
+f408565af65c23a7ce925c53b052f6ba39aa4e7a	f408565af65c23a7ce925c53b052f6ba39aa4e7a	2026-09-24	plan: record the measured outcome at the top so it supersedes its own targets
+1cec431354fe7f6e52e6a58fe19e9a89045ee3a1	1cec431354fe7f6e52e6a58fe19e9a89045ee3a1	2026-09-24	Phase-0 board measured on T4: only a2-compiled wins (+20%); plan predictions refuted
+d2b634181021b8dca6dfab398458c1ad268be025	d2b634181021b8dca6dfab398458c1ad268be025	2026-09-24	variant verification: fix two real bugs, add tests/check_variants.py
+aa2bbe10a26fdc032002f56972bbf20377888fb0	aa2bbe10a26fdc032002f56972bbf20377888fb0	2026-09-24	standalone GPU optimization plan
+3eed1ed9ac096bd504c149aed00b01fc311524e5	3eed1ed9ac096bd504c149aed00b01fc311524e5	2026-09-24	optimization plan from the live-leg profile: the ring is 87% of traffic, not the tail
+2f0dfbffdcc2937691b243b5f5640a11e7cd9748	2f0dfbffdcc2937691b243b5f5640a11e7cd9748	2026-09-24	leg run 2: banked the checkpoint; EOS ruled out, hot-dim growth is the cost
+8eaaafe839bb27e69c4d6cb4c7aad528af288550	8eaaafe839bb27e69c4d6cb4c7aad528af288550	2026-09-24	live 30k leg: all infra PASS; push the final tag, and measure the real rate
+1d72c6705ae673218e5eb91f8eeb47b9de680718	1d72c6705ae673218e5eb91f8eeb47b9de680718	2026-09-24	leg bundle: embed the hub repo id, not just the token
+44693e5a55a070fe12bb596f97499326449e0684	44693e5a55a070fe12bb596f97499326449e0684	2026-09-24	hub: make the digest check actually run on pull
+df4214f3d2b0f656ea5dac23b9f01494cc37b57c	df4214f3d2b0f656ea5dac23b9f01494cc37b57c	2026-09-24	live-checkpoint leg: self-contained generator with embedded HF token
+debd576a31a2d741778ea7bb16fd9ee82cc47c59	debd576a31a2d741778ea7bb16fd9ee82cc47c59	2026-09-24	runbook: 10k live leg saves every 5k (keep_k=3), no hub push in the loop
+bdd2721cf12cf5cbfa41218b6db89a7b1fc3fb33	bdd2721cf12cf5cbfa41218b6db89a7b1fc3fb33	2026-09-24	CUDA state-parity gate: run it, and let it catch the metric floors
+2688a0df1a2c5c07f7dea2ebf1f79c2a71438a00	2688a0df1a2c5c07f7dea2ebf1f79c2a71438a00	2026-09-24	second review response: A/B tag isolation, pre-alloc tail cap, state invalidation, content-verified hub, crash-safe corpus publish, paginated HF listing, Kaggle entrypoint
+7e7bfa0675e3b01b3d2073b2e46c9caba8c96d80	7e7bfa0675e3b01b3d2073b2e46c9caba8c96d80	2026-09-24	review response: hub-pull load, relative --steps, B default, --push, atomic rolling, TMT_TAIL, hot-dim cap, accumulator parity, corpus staging swap
+af1e344d95e6fc07c9e5f68dbb3d5b3187c2aff4	af1e344d95e6fc07c9e5f68dbb3d5b3187c2aff4	2026-09-24	plan: measured T4 throughput supersedes estimate; status checklist + real file list
+4fc2d943d2502273525dccaa8a0ca61a0cbd3964	4fc2d943d2502273525dccaa8a0ca61a0cbd3964	2026-09-24	RESULTS: GPU port gates + measured T4 speed; MORNING-RUNBOOK for first legs
+0647e2a97edd169b8c70fd118e41de674c399d0c	0647e2a97edd169b8c70fd118e41de674c399d0c	2026-09-24	GPU perf: tail membership rebase off the per-step path (12x), final save on budget exit
+ac7eba84340ba013280af3428412d0c7724c0ac7	ac7eba84340ba013280af3428412d0c7724c0ac7	2026-09-24	checkpoint_hub integration + colab final-test driver + plan status
+dab7079102bd97ed0a815bd58b26d827c95d0637	dab7079102bd97ed0a815bd58b26d827c95d0637	2026-09-24	gpu_port: torch transcription of numpy_port.step_batch + train_gpu + parity/fetch gates
+ac1e5c294476527fe7764107f7d75bacb90f72ba	ac1e5c294476527fe7764107f7d75bacb90f72ba	2026-09-23	fetch_corpus: per-layer budget mix + SCHEDULE ledger (PLAN §7 item 4)
+107e3441b97422617f9f1c1cc1899892588b1f34	107e3441b97422617f9f1c1cc1899892588b1f34	2026-09-23	held-out data: fetch fresh TinyStories valid splits; clean baseline
+53f05c7a96fde35907743727b20128d778134a0b	53f05c7a96fde35907743727b20128d778134a0b	2026-09-23	Phase 0: trustworthy ruler (split, data-seed, tagged saves, eval.py)
+d48ab6d51be7209f0de7294da50fa241387803a1	d48ab6d51be7209f0de7294da50fa241387803a1	2026-09-23	load(): honor the checkpoint's ring_k instead of re-deriving it
+25380536c01f25ea067eaf3edcf200f6fd826a89	25380536c01f25ea067eaf3edcf200f6fd826a89	2026-09-22	eval_npz: build the eval model with the checkpoint's ring K
+6a672991689140be404781c7952b20129f1b752c	6a672991689140be404781c7952b20129f1b752c	2026-09-22	persist ring_k in checkpoints; reports/eval read it instead of guessing
+84bc2c0dc83489f34683ea47ed8bcc66d581f643	84bc2c0dc83489f34683ea47ed8bcc66d581f643	2026-09-22	tail credit: exact long-lag embed credit for hot dims
+9012589951cb9713a4bb76854a404a47e2c87be5	9012589951cb9713a4bb76854a404a47e2c87be5	2026-09-21	numpy port: ring-buffer eligibility trace + optional numba credit, eval & memory tools
+ea8c064afd73026d1f9ba0635192b417bdfa5e17	ea8c064afd73026d1f9ba0635192b417bdfa5e17	2026-09-17	rename the main torch
+c9dd01df4ae11170c8f26c1ea1992bfdb2bbc5f0	c9dd01df4ae11170c8f26c1ea1992bfdb2bbc5f0	2026-09-17	Move training corpus into data/
+50595c8daa27d5444826b745f85602efa50598fa	50595c8daa27d5444826b745f85602efa50598fa	2026-09-17	Consolidate torch ports into main_mixed.py: fused builtin AdamW, 53% faster at 130M
+86e4df469110c712e28a51027dd90178c01f3905	86e4df469110c712e28a51027dd90178c01f3905	2026-09-17	more versions
+1dfff0428132caddb9fce7af594d3034034328fa	1dfff0428132caddb9fce7af594d3034034328fa	2026-09-16	Optimize torch port training step ~1.7x (67 -> 40 ms/step contended), fix per-step recompile leak
+3050cb61c657270b0a1e427bc00ee7c21c387b67	3050cb61c657270b0a1e427bc00ee7c21c387b67	2026-09-16	PyTorch CPU port (experiment): main_torch.py + benchmark_torch.py alongside MLX
+f36ef73fbe7e57a52fef55d4f1de5c82a7b02b1c	f36ef73fbe7e57a52fef55d4f1de5c82a7b02b1c	2026-09-16	Frozen read-only chat mode, benchmark held-out evaluation, generation token cap
+4699c2ae063b0bbcd23e50c5747dbe2834744b39	4699c2ae063b0bbcd23e50c5747dbe2834744b39	2026-09-16	Speed up per-byte training step ~1.5x (10.9 -> 16.5 steps/s); verify bit-exact parity
+1089c5aa041660308d905cf131315d8a9dca6a0e	1089c5aa041660308d905cf131315d8a9dca6a0e	2026-09-16	Add 11-book Gutenberg corpus (runtime data, gitignored); tune chat: threshold 0.35->0.25, temp 0.75->0.6
+6fd7efe631d24adc8e8ff62c3b6109d10908b363	6fd7efe631d24adc8e8ff62c3b6109d10908b363	2026-09-16	Add Model.freeze() for frozen-feature benchmarking; sanitize stdout writes
+e8c1a9cef7f5b1773122c9fbe28fec3407e36d9c	e8c1a9cef7f5b1773122c9fbe28fec3407e36d9c	2026-09-16	Linux/CPU support: fix entry-point config, dataset fallback, non-interactive env vars
+1f0f37d0d3f71d85fe525fd8e7d154be641e99d8	1f0f37d0d3f71d85fe525fd8e7d154be641e99d8	2026-09-13	video fix
+628f0ddf4dd0378346b21b87e5165acf252de6fb	628f0ddf4dd0378346b21b87e5165acf252de6fb	2026-09-13	video -> readme
+2e170881592c7c4f7bab84f9ac058e4abfd2e319	2e170881592c7c4f7bab84f9ac058e4abfd2e319	2026-09-10	Readme redo part 5
+370d333bacdf00a41f6b9e9f2d37ff86309e7fc7	370d333bacdf00a41f6b9e9f2d37ff86309e7fc7	2026-09-10	readme 4
+d38f197e04a02e6a7aec6d14d183adaaf43ce75c	d38f197e04a02e6a7aec6d14d183adaaf43ce75c	2026-09-10	fix readme pt 3
+715ff654c0de56f0d81dacf0af8aeb862153b624	715ff654c0de56f0d81dacf0af8aeb862153b624	2026-09-10	readme redo pt 2
+b69142344ea0eee675085f4d3473a0de41514980	b69142344ea0eee675085f4d3473a0de41514980	2026-09-10	redo the readme
+8cf39104c4bf2745d428ef86f40d8b867b718360	8cf39104c4bf2745d428ef86f40d8b867b718360	2026-08-22	change link bc reupload
+5bb28e3070e0d286e46293b188d79cb63f9756df	5bb28e3070e0d286e46293b188d79cb63f9756df	2026-08-12	update readme 2
+4b588315adf565b9af2495272fa2bb70c7877a16	4b588315adf565b9af2495272fa2bb70c7877a16	2026-08-12	fix readme!!
+2f70e5f3bfcdcbc26e06007de4240796d7d460a9	2f70e5f3bfcdcbc26e06007de4240796d7d460a9	2026-08-12	test model thing, finally
