@@ -3920,3 +3920,152 @@ capacity axis's erosion curve, all at ~19 MB):
 Weight decay erodes the P4 spread roughly in half (95 B → 57 B of half-life)
 and costs CE, but it does not remove the capacity: the retention curve is
 barely moved. The default init has no capacity at any budget.
+
+---
+
+## 2026-10-21 — the audit of the read path, the architecture, and the plan
+
+Three findings from an audit of the read path and the model's structure. The
+first two are **defects in instruments**, and the third is a **structural fact
+about the architecture** that the previous plan was working around without
+knowing it. Together they change what the next experiment should be.
+
+### 1. D1 — the copy/retrieval readout was broken, so the read-path null was an artifact
+
+`tools/membench/model_backend.py:_ridge_score` had a **swapped tuple
+assignment** in its lambda selection:
+
+```python
+if acc > best_acc:
+    best_acc, best = lam, acc     # <- SWAPPED
+```
+
+`best_acc` received the *lambda* and `best` received the *accuracy*, so
+(a) only `lam=1.0` was ever eligible — after the first iteration
+`best_acc` is 1.0 and `acc > 1.0` is never true, so λ=1e3 and λ=1e5 were dead
+code; and (b) `chosen = best` was a **training accuracy**, so the final fit
+solved `G + 0·I` — an *unregularized* solve of a rank-deficient Gram matrix
+over 8,192 features.
+
+**Verified by calling the project's own function**: it returns `lam = 0.0`.
+The stored ruler output is the fingerprint — `runs/taxis/ruler_A_p4_wd0_c.txt`
+prints `readout exact=0.0156 (se 0.0155) lam=0`, and the intended code
+cannot print that (`chosen ∈ {1.0, 1e3, 1e5}`).
+
+A second defect in the same cell: `y = targets.astype(np.int64).ravel()`
+flattened the `(n, 4)` payload targets, and the split then indexed only
+`idx ∈ [0, n)`, so **only payload byte 0 of each sample was ever decoded** —
+while the metric was published as *"fraction of exact 4-byte payload
+matches"* against a chance level of **2⁻³²** (the true chance for byte 0 is
+1/256).
+
+**Fixed** (same file): the assignment is corrected, the lambda is now chosen
+on an **inner hold-out carved out of the training half** (the old code chose
+it on the *test* half), the k-byte payload is fit with **k independent
+readouts, one per byte position** (a single readout over shared features can
+only emit one byte value per sample, so it cannot decode a multi-byte payload
+at all), and the permuted-label veto now permutes **samples**, not bytes.
+
+**The consequence for the record:** the claim *"the readout never beats its
+own control"* — which the 10-11 plan's pivot to the readout rested on — was
+**produced by a broken probe and is not established**. This is the fourth
+instance of the same failure mode in this repo (the harness that never ran;
+the contention measured 256× too high; the FSP arm that was unmeasurable;
+now the readout). `tests/check_ridge_readout.py` is the new gate: it fails on
+the pre-fix code and passes on the fixed code.
+
+### 2. D3 — the copy probe is class-coverage limited, so its "chance" is not the right bar
+
+The readout is a **256-way one-hot ridge**, so it can only ever *emit* a byte
+value that occurred in its training half. The copy task's payloads are
+**random**, so with `n` samples the training half contains only
+≈ `1 − exp(−n_train/256)` of the 256 byte values. At the ruler's
+`sample_count=128` that is **≈ 22 %** of the alphabet, so the probe's
+per-byte accuracy is capped near 22 % *whatever the state contains*, and the
+4-byte exact rate near `0.22⁴ ≈ 0.2 %` — against a stated chance of 2⁻³².
+The published metric and its chance level are not on the same scale, and a
+coverage-limited probe cannot distinguish "the state is empty" from "the
+probe cannot name the answer".
+
+**Consequence:** a verdict from a coverage-limited probe is `UNMEASURED`, not
+a null. The re-measurement must report the **class coverage** next to every
+accuracy, and must be powered (thousands of samples, or a matched alphabet).
+
+### 3. The architecture, as the code actually is
+
+From `gpu_port.py:228-256` and `gpu_port.py:1701-1707`:
+
+```python
+state = states * a + enc          # the ONLY thing that enters the state
+...
+enc = self.embed[c_arr]           # ONE embedding
+x = enc
+for l in self.layers: x, state, decay, cache = l.forward(enc, x, l.states)
+```
+
+* The **residual stream never enters the state**; the only inputs to the
+  memory are the byte embedding and the decay.
+* There is **no cross-layer state flow**: layer L's memory is not a function
+  of layer L−1's memory.
+* Therefore **the 16 layers are 16 nonlinear readouts of ONE 512-dimensional
+  multi-scale EMA bank**, accumulated into a residual stream. They are not a
+  feature hierarchy, and "16 layers" does not mean 16 memories.
+* The **8,192 decay channels are 16 permutations of the same 512
+  time-scales** (the P4 init builds `np.geomspace(hmin, hmax, 512)` inside
+  the layer loop and reshuffles it per layer). The model's distinct memory
+  time-scales number **512, not 8,192** — and under the default init every
+  half-life is ≈1 byte, i.e. no multi-scale at all.
+
+**Parameter budget** (`numpy_port.Model(dim=512, layers=16)` →
+`theta.size = 4,481,793`, verified live):
+
+| group | params | % |
+|---|---:|---:|
+| per-layer `W` (512×512) × 16 | 4,194,304 | **93.585** |
+| per-layer `g`+`b` × 16 | 16,384 | 0.366 |
+| per-layer **`decay` × 16** | **8,192** | **0.183** |
+| `embed` (256×512) | 131,072 | 2.925 |
+| decoder `Wd`+`bd` | 131,328 | 2.931 |
+| `Ws`+`bs` | 513 | 0.011 |
+
+**The structural limit.** `state_j(t) = Σ_k a_j^k · emb(byte_{t−k})_j` is a
+*weighted average* of one embedding coordinate over time. It can represent
+"there has been a lot of `e` recently"; it cannot represent "the value that
+followed this key". A linear readout over a sum of EMAs cannot isolate one
+term without a **key-conditioned read** — which is the 10-11 plan's own §7.3
+item 8 and `STRATEGIC-REVIEW §3(iii)`, and it is why the read path fails:
+**not** a shortage of capacity, and **not** a shortage of layers.
+
+**Consequence for the size question.** 94.1 % of the parameters sit in the
+readout stack — precisely the surface a test-time update overwrites, i.e. the
+catastrophic-forgetting surface — while the entire control surface of the
+memory is 0.18 %. Capacity is not the binding constraint (data-limited, not
+capacity-limited; the CUDA fork's 34M run still shows no retrieval past
+64 B). The plan's decision: **the core is trained once and then frozen; new
+knowledge lives in experts, and an expert never copies the depth** — a
+decay-set expert costs 8,192 params (0.18 %), a rank-r readout LoRA costs
+1,024·r per layer, and a full depth copy costs 4,218,880 (which is why the
+T-RTU design was deferred).
+
+### 4. The plan
+
+`docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md` is now the single current
+plan. It supersedes the *ordering* of the 10-04 roadmap, the 10-06 memory
+benchmarks and the 10-11 T-axis plan; their evidence and their closed axes
+are retained. `docs/INDEX.md` was corrected: it had marked nine documents
+"current — read before new experiments", omitted five live ones, and pointed
+at two closed axes.
+
+**The goal, and its ruler:** *continual learning*, measured as three
+numbers — **ACQUIRE** (recall new facts), **RETAIN** (keep the old ones),
+**NO REGRESSION** (general held-out CE does not degrade) — with thresholds
+fixed in advance, a permuted-label veto on every cell, and a
+whole-programme kill criterion that the repo has never had.
+
+**Also recorded here, for the record:** the n-gram script that produced the
+`0.81` figure (`lag5.py`) was never committed and no longer exists, so that
+number is currently unreproducible; and the original comparison was not
+byte-matched to the ruler's held-out set (the n-gram was scored on a 300 kB
+head of `tinystories_valid.txt`; the model is scored on 6 × 20,001-byte
+slices across both files in `data/eval/`). Both are fixed in the plan's
+CL-0 step.

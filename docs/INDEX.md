@@ -6,32 +6,47 @@ from-scratch experiment).
 
 ## Where things are
 
+**Exactly one plan is current.** If you are about to run an experiment, read
+`plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md` and nothing else. Everything
+else below is retained evidence, a run protocol, or a closed axis. (Until
+2026-10-21 this index marked nine documents "current — read before new
+experiments", omitted five live ones, and pointed at two closed axes — which
+is how 14 plans produced 0 end-to-end wins.)
+
 | doc | what it is | status |
 |---|---|---|
 | `../README.md` | project entry point, how to run | **current** |
 | `../RESULTS.md` | the ruler and all measured results | **current — append-only** |
-| `plans/PLAN-2026-09-23-GPU.md` | the GPU port plan: engine, hub, correctness gate, week-1 order | **current** |
+| **`plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`** | **THE plan.** Continual learning as the goal; the three-number CL-RULER; the architecture as it actually is (16 readouts over one EMA bank); the size decision; CL-0…CL-5 with pre-registered falsifiers; the whole-programme kill criterion | **current — the only plan to read before an experiment** |
+| `plans/PLAN-2026-09-23-GPU.md` | the GPU port plan: engine, hub, correctness gate, week-1 order | **executed** — the port landed; the corpus axis is closed |
 | ~~`plans/PLAN-2026-09-25.md`~~ | next-day execution plan | **archived** → `plans/superseded/` |
 | ~~`plans/PLAN-2026-09-22.md`~~ | the original phase plan | **archived** → `plans/superseded/` |
-| `plans/PLAN-2026-10-04-LR-ROLES.md` | role-specific-LR factorial (the cheap half of the SNR blocker's two-axis plan); gate + Colab bundle built, run not launched | **current** |
-| `plans/PLAN-2026-10-03-DISTILL.md` | distil an open model into TMT (teacher `LFM2.5-230M-Base`, Marginalize-It, teacher-generated corpus); gate 0 cleared | **current — read before optimizing** |
-| `plans/PLAN-2026-10-04-ROADMAP.md` | **roadmap v3** — ruler → step size → memory → SSM. v3 reorders v2 after the SNR blocker was found to be ~12.6× pessimistic; v2's evidence chains and rejected-ideas table are retained below the v3 header | **current — read before new experiments** |
-| `plans/PLAN-2026-10-11-T-AXIS.md` | **the T axis** — `seqlen` as a knob with `T=1` as the floor; then gated recurrence → MTP. Synthesizes this repo's `RESULTS.md` with upstream issues `#17/#20/#23/#25/#28/#30/#34` and the CUDA fork's converged config. **Executed through P0 + P6 (2026-10-12): CE-only, the repaired optimization gate, the NaN guard + grad clip, per-group weight decay, `seqlen`, the dense trace, the log-spaced half-life init, and a 0-training P4 capacity gate. Four corrections applied — see §7.** | **current — supersedes the *ordering* of the 10-04 roadmap and the 10-06 plan; read before new experiments** |
+| `plans/PLAN-2026-10-04-LR-ROLES.md` | role-specific-LR factorial | **closed** — "axis answered, no winner, closed" |
+| `plans/PLAN-2026-10-03-DISTILL.md` | distil an open model into TMT (teacher `LFM2.5-230M-Base`, Marginalize-It) | **closed as specified** — KD was CE-neutral; "plain CE is the optimum of this family" |
+| `plans/PLAN-2026-10-04-ROADMAP.md` | **roadmap v3** — ruler → step size → memory → SSM | **closed** — its §6 success criteria are all spent; the ordering is superseded by the 10-21 plan |
+| `plans/PLAN-2026-10-06-MEMORY-BENCHMARKS.md` | retention → selectivity → retrieval; a ruler per verb | **executed** — the suite shipped (`tools/membench/`); the verdict it was built to get was produced on a broken instrument (10-21 plan §6) |
+| `plans/PLAN-2026-10-11-T-AXIS.md` | **the T axis** — `seqlen` as a knob; gated recurrence → MTP. Executed through P0 + P6 + P4 + the C run. | **executed** — P0/P1/P2/P4/P6 done, P3 partial, FSP null; the ordering is superseded by the 10-21 plan |
+| `plans/PLAN-2026-10-13-COLAB-HF-RUNS.md` | the **run protocol**: Colab-only training, private HF repo as the durability layer, credential handling, recycling rules | **current — HOW to run a leg** (not a plan: it does not say what to run) |
+| `plans/SPEED-INVESTIGATION.md` | the ring credit's atomic scatter: legality, arithmetic, measurement on a T4, verdict | **closed** — "the wall is the bytes, not the atomics"; `nvrtc` adopted |
 | `ideas/ROUTER-4.5M-INTENT-JSON.md` | 4.5M intent→JSON tool router (SFT, short-horizon, teacher-as-labeler) | **design — nothing measured.** moved out of `plans/`: it was never a plan |
 | `optimization/OPTIMIZATION_TEST_STATUS.md` | what was measured, what was **not**, what to try next | **current — read before optimizing** |
 | `optimization/GPU_OPTIMIZATION_PLAN.md` | the optimization plan and its measured outcome (§0) | historical + measured |
 | `optimization/GPU_OPTIMIZATION_PLAN-REVIEW.md` | review of that plan | review, closed |
+| `reviews/STRATEGIC-REVIEW-2026-10-05.md` | the deep review: "the memory programme is aimed at an unmeasured quantity"; §3's three structural verdicts on the architecture; §4's copy task | **current — read §0–§4 and §5** (it invalidated the 2015 anchor and set the copy task that CL-2 now runs) |
+| `reviews/RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md` | point-by-point response to an external critique, "accepted in part"; names the *Selective-copy training run — not started* | **current — read before claiming a probe is the next step** |
 | `reviews/PLAN-2026-09-23-GPU-IMPLEMENTATION-REVIEW.md` | implementation review + responses | review, closed |
 | `runbooks/MORNING-RUNBOOK.md` | how to run the GPU legs | **current** |
 | `runbooks/SCHEDULE.md` | quotas and weekly schedule | **current** |
-| `ideas/ARCHITECTURE_IDEAS.md`, `ideas/ARCHITECTURE_IDEAS2.md` | speculative directions | ideas, not plans |
+| `ideas/ARCHITECTURE_IDEAS.md`, `ideas/ARCHITECTURE_IDEAS2.md` | speculative directions | ideas, not plans (the T-RTU / tagged-RTU design is deferred; 10-21 plan §4) |
 | `ideas/papers/README.md`, `ideas/papers/*` | external papers with the notes taken from them, source text beside the notes | ideas, not plans |
 
 ## Reading order
 
-1. **`../README.md`** — orientation.
-2. **`../RESULTS.md`** — what is actually true, with numbers.
-3. **`optimization/OPTIMIZATION_TEST_STATUS.md`** — what has *not* been tested.
+1. **`plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`** — the goal, the ruler,
+   the steps, the falsifiers, and the kill criterion. **Start here.**
+2. **`../README.md`** — orientation.
+3. **`../RESULTS.md`** — what is actually true, with numbers.
+4. **`optimization/OPTIMIZATION_TEST_STATUS.md`** — what has *not* been tested.
    Read this before proposing an optimization; it names the candidates that
    were already measured and lost.
 4. **`plans/PLAN-2026-09-23-GPU.md` §7** — the live status and next steps.

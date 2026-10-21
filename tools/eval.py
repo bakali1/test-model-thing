@@ -323,7 +323,12 @@ def main():
 
     d = np.load(args.ckpt)
     dim, layers = infer_config(d)
-    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4)
+    # An FSP arm's checkpoint carries the auxiliary head's 132,352
+    # parameters, so the reference model must have the same layout --
+    # otherwise the load fails on a parameter-count mismatch (which is
+    # how the FSP arm's CE cell died: in the loader, not the measurement).
+    _has_fsp = "fsp.W" in d.files
+    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4, fsp=_has_fsp)
     m.new_states(1)
     m.load(args.ckpt)          # honors the checkpoint's ring_k
     K = m.ring_k

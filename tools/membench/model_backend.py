@@ -132,48 +132,93 @@ def _ridge_score(X_train, y_train, X_test, y_test, lams=(1.0, 1e3, 1e5),
     """Dual-form ridge classifier on the concatenated state.
 
     Returns (exact_match_rate, per_byte_accuracy, se, chosen_lambda).  Builds
-    Z-scored features from the training half, chooses lam by a 3-point inner
-    hold-out, refits at the chosen lambda, and evaluates on the held-out test
-    half.  y's are byte integers in 0..255.  The probe is an offline readout
-    (no model weight updates).
+    Z-scored features from the training half, chooses lam on an inner
+    hold-out CARVED OUT OF THE TRAINING HALF, refits at the chosen lambda on
+    the full training half, and evaluates on the held-out test half.  y's are
+    byte integers in 0..255.  The probe is an offline readout (no model
+    weight updates).
+
+    y may be (n,) for a single target byte, or (n, k) for a k-byte payload
+    (the copy task's payload is k=4).  The sample split is by SAMPLE, never
+    by byte, so a byte belonging to a test sample can never appear in the
+    training half.  For a k-byte payload the ridge is fit over the k bytes of
+    each training sample, `exact` is the fraction of samples whose k bytes
+    are ALL correct (chance 256**-k), and `per_byte` is the byte-level
+    accuracy (chance 1/256).
+
+    NOTE (2026-10-21, defect D1): the lambda selection here used to be
+    `best_acc, best = lam, acc` -- a swapped assignment.  `best_acc` then
+    held a LAMBDA, so only lam=1.0 was ever eligible (every later
+    `acc > best_acc` compared against 1.0), and `chosen = best` was a
+    TRAINING ACCURACY, so the final fit solved `G + 0*I` -- an unregularized
+    solve of a rank-deficient Gram matrix over 8192 features.  The ruler's
+    stored output (`lam=0`) is the fingerprint of that bug.  Fixed here, with
+    the lambda also chosen on an inner hold-out so the test half is not used
+    to select it.
     """
     rng = np.random.default_rng(seed)
     n = X_train.shape[0]
+    y_train = np.asarray(y_train)
+    y_test = np.asarray(y_test)
     idx = rng.permutation(n)
     n_train = max(4, n // 2)
     tr, te = idx[:n_train], idx[n_train:]
-    Xtr, ytr = X_train[tr], y_train[tr]
-    Xte, yte = X_test[te], y_test[te]
+    Xtr, Xte = X_train[tr], X_test[te]
+    ytr, yte = y_train[tr], y_test[te]
 
-    mu = Xtr.mean(axis=0, keepdims=True)
-    sd = Xtr.std(axis=0, keepdims=True) + 1e-8
-    if standardize:
-        Ztr = (Xtr - mu) / sd
-        Zte = (Xte - mu) / sd
-    else:
-        Ztr, Zte = Xtr, Xte
+    def _fit1(Xa, ya, Xb, yb, lam):
+        """One linear readout: standardize on Xa, ridge on Xa at `lam`, predict
+        Xb.  Returns (pred, accuracy)."""
+        mu = Xa.mean(axis=0, keepdims=True)
+        sd = Xa.std(axis=0, keepdims=True) + 1e-8
+        Za = (Xa - mu) / sd if standardize else Xa
+        Zb = (Xb - mu) / sd if standardize else Xb
+        Y = np.zeros((len(Za), 256), np.float64)
+        Y[np.arange(len(Za)), ya] = 1.0
+        G = Za @ Za.T
+        alpha = np.linalg.solve(G + lam * np.eye(len(Za)), Y)
+        P = Zb @ Za.T @ alpha
+        pred = P.argmax(axis=1)
+        return pred, float((pred == yb).mean())
 
-    Ytr = np.zeros((len(tr), 256), np.float64)
-    Ytr[np.arange(len(tr)), ytr] = 1.0
+    def _fit(Xa, ya, Xb, yb, lam):
+        """Fit the readout(s) for one lambda.
+
+        y is (n,) -> one readout.  y is (n, k) -> k INDEPENDENT readouts, one
+        per byte position.  This matters: a single readout over the shared
+        features can only emit ONE byte value per sample (the same feature
+        vector gives the same 256 scores for every byte position), so it
+        cannot decode a multi-byte payload at all.  One readout per byte
+        position is the natural linear-probe semantics for "decode the
+        payload", and it is what the old ravel-then-first-n-index code
+        accidentally approximated (it scored byte 0 only).
+        """
+        if ya.ndim == 1:
+            return _fit1(Xa, ya, Xb, yb, lam)
+        preds, accs = [], []
+        for j in range(ya.shape[1]):
+            p, a = _fit1(Xa, ya[:, j], Xb, yb[:, j], lam)
+            preds.append(p)
+            accs.append(a)
+        return np.stack(preds, axis=1), float(np.mean(accs))
+
+    # -- choose lam on an inner hold-out of the TRAINING half only --
+    n_in = max(2, (len(tr) * 3) // 4)
     best, best_acc = None, -1.0
     for lam in lams:
-        G = Ztr @ Ztr.T
-        alpha = np.linalg.solve(G + lam * np.eye(len(tr)), Ytr)
-        P = Zte @ Ztr.T @ alpha
-        acc = float((P.argmax(axis=1) == yte).mean())
+        _, acc = _fit(Xtr[:n_in], ytr[:n_in], Xtr[n_in:], ytr[n_in:], lam)
         if acc > best_acc:
-            best_acc, best = lam, acc
+            best_acc, best = acc, lam
     chosen = best
-    Ztr = (Xtr - mu) / sd
-    Zte = (Xte - mu) / sd
-    G = Ztr @ Ztr.T
-    alpha = np.linalg.solve(G + chosen * np.eye(len(tr)), Ytr)
-    P = Zte @ Ztr.T @ alpha
-    pred = P.argmax(axis=1)
-    exact = float((pred == yte).all(axis=1).mean()) if yte.ndim == 2 else float(
-        (pred == yte).mean())
-    per_byte = float((pred == yte).mean()) if yte.ndim == 2 else float(
-        (pred == yte).mean())
+
+    # -- refit on the FULL training half at the chosen lam, test on the half --
+    pred, _ = _fit(Xtr, ytr, Xte, yte, chosen)
+    if yte.ndim == 2:
+        per_byte = float((pred == yte).mean())
+        exact = float((pred == yte).all(axis=1).mean())
+    else:
+        per_byte = float((pred == yte).mean())
+        exact = per_byte
     se = math.sqrt(max(exact * (1 - exact), 0.0) / max(len(yte), 1))
     return exact, per_byte, se, chosen
 
@@ -516,8 +561,14 @@ def model_copy_readout(m, task, d, seed=0, sample_count=1024,
     res = _frozen_forward(m, X)
     states = res["final_states"]                       # (n, 8192)
 
-    # main readout
-    y = targets.astype(np.int64).ravel()
+    # main readout.  `targets` is (n, k) -- the k payload bytes per sample.
+    # It is NOT raveled here: the readout splits by SAMPLE and expands to
+    # per-byte rows itself, so all k bytes are scored and the reported
+    # "exact" really is the exact-k-byte rate (chance 256**-k).  The old
+    # ravel + first-n-index split silently scored only byte 0 of each sample
+    # while publishing the metric as an exact-4-byte rate (defect D1).
+    y = targets.astype(np.int64)
+    k_payload = y.shape[1] if y.ndim == 2 else 1
     exact, per_byte, se, lam = _ridge_score(
         states, y, states, y, lams=(1.0, 1e3, 1e5), seed=seed)
 
@@ -526,13 +577,16 @@ def model_copy_readout(m, task, d, seed=0, sample_count=1024,
               f"(se {se:.4f}) lam={lam:g}", flush=True)
 
     # ---- mismatched-cue veto: permute the payload labels across samples ----
+    # The permutation is over SAMPLES (rows), not over bytes: permuting the
+    # raveled array would shuffle bytes within a sample and destroy the
+    # control.
     perm = np.random.default_rng(seed + 1000).permutation(n)
     y_perm = y[perm]
     exact_v, per_v, se_v, lam_v = _ridge_score(
         states, y_perm, states, y_perm, lams=(1.0, 1e3, 1e5), seed=seed + 1)
     if verbose:
         print(f"  [copy {task} d={d}] veto permuted-label exact={exact_v:.4f} "
-              f"(chance {1.0/256**4:.5f})", flush=True)
+              f"(chance {1.0/256**k_payload:.5f})", flush=True)
 
     return {"states": states, "y": y, "perm": perm,
             "exact": exact, "per_byte": per_byte, "se": se, "lam": lam,

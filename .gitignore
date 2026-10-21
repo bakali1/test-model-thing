@@ -9,6 +9,22 @@ bundles/colab_fs_w.py
 bundles/colab_leg.py
 bundles/colab_kd_smoke.py
 bundles/colab_lr_roles.py
+# The bundlers EMBED the engine modules into the generated bundle, so
+# bundles/ also collects stale copies of gpu_port.py, numpy_port.py, ... .
+# They are build output, not source: they are snapshots (the 2026-10-05 set
+# was still sitting here) and they drift from the root modules by
+# construction.  Only the make_*_bundle.py bundlers are source.
+bundles/checkpoint_hub.py
+bundles/distill.py
+bundles/gpu_port.py
+bundles/numpy_port.py
+bundles/tail_credit.py
+bundles/teacher_table.py
+bundles/telemetry.py
+bundles/train_gpu.py
+# generated Colab bundles (colab_lrladder_*.py, colab_p0_gate.py, ...)
+bundles/colab_lrladder_*.py
+bundles/colab_p0_gate.py
 # eval transcripts cached beside checkpoints (fs_verdict.py); regenerate with
 cache/
 bundles/__pycache__/
