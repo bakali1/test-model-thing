@@ -1262,7 +1262,16 @@ class GpuModel:
             if mode in ("compiled", "triton", "nvrtc"):
                 mode = "full"
         elif mode == "auto":
-            mode = "compiled"
+            # The default is the FASTEST bit-identical path, not the first
+            # one that was written. Measured end to end on a T4 (the whole
+            # step_batch, 40 timed steps, a fresh model per arm):
+            #   full 35.46 ms/step | compiled 33.68 | nvrtc 26.72 | grouped 27.92
+            # with the IDENTICAL loss 7.58001 on all four -- the paths are the
+            # same arithmetic, so the faster one is free. The fused NVRTC
+            # kernel was already shipped (it is the only fused option below
+            # cc 7.0, where it measured 2.2-2.7x on an MX150); it was simply
+            # not the default where Inductor was available.
+            mode = "nvrtc" if _nvrtc_ring_kernel() else "compiled"
         if is_cuda and mode in ("compiled", "triton") and torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
             if major < 7:
@@ -1311,7 +1320,15 @@ class GpuModel:
                      args=[w, dec, dlds, rows, self._ring_dest, marg,
                            B, K, D, 0 if hot_mask is None else 1])
                 return
-            mode = "full"        # kernel unavailable: portable reference
+            # The kernel is unavailable (no CUDA_HOME, no NVRTC): degrade to
+            # the next best path, not straight to the slow one. `compiled`
+            # needs cc >= 7.0; below that the portable reference is all
+            # there is.
+            if torch.cuda.is_available():
+                major, _ = torch.cuda.get_device_capability()
+                mode = "compiled" if major >= 7 else "full"
+            else:
+                mode = "full"
         if mode == "grouped":
             # The grouped credit: the contending adds to one address are
             # combined FIRST (in the reference's row order), so the address

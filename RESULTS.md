@@ -3785,3 +3785,33 @@ cost is bytes and launches. So a "make the credit faster" programme has a
 small ceiling (the credit is 7.6 ms of a ~63 ms step at best), and the
 "make the step cheaper" programme (fewer launches, a smaller ring) has a
 large one.
+
+**The decision that follows: the default credit path is now the fastest
+bit-identical one.** The default was `compiled` (33.68 ms/step end to end on
+a T4) while the already-shipped `nvrtc` measured 26.72 ms/step — **1.26× the
+throughput, moving no float** (all four paths produced the identical loss
+7.58001, and all five are bit-identical on the device with max|Δ| = 0.0).
+`auto` now resolves to `nvrtc` on CUDA, and if the kernel cannot be compiled
+the resolution degrades to `compiled` (cc ≥ 7.0) or the portable reference,
+never straight to the slow path. This is not new code: the fused NVRTC
+kernel was already shipped — it is the only fused option below cc 7.0, where
+it measured 2.2–2.7× on the MX150 — it was simply not the default where
+Inductor happened to be available.
+
+**The `grouped` credit stays as an option, not a default.** It is the legal,
+bit-identical way to remove every atomic, and it *wins* when the byte ids are
+uniform (0.486 vs 0.559 ms/call) — but on a real byte histogram the
+commonest byte owns 16.3% of the rows, and the legal grouping hands all 3,012
+of them to one byte id, one block, one SM, while the atomic scatter spreads
+every row over every SM. So it is **slower on real data** (0.693 vs 0.497
+ms/call), and the reason is structural, not a tuning failure. The finding
+that closes the investigation: **the contention was never the wall.**
+
+**What the investigation says to do next.** The credit's floor is its
+traffic (604 MB/step → 1.89 ms read, 3.77 ms read+write) and the best path
+is at 7.95 ms/step of credit — so the credit is 24% of a ~63 ms step and
+cannot be made much cheaper by fixing its atomics. The two larger prizes are
+outside it: the `masked_fill` that zeroes the ring's 1.4% hot columns
+(5.1 ms/step) and the **1,072 kernel launches per step** (10.1 ms of *CPU*
+time — the launch overhead is larger than the whole credit's arithmetic).
+A launch-count reduction is the next thing to measure.
