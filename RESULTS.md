@@ -4285,3 +4285,78 @@ the hierarchical feature-state wiring.
 
 Runtime: 1,558.9 s total on CPU (the forward is a numpy loop over
 timesteps x 16 layers; the ridge is 45–109 s per gap).
+
+### 8. The speed question, re-examined: the CUDA graph is NOT the prize
+
+A feasibility assessment of CUDA-graphing the step (2026-10-21) reached a
+conclusion that contradicts the standing assumption, so it is recorded here
+in full.
+
+**The premise mixed two arms.** The 26.72 ms/step figure is the **`nvrtc`**
+arm. The "1,072 launches = 10.1 ms of CPU" and the "`masked_fill` = 5.1
+ms/step" figures are from the **OLD `compiled` arm** (a 51 ms step). The
+`masked_fill` does **not** exist in the default arm: the NVRTC kernel
+applies the hot-column mask inline (`gpu_port.py:383`). "Fuse the
+masked_fill into the credit kernel" is **already shipped**; it only exists
+in the `compiled` and `full` paths.
+
+**The 10.1 ms of launch time is already overlapped, not on the critical
+path.** The bench synchronises once after the loop
+(`tools/bench_step_paths.py:49-55`), so 26.72 ms = max(CPU, GPU). The
+device work alone is >20 ms, i.e. 2–3× the CPU launch time, so the wall is
+GPU-bound and the CPU time is fully hidden. The per-step syncs do not put
+the CPU on the path either: the CPU emits launches every ~9.4 µs while the
+GPU consumes them every ~24.9 µs, so the GPU never idles.
+
+**A CUDA graph would therefore buy ~0.5–1.5 ms/step (2–6 %)**, not
+10–15 %: it can only recover the *GPU-side dispatch* of 1,072 kernels.
+`RESULTS.md:999` ("CUDA graphs would have bought nothing") was the correct
+conclusion; the repo's 10–15 % estimate in
+`docs/optimization/OPTIMIZATION_TEST_STATUS.md:123` treats CPU time as wall
+time and is wrong.
+
+**What is capturable, if anything.** The largest capturable subgraph is
+**two graphs**: (A) forward + backward + credit + gradient assembly
+(`gpu_port.py:1701`→`2049`), and (B) the AdamW update
+(`:2093-2108`). Outside them: the finiteness read (it is a *host decision*
+between A and B), the scalar updates, the telemetry, and the tail rebase.
+It needs six changes: a device-side ring write slot (today `w[:,p]=1.0`
+bakes a host index into the kernel), fixed input buffers, an async loss, a
+device-side bias-correction scalar, a side-stream warmup for the cuBLAS
+workspace, and an in-place tail-mask update at the rebase. The unsafe ops
+are `float(loss_tensor)` mid-step (`:1810-1814`, **on by default**), the
+nan-guard `.item()` (`:2078`), the grad-clip `.item()` + host branch
+(`:2089`), and the host bias-correction `b1**t` (`:2106`).
+
+**The cheaper wins, ranked (none needs a graph):**
+1. **Fused AdamW as one NVRTC kernel** — the optimizer region is 3.0 ms
+   and currently makes ~25–30 array passes; a fused kernel makes 7.
+   **~1.5–2.2 ms (6–8 %)**, and bit-identical if FMA contraction is off.
+2. **Fused tail decay+credit** — 3 element-passes become 2; the tail is
+   10.2 ms, so **~3–4 ms (12–15 %)**. It reassociates the einsum, so it
+   must land in `numpy_port` too or the parity gate breaks.
+3. `--async-metrics` plus taking the nan-guard off the per-step path —
+   small alone (~0–0.5 ms) but the **prerequisite for any graph**; and
+   folding `w[:,p]=1.0` into the NVRTC kernel (~0.2 ms).
+
+**`torch.optim.AdamW(fused=True, capturable=True)` is NOT applicable.** The
+engine hand-builds AdamW on flat 4,481,793-fp32 vectors
+(`gpu_port.py:1052-1057`, `:2062-2110`) with per-coordinate LR and weight
+decay vectors. `torch.optim` cannot express per-coordinate LR/WD without
+splitting the flat layout, which would change the checkpoint format, and
+the arithmetic differs anyway (eps added after bias correction and inside
+the role-LR bracket; decay scaled by the role LR). The engine's **own**
+fused/capturable AdamW is the one piece that would pay twice — once for
+the speed and once as the enabler of a graph.
+
+**The decisive measurement, if this is ever pursued:** `tools/bench_variants.py
+profile_baseline` (device time sum vs wall) plus a no-sync CPU-time probe
+plus an `--async-metrics` A/B. If the device time is already >95 % of the
+wall, the graph is worth nothing and the three wins above are the work.
+
+**This also revises the earlier claim in this file** that the biggest
+remaining prizes were the `masked_fill` (5.1 ms) and the launches
+(10.1 ms). Both are artefacts of the superseded `compiled` arm. The real
+remaining prizes are the **traffic** (the credit's floor is 3.77 ms/step
+against 7.6–8.0 ms measured) and the **optimizer** (3.0 ms in ~25–30 array
+passes).
