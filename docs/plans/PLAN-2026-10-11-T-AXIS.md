@@ -644,3 +644,61 @@ SECOND arm, because it costs 16x the head's flops.
    the CUDA fork's hierarchical wiring is where its memory came from, and
    because a linear order-losing EMA of byte embeddings cannot represent
    "that name appeared 200 bytes ago" no matter how long its half-life is.
+
+### 7.2d C ran: FSP is a null, and the plan's next candidate is on the other side of the state (2026-10-21)
+
+**The A/B.** `A_p4_wd0_c` (P4 init, `wd_decay 0`) vs `A_p4_wd0_fsp_c` (the
+same + `--fsp-alpha 1.0 --fsp-r 16 --fsp-tau 64 --fsp-pos-weight 8.5
+--fsp-layer -1`), B=1024, T=1, `ring_k=18`, `TMT_TAIL=0`, seed 0, from
+scratch, 19,000 steps each (the salvaged control's exact budget), on a Colab
+T4. Both arms reached the target through at least one runtime recycling.
+
+**The result: FSP changed nothing.** CE 1.360 → 1.361; retention
+38.3/17.6/5.3/0.83% → 37.5/17.1/5.0/0.78%; copy and retrieval at chance in
+both arms.
+
+**And the null has a measured cause, which is the part that changes the
+plan.** The FSP head scored F1 **0.685** at its threshold and **0.792** at
+top-22, against a **global byte-frequency prior of 0.817** on the same
+positions. The head did not beat the prior: the auxiliary was satisfied
+without the state, so the arm never tested the hypothesis. Two independent
+reasons, both worth knowing:
+
+* *the objective is free at byte level* — a 64-byte bag holds ~22 distinct
+  symbols and they are largely the common ones, so "predict the next 64
+  bytes' bag" is mostly "predict the letter frequencies". The paper's
+  token-level setting does not have this shape;
+* *the target is out of reach* — the retention curve puts the state's usable
+  horizon at 8–32 bytes (38% / 17% / 5% at 8 / 32 / 128) and the FSP target
+  is a bag **64 bytes** ahead. τ=64 came from a setting where one token is a
+  word.
+
+**The reframe: the write path works, the read path does not.** The matched
+cue's states are 2.6× closer than the random control's at 8 bytes, so the
+state **holds** the cue; every copy/retrieval arm is at chance, so the model
+cannot **read** it out; and the FSP head — a direct read of the state — gets
+the prior and nothing more, which is a third independent read-path failure.
+
+**What this does to the priority queue.** §7.2b put the next month on "the
+write path and the readout". The C run splits that in two, and the evidence
+puts the weight on the *readout*:
+
+* **the read wiring (the hierarchical feature-state wiring) has never been
+  tested with an objective that is not saturated** — every auxiliary so far
+  has been either free (FSP) or an init (P4). This is the untested
+  candidate;
+* **the P3 gate (an input-dependent write) is not mis-aimed, but its purpose
+  has changed**: not "make the state hold the cue" — it does — but "make the
+  write selective, so the read's signal-to-noise is good enough to decode".
+  That also relocates the P3 blocker: with a per-byte decay, the ring's
+  stored value and the credit's decay no longer agree, so the ring has to
+  store the undecayed value plus the per-element factor (twice the memory),
+  or the credit has to be re-derived;
+* **an FSP v2 is only worth running after the objective stops being free**:
+  τ inside the state's reach (8–16 bytes), and a prior-free score (the head's
+  F1 on the symbols the prior gets wrong), pre-registered before the run.
+
+**The T-axis itself is untouched by all of this.** T=1 still wins at this
+scale, for the same reason (update count, not credit), and the T4's 1.26×
+default-path win (the fused `nvrtc` credit, bit-identical) makes the T
+question cheaper to re-ask: the same T4 now trains 26% faster.
