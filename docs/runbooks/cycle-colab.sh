@@ -44,6 +44,13 @@ for cycle in $(seq 1 "$CYCLES"); do
   fi
   echo "  T4 acquired"
 
+  # Build the code tarball FRESH, every cycle. Shipping a stale tarball
+  # already cost one cycle: the arms died instantly on an unrecognized
+  # flag, because the tarball predated the change.
+  tar czf /tmp/code_only2.tar.gz -C "$REPO" \
+      gpu_port.py numpy_port.py train_gpu.py checkpoint_hub.py distill.py \
+      tail_credit.py teacher_table.py telemetry.py fetch_corpus.py \
+      fetch_eval_data.py test_tail.py tools 2>/dev/null
   $SCP /tmp/code_only2.tar.gz "$ALIAS":/content/ 2>/dev/null
   $SCP "$REPO/docs/runbooks/run-box.sh" "$REPO/docs/runbooks/fetch-corpus-box.sh" \
        "$REPO/runs/taxis/corpus_sha256.txt" "$ALIAS":/content/ 2>/dev/null
@@ -54,7 +61,7 @@ for cycle in $(seq 1 "$CYCLES"); do
   # RESUME it (not start over); if not, it starts from scratch. Asking the
   # hub is the only honest way to decide.
   $SSH "$ALIAS" 'cd /content && tar xzf code_only2.tar.gz && mkdir -p runs/taxis && \
-      (bash fetch_corpus_box.sh > runs/fetch.log 2>&1; \
+      (bash fetch-corpus-box.sh > runs/fetch.log 2>&1; \
        FROM=$(python3 -c "
 from huggingface_hub import HfApi
 fs = HfApi().list_repo_files(\"bakali1/tmt-checkpoints\")
@@ -62,9 +69,10 @@ own = [f for f in fs if f.startswith((\"A_p4_wd0_c_t\", \"A_p4_wd0_fsp_c_t\"))]
 print(\"1\" if own else \"\")
 "); \
        export FROM_SCRATCH=$FROM; \
-       setsid nohup bash run_box.sh > runs/box.log 2>&1 < /dev/null) & sleep 30; \
+       setsid nohup bash run-box.sh > runs/box.log 2>&1 < /dev/null) & sleep 30; \
        tail -3 runs/box.log' 2>&1 | tail -4
-  echo "  FROM_SCRATCH=$FROM (empty means: resume from the hub)"
+  echo "  (the hub decides: an arm with no checkpoint of its own starts from scratch,"
+  echo "   an arm with one resumes it)"
   echo "  arms launched; polling"
 
   # wait for the arms to finish, or for the runtime to die
@@ -74,8 +82,23 @@ print(\"1\" if own else \"\")
       echo "  runtime went away at $(date -u +%H:%M:%SZ)"
       break
     fi
-    if $SSH "$ALIAS" 'grep -q "BOTH ARMS DONE" /content/runs/box.log 2>/dev/null'; then
-      echo "  BOTH ARMS DONE at $(date -u +%H:%M:%SZ)"
+    # "BOTH ARMS DONE" is printed even when the arms FAILED (it is printed
+    # unconditionally at the end of the script), so the completion test is
+    # the arms' own final checkpoints: they must exist AND be at the target
+    # step. That check caught a cycle whose arms died on a bad flag.
+    if $SSH "$ALIAS" 'cd /content && python3 -c "
+import numpy as np, os, sys
+ok = True
+for arm in (\"A_p4_wd0_c\", \"A_p4_wd0_fsp_c\"):
+    p = f\"runs/taxis/{arm}.npz\"
+    if not os.path.exists(p):
+        print(f\"{arm}: MISSING\"); ok = False; continue
+    t = int(np.load(p)[\"t\"])
+    print(f\"{arm}: t={t}\")
+    ok = ok and t >= 19000
+sys.exit(0 if ok else 1)
+"' 2>/dev/null; then
+      echo "  BOTH ARMS REACHED THE TARGET at $(date -u +%H:%M:%SZ)"
       $SCP "$ALIAS":/content/runs/taxis/ruler_A_p4_wd0_c.txt \
            "$ALIAS":/content/runs/taxis/ruler_A_p4_wd0_fsp_c.txt \
            "$REPO/runs/taxis/" 2>/dev/null
