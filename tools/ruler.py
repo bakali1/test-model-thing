@@ -196,7 +196,13 @@ def main():
           "no weight updates; SE across slices")
     import tools.eval_npz as eval_npz
     dim, layers = eval_npz.infer_config(np.load(CKPT))
-    m_eval = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4)
+    # The eval model must have the SAME parameter layout as the checkpoint,
+    # and an FSP arm's checkpoint carries the auxiliary head's 132,352
+    # parameters. Building without them makes the numpy reference refuse the
+    # file (a parameter-count mismatch), which is how this cell died on the
+    # FSP arm: the crash was in the LOADER, not in the measurement.
+    _has_fsp = "fsp.W" in np.load(CKPT).files
+    m_eval = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4, fsp=_has_fsp)
     m_eval.new_states(1)
     m_eval.load(CKPT)
     m_eval.new_states(1)

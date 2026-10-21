@@ -3815,3 +3815,108 @@ outside it: the `masked_fill` that zeroes the ring's 1.4% hot columns
 (5.1 ms/step) and the **1,072 kernel launches per step** (10.1 ms of *CPU*
 time — the launch overhead is larger than the whole credit's arithmetic).
 A launch-count reduction is the next thing to measure.
+
+---
+
+## 2026-10-21 — C: the P4-vs-FSP A/B on a T4 (19,000 steps each) — FSP is a null, and the null has a *measured* cause
+
+**The arms.** `A_p4_wd0_c` (the control: P4 init, `wd_decay 0`) vs
+`A_p4_wd0_fsp_c` (the same, plus `--fsp-alpha 1.0 --fsp-r 16 --fsp-tau 64
+--fsp-pos-weight 8.5 --fsp-layer -1`). B=1024, T=1, `ring_k=18`, `TMT_TAIL=0`,
+seed 0, **from scratch**, 19,000 steps (19.5 MB) each — the salvaged control's
+*exact* budget, so the two arms and the salvaged run are comparable. Colab T4,
+corpus fetched on the box (so the held-out bytes differ from the local files:
+the absolute CE below is Colab-vs-Colab only).
+
+**The run survived the recycling.** The free tier refused allocations outright
+for hours, and the runtimes that did come were recycled mid-run. The loop
+(allocate → ship → fetch → *resume* both arms from the hub → wait → repeat)
+worked because of the two pieces landed earlier: the checkpoint's **data
+position** (a resume continues the corpus instead of replaying it) and
+`--stop-at-t` (a resume finishes at exactly the same step, so the byte budget
+cannot drift). Both arms reached t=19,000 and were pushed to the hub.
+
+| metric | control | +FSP | Δ |
+|---|---:|---:|---|
+| held-out CE (Colab corpus) | 1.360 | 1.361 | **+0.001** |
+| half-life mean | 93.97 B | 92.77 B | −1.2 B |
+| retention d=8 | 38.3% | 37.5% | −0.8 |
+| retention d=32 | 17.6% | 17.1% | −0.5 |
+| retention d=128 | 5.3% | 5.0% | −0.3 |
+| retention d=512 | 0.83% | 0.78% | −0.05 |
+| selective copy / associative retrieval | chance | chance | — |
+| **FSP bag F1 (head @ 0.5)** | — | **0.685** | vs the global prior **0.817** |
+| **FSP bag F1 (head @ top-22)** | — | **0.792** | vs the global prior **0.817** |
+| (local 4-gram prior, same positions) | — | 0.420 | — |
+
+**The verdict: FSP changed nothing — and the D7 cell says exactly why.** The
+head did **not** beat the static byte-frequency prior (0.685 and 0.792 against
+0.817). The auxiliary loss was therefore satisfied by the prior: the objective
+never asked the state for anything. This is the failure the cell was built to
+catch, and it caught it.
+
+**Three readings, in the order they constrain the next step.**
+
+1. **The objective is saturated by a trivial solution, and this is a property
+   of the byte-level port, not of the hypothesis.** "Predict the bag of the
+   next 64 bytes" at byte level is mostly "predict which bytes are common":
+   a 64-byte bag holds ~22 distinct symbols and they are largely the common
+   ones. The paper's token-level setting does not have the same shape (a
+   4096-symbol vocabulary at ~1.6% density). So this arm's null says *the
+   auxiliary was free*, not *the state is useless*.
+2. **The target is also beyond the state's reach, independently.** The
+   retention curve says the state's usable horizon is short — 38% at 8 bytes,
+   17% at 32, 5% at 128 — and the FSP target is a bag at **64 bytes** ahead.
+   τ=64 was carried over from the paper's token setting, where one token is a
+   word; here it is outside what the state can carry at all. A head at the
+   prior is exactly what a state that carries nothing that far should produce.
+3. **The pre-registered limitation (D2) is still in force** — only one of the
+   sixteen layer memories received the direct gradient — so a null is
+   ambiguous between "the objective was free" and "one of sixteen memories
+   got the job". Reading (1) dominates: the head did not need the state.
+
+**What the A/B does establish: the write path works, the read path does not.**
+This is a reframe of where the bottleneck is, and it comes from three
+independent measurements that agree:
+
+* the **retention curve**: the matched cue's states are 2.6× closer together
+  than the random control's at 8 bytes (matched Δh 23.4 vs control 61.1) —
+  the cue **is** in the state;
+* **every** copy/retrieval arm is at chance, in this pair and in all the
+  earlier ones — the model cannot **read** the stored value out;
+* the **FSP head** is a third, independent read-path failure: a head that
+  reads the state *directly* and predicts the future bag gets the prior and
+  nothing more.
+
+So the failure is not that the state is empty; it is that nothing in the
+architecture can extract what the state holds. That reorients the plan:
+
+* the **read wiring** (how a layer's state reaches the output) has never been
+  tested with an objective that is not saturated — the hierarchical
+  feature-state wiring is the untested candidate;
+* the **P3 gate** (an input-dependent *write*) is not mis-aimed — but its
+  value is now understood differently: not "make the state hold the cue"
+  (it does) but "make the write selective, so the read's signal-to-noise is
+  good enough to decode".
+
+**What an FSP v2 would have to change** (pre-registered before it is run):
+
+* **τ inside the state's reach** — 8 or 16 bytes, not 64;
+* **a prior-free score**: the head's F1 measured *on the symbols the prior
+  gets wrong*, or against a prior conditioned the same way, so a head that
+  learned the prior cannot look good;
+* the **per-layer variant** (16× the head's flops) stays the second arm —
+  but only after the objective stops being free.
+
+**The other two salvaged snapshots, measured on the local corpus** (the
+capacity axis's erosion curve, all at ~19 MB):
+
+| arm | init | wd_decay | half-life mean | retention d=8 / 32 / 128 | held-out CE |
+|---|---|---|---:|---|---:|
+| default | default | 0.01 | 1.05 B | 1.1% / 0.10% / 0% | 1.3297 ± 0.0254 |
+| P4 | P4 | 0.01 | 57.16 B | 37.0% / 16.3% / 4.6% | 1.6342 ± 0.0297 |
+| P4 | P4 | 0 | 95.37 B | 37.5% / 17.1% / 5.3% | 1.7482 ± 0.0362 |
+
+Weight decay erodes the P4 spread roughly in half (95 B → 57 B of half-life)
+and costs CE, but it does not remove the capacity: the retention curve is
+barely moved. The default init has no capacity at any budget.
