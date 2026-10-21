@@ -3693,3 +3693,95 @@ decay logits and the shared embedding's credit, and no other layer's decay).
 A null result is therefore ambiguous between "the objective does not work" and
 "one of sixteen memories got the job". The per-layer variant — 16× the head's
 flops — is pre-specified as a **second** arm, not a variant of this one.
+
+---
+
+## 2026-10-21 — the speed investigation: the hypothesis was WRONG, and the correction is the useful part
+
+**The question.** The engine's optimizer step is dominated by one irregular
+memory pattern: the ring credit's atomic scatter. At the production shape
+(B=1024, K=18, dim=512, 16 layers) it issues **150,994,944 fp32 atomic
+element-adds per step** into a 131,072-address destination — 72 contending
+adds per address on average, 3,012 on the busiest. The hypothesis was that
+*contended atomics* are the wall, and that a fused or segmented credit path
+could raise the training throughput.
+
+**The measurement (Tesla T4, cc 7.5, the production shape).** The credit,
+timed alone (`tools/bench_ring_credit.py`):
+
+| path | ms/call | ms/step (16 layers) | atomics/layer | passes over the ring |
+|---|---:|---:|---:|---:|
+| `full` (portable reference) | 1.285 | 20.56 | 9,437,184 | 5 |
+| `compiled` (Inductor — the CUDA default) | 0.671 | 10.74 | 9,437,184 | ~2 + scatter |
+| `triton` | 1.024 | 16.38 | 9,437,184 | 2 + scatter |
+| `nvrtc` (hand-written fused kernel) | **0.475** | **7.61** | 9,437,184 | 1 (read+write) |
+| traffic floor at 320 GB/s | — | 1.89 read / 3.77 read+write | — | — |
+
+All four paths agree **bit-for-bit** on the T4, and the `full` baseline's
+20.56 ms/step matches the profiler's independent 21.3 ms/step for the
+ring-credit phase — the harness and the profiler agree.
+
+**The verdict: the wall is the BYTES, not the atomics.** The credit moves
+604 MB/step of ring traffic (1,208 MB with the decay's write-back) — the
+traffic floor is 1.89–3.77 ms/step, and the *best* path is 7.61 ms. The
+atomics are not what is left over: the fused `nvrtc` path already moves the
+ring exactly once and is 2.7× faster than the portable reference **while
+issuing the same 151M atomics per step**. So the atomics are cheap, and
+what costs is reading and writing the ring.
+
+**Two corrections to what I believed going in.**
+
+1. *The removed `segmented` candidate was never measured on the MX150.* Its
+   0.81× (RESULTS, Board run 4) and 0.71× (Phase-0 board) are **both T4
+   numbers**; the MX150 work is from 2026-10-03, a month after the candidate
+   was removed. I had briefed the investigation on a false premise, and the
+   agent corrected it in the record rather than answering the question as
+   asked.
+2. *The candidate did not lose because of the atomics either.* It traded
+   9.44M atomics for a full extra round trip over the (B,K,dim) tensor
+   (~113 MB/step): the traffic it **adds** cost more than the atomics it
+   removed (0.38 ms vs 0.23 ms on the T4; 3.0 vs 1.8 ms on the MX150). The
+   margin gets *worse* on the faster GPU — the same extra traffic buys less
+   time while the atomics it removed were already cheap. The isolated
+   micro-benchmark agrees: `index_add_` 0.320 ms vs sort+segment-sum
+   0.661 ms. It also moved the float (state RMS 1.8e-03 against 1.3e-04 for
+   the kept paths), because `segment_reduce` reassociates.
+
+**What survives the analysis: the `grouped` credit.** The reduction axis of
+the credit is the **byte id**, never the lag: the K lag terms of a (b,d)
+land on K *different* byte ids (99.9% of lag pairs differ, measured), so
+reducing the lag axis in registers is illegal — it sums contributions
+destined for different bytes. The legal move is to group the rows by byte
+id and fold each group **left, in increasing row order** — which is the
+reference's own order (`index_add_` is bit-identical to numpy's walk,
+measured, not assumed) — and write each address exactly once:
+
+* **zero atomics** per layer (the other four paths issue 9,437,184);
+* **no extra traffic**: one pass over the ring, read and written back, the
+  same traffic the fused `nvrtc` path already moves;
+* **the same float**, term for term.
+
+Gated by `tests/check_ring_grouped.py` (new): bit-identical to `full`, to
+numpy's own scatter, and to a 12-step engine run's theta/m/v — and the gate
+also pins the two *illegal* moves (the lag reduction, the reassociation) so
+they cannot be re-introduced by accident. `tests/check_parity.py`,
+`tests/check_safety.py` and `tests/check_seqlen_credit.py` all pass, and the
+default path (`auto` → `compiled` on CUDA) is untouched.
+
+**Still open:** the `grouped` path's T4 wall-clock (the free tier refused a
+second allocation), and the cost of the sort of 18,432 keys per byte.
+
+**The bigger prizes are outside the credit.** The `masked_fill` that zeroes
+the 1.4% hot columns of the ring is 5.1 ms/step, and the 1,072 kernel
+launches per step cost 10.1 ms of *CPU* time — both larger than anything
+the credit's atomics can save. The engine's launch overhead is the next
+thing to look at.
+
+**What this changes about the plan.** The T-axis and P4/FSP work is a
+*quality* question and the throughput question was supposed to be a
+separate axis. The measurement says the throughput axis is not where the
+151M atomics are: the engine already moves the ring once, and the remaining
+cost is bytes and launches. So a "make the credit faster" programme has a
+small ceiling (the credit is 7.6 ms of a ~63 ms step at best), and the
+"make the step cheaper" programme (fewer launches, a smaller ring) has a
+large one.
