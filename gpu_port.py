@@ -37,6 +37,11 @@ RING_TOL = float(os.environ.get("TMT_RING_TOL", "1e-4"))
 HOT_FRAC = _tc.HOT_FRAC          # 0.01
 REBASE_EVERY = _tc.REBASE_EVERY  # 500
 F = torch.float32
+# The ring-credit paths the engine can run. `auto` resolves to `compiled` on
+# CUDA and `full` elsewhere; the rest are opt-in and measured in
+# tools/bench_ring_credit.py. `grouped` is the one that removes the atomic
+# contention WITHOUT changing a single float (see _NVRTC_GROUP_SRC).
+RING_CREDIT_MODES = ("auto", "full", "compiled", "triton", "nvrtc", "grouped")
 # Bit 0 stores undecayed ring values with per-slot decay factors; bit 1 stores
 # undecayed tail EMAs with per-column decay factors. Version 0 is the live
 # numpy-compatible algorithm and remains the production default.
@@ -446,6 +451,151 @@ def _nvrtc_ring_kernel():
     return _NVRTC_RING_KERNEL
 
 
+# ---------------------------------------------------------------------------
+# The GROUPED credit -- the legal way to take the contention out.
+#
+# WHAT THE ATOMIC SCATTER IS. The credit computes, for every (stream b, lag
+# k, dim d):
+#
+#     dest[ rows[b*K+k] , d ]  +=  w[b,k,d] * dlds[b,d]
+#
+# where rows[b*K+k] is the byte id the (b,k) slot holds. The destination has
+# 256 rows (byte ids) and `dim` columns, so EVERY element of the (B,K,dim)
+# ring becomes an fp32 atomic add: 9.44M per layer at B=1024, K=18, D=512,
+# 151M per step, into 131,072 addresses -- ~72 contending adds per address
+# on average, and far more on the popular bytes.
+#
+# WHY THE OBVIOUS FIX IS ILLEGAL. The tempting rewrite is "reduce the K axis
+# in registers and issue one atomic per (b,d)": 1024*512 = 524K atomics per
+# layer instead of 9.44M. It is WRONG, and not by a rounding: the K lag
+# terms of one (b,d) do not share a byte id. rows[b,k] is the byte that
+# stream b saw k steps ago, so the K terms of (b,d) land on K DIFFERENT
+# bytes. Summing them would put one byte's credit on another byte. The
+# reduction axis of the credit is the BYTE ID, never the lag.
+#
+# WHAT IS LEGAL. dest[r,d] must end up as the sum of the values of every row
+# that maps to byte id r, in the order the reference adds them, and the
+# reference's order is the row order (numpy_port's `_scatter_credit` walks
+# the rows in increasing index; torch's CPU `index_add_` is bit-identical to
+# that walk -- measured, see tests/check_ring_grouped.py). So:
+#
+#   LEGAL: group the rows by byte id and combine each group's contributions
+#          in INCREASING ROW ORDER, then write the group total once. Every
+#          float is the same float, in the same order, as the reference.
+#   LEGAL: any permutation of the ADDRESSES (each address is independent).
+#   ILLEGAL: reducing over the lag axis (wrong bytes).
+#   ILLEGAL: reassociating a group's sum (a tree/segment sum instead of a
+#            left fold) -- that is a different float, and it is exactly what
+#            the removed `segmented` candidate did.
+#   ILLEGAL: starting the fold from something other than the destination's
+#            current value ((d + v1) + v2 != d + (v1 + v2) in fp32).
+#
+# The kernel below therefore does a LEFT FOLD per address, in row order,
+# with no reassociation: each thread owns one (byte id, dim) address, reads
+# the destination, adds the group's values one at a time in row order, and
+# writes the address back ONCE. Zero atomics.
+#
+# THE GROUP PLAN. The kernel needs, for each byte id, the list of rows that
+# map to it, in increasing row order. That is a stable sort of the byte ids
+# (a stable sort keeps the rows of a group in their original relative
+# order, which is what makes the fold the reference's fold). The plan is
+# built ONCE PER BYTE and reused by all 16 layers, so its cost is 1/16 of a
+# layer's.
+# ---------------------------------------------------------------------------
+_NVRTC_GROUP_SRC = r"""
+extern "C" __global__
+void tmt_ring_credit_grouped(float* __restrict__ w,
+                              const float* __restrict__ dec,
+                              const float* __restrict__ dlds,
+                              const int* __restrict__ woff,
+                              const int* __restrict__ dlsoff,
+                              const int* __restrict__ goff,
+                              const int* __restrict__ gcnt,
+                              float* __restrict__ dest,
+                              const unsigned char* __restrict__ hotmask,
+                              int D, int has_mask) {
+    const int r = blockIdx.y;                    // the byte id
+    const int d = blockIdx.x * (blockDim.x * blockDim.y)
+                  + threadIdx.y * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    const int m = gcnt[r];                       // rows that land on this byte
+    const int off = goff[r];                     // where they start, sorted
+    // The address is owned by exactly this thread, so the reference's
+    // "add into whatever is there" is a plain read, and the group total is
+    // a plain write. No atomics, and no second writer.
+    float s = dest[(long)r * D + d];
+    for (int j = 0; j < m; ++j) {
+        const int wo = woff[off + j];            // this row's w offset
+        const int lo = dlsoff[off + j];          // this row's dlds offset
+        const float wv = w[(long)wo + d] * dec[d];
+        w[(long)wo + d] = wv;                    // the decay, in place
+        float v = wv * dlds[(long)lo + d];       // the ring credit
+        if (has_mask && hotmask[d]) v = 0.0f;    // hot-dim mask (1 byte)
+        s += v;                                  // LEFT FOLD, row order
+    }
+    dest[(long)r * D + d] = s;
+}
+"""
+
+_NVRTC_GROUP_KERNEL = None
+_NVRTC_GROUP_FAILED = False
+
+
+def _nvrtc_group_kernel():
+    """Compile (once) and return the grouped ring kernel, or None."""
+    global _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_FAILED
+    if _NVRTC_GROUP_KERNEL is not None or _NVRTC_GROUP_FAILED:
+        return _NVRTC_GROUP_KERNEL
+    try:
+        if not hasattr(torch.cuda, "_compile_kernel"):
+            raise RuntimeError("torch.cuda._compile_kernel is unavailable")
+        if not _ensure_cuda_home():
+            raise RuntimeError("no CUDA_HOME and no bundled cuda_runtime headers")
+        _NVRTC_GROUP_KERNEL = torch.cuda._compile_kernel(
+            _NVRTC_GROUP_SRC, "tmt_ring_credit_grouped")
+    except Exception as exc:                     # pragma: no cover
+        _NVRTC_GROUP_FAILED = True
+        print(f"[ring_credit] grouped kernel unavailable ({type(exc).__name__}: "
+              f"{str(exc).splitlines()[0][:90]}) -> falling back to 'full'",
+              flush=True)
+        return None
+    return _NVRTC_GROUP_KERNEL
+
+
+def _ring_credit_grouped_torch(dest, w, dlds, hot_mask, rows, dec):
+    """The portable (CPU) grouped credit: the same left fold, in torch.
+
+    This is the reference semantics of the CUDA kernel, and it is what makes
+    the kernel testable on a machine with no GPU: the fold is done in
+    "rounds" -- in round j, every byte id adds its j-th row -- so each
+    address's contributions are added in increasing row order, exactly as
+    `index_add_` (and numpy's `_scatter_credit`) add them.
+
+    It is a LOOP OVER ROUNDS, so it is not a fast path: it exists to pin the
+    arithmetic, and to run the credit on a CPU. The CUDA kernel is the fast
+    one, and it computes the same thing.
+    """
+    w.mul_(dec[None, None, :])
+    vals = w * dlds[:, None, :]
+    if hot_mask is not None:
+        vals = vals.masked_fill(hot_mask[None, None, :], 0.0)
+    flat = vals.reshape(-1, w.shape[-1])
+    nb = dest.shape[0]
+    order = torch.argsort(rows, stable=True)
+    counts = torch.bincount(rows, minlength=nb)
+    goff = torch.cumsum(counts, 0) - counts
+    s = dest.clone()
+    maxc = int(counts.max()) if counts.numel() else 0
+    for j in range(maxc):
+        valid = (counts > j).nonzero(as_tuple=False).reshape(-1)
+        if valid.numel() == 0:
+            continue
+        idx = order[goff[valid] + j]
+        s.index_add_(0, valid, flat[idx])
+    dest.copy_(s)
+    return dest
+
+
 if triton is not None:
     @triton.jit
     def _fused_ring_credit_kernel(dest_ptr, w_ptr, grad_ptr, rows_ptr, factor_ptr,
@@ -638,7 +788,7 @@ class GpuModel:
         if self._ring_k_explicit:
             if not isinstance(ring_k, (int, np.integer)) or int(ring_k) < 1 or int(ring_k) > 256:
                 raise ValueError(f"ring_k must be an integer in [1, 256], got {ring_k!r}")
-        if ring_credit not in ("auto", "full", "compiled", "triton", "nvrtc"):
+        if ring_credit not in RING_CREDIT_MODES:
             raise ValueError(f"unknown ring_credit={ring_credit!r}")
         if grad_assembly not in ("cat", "loop"):
             raise ValueError(f"unknown grad_assembly={grad_assembly!r}")
@@ -649,6 +799,10 @@ class GpuModel:
         #               on T4 vs full, with no recompile stall at a tail rebase
         #   triton   -- hand-written fused kernel, +9% on T4; the fallback when
         #               Inductor is unavailable
+        #   nvrtc    -- hand-written fused kernel, no Triton/cc floor
+        #   grouped  -- the same arithmetic with NO atomics: the contending
+        #               adds to a byte id are combined in the reference's row
+        #               order first (see _NVRTC_GROUP_SRC)
         #   auto     -- compiled on CUDA, full elsewhere (safe default)
         self.ring_credit = ring_credit
         if self.ring_credit == "auto":
@@ -1027,6 +1181,13 @@ class GpuModel:
         option below cc 7.0 (measured 2.2-2.7x on an MX150). The `cold`,
         `kloop` and `segmented` candidates were removed after measuring 0.95x,
         0.90x and 0.81x respectively -- see RESULTS.md.
+
+        `grouped` is the one that attacks the ATOMICS rather than the traffic:
+        the contributions to one byte id are combined in the reference's row
+        order first, so the address is written once and the layer issues no
+        atomics at all. It is the only path that changes the SHAPE of the
+        scatter without changing a single float; the legality argument (and
+        the reductions that are NOT legal) is on _NVRTC_GROUP_SRC.
         """
         mode = self._ring_mode()
         if mode == "nvrtc":
@@ -1038,21 +1199,40 @@ class GpuModel:
                 # own _mask dict holds numpy, and masked_fill_ silently accepts
                 # both). A raw-pointer kernel accepts neither implicitly, so
                 # normalise here rather than fail at the launch.
-                if hot_mask is None:
-                    marg = self._nvrtc_nomask()
-                elif (isinstance(hot_mask, torch.Tensor)
-                      and hot_mask.is_cuda and hot_mask.dtype == torch.bool):
-                    marg = hot_mask
-                else:
-                    marg = torch.as_tensor(np.asarray(hot_mask),
-                                           dtype=torch.bool,
-                                           device=self.device)
+                marg = self._ring_hot_mask_arg(hot_mask)
                 grid = ((B * K * D + 255) // 256, 1, 1)
                 kern(grid=grid, block=(256, 1, 1),
                      args=[w, dec, dlds, rows, self._ring_dest, marg,
                            B, K, D, 0 if hot_mask is None else 1])
                 return
             mode = "full"        # kernel unavailable: portable reference
+        if mode == "grouped":
+            # The grouped credit: the contending adds to one address are
+            # combined FIRST (in the reference's row order), so the address
+            # is written once and there are NO atomics. See the legality
+            # notes on _NVRTC_GROUP_SRC.
+            if dec.dim() != 1:
+                # the gated arm's retention is per (stream, dim), which this
+                # kernel does not implement; the portable path does.
+                mode = "full"
+            elif not w.is_cuda:
+                _ring_credit_grouped_torch(self._ring_dest, w, dlds,
+                                            hot_mask, rows, dec)
+                return
+            else:
+                kern = _nvrtc_group_kernel()
+                if kern is not None:
+                    B, K, D = w.shape
+                    marg = self._ring_hot_mask_arg(hot_mask)
+                    woff, dlsoff, goff, gcnt = self._group_plan(rows, K, D)
+                    nchunk = (D + 127) // 128
+                    kern(grid=(nchunk, self._ring_dest.shape[0], 1),
+                         block=(32, 4, 1),
+                         args=[w, dec, dlds, woff, dlsoff, goff, gcnt,
+                               self._ring_dest, marg, D,
+                               0 if hot_mask is None else 1])
+                    return
+                mode = "full"        # kernel unavailable: portable reference
         if mode == "compiled":
             if self._compiled_ring_credit is None:
                 self._compiled_ring_credit = torch.compile(
@@ -1086,6 +1266,51 @@ class GpuModel:
             self._nvrtc_nomask_t = torch.zeros(1, dtype=torch.bool,
                                                device=self.device)
         return self._nvrtc_nomask_t
+
+    def _ring_hot_mask_arg(self, hot_mask):
+        """The hot mask as a DEVICE bool tensor the raw-pointer kernels read.
+
+        The hot mask reaches us as EITHER a cuda bool tensor (the rebase path
+        writes one) or a numpy bool array (tail_credit's own _mask dict holds
+        numpy, and masked_fill_ silently accepts both). A raw-pointer kernel
+        accepts neither implicitly, so normalise here rather than fail at the
+        launch.
+        """
+        if hot_mask is None:
+            return self._nvrtc_nomask()
+        if (isinstance(hot_mask, torch.Tensor)
+                and hot_mask.is_cuda and hot_mask.dtype == torch.bool):
+            return hot_mask
+        return torch.as_tensor(np.asarray(hot_mask), dtype=torch.bool,
+                               device=self.device)
+
+    def _group_plan(self, rows, K, D):
+        """The grouped credit's plan: which rows land on which byte id, in
+        increasing row order.
+
+        A STABLE sort of the byte ids is what makes the fold the reference's
+        fold: within a byte id, the rows keep their original relative order,
+        and the reference adds them in that order.
+
+        Cached per byte: the ring's byte ids change once per byte and the
+        plan is reused by every layer, so the plan costs 1/16 of a layer.
+        The cache key is the row tensor's version counter, which is bumped
+        by the in-place write of the ring's byte ids.
+        """
+        key = (int(rows._version), int(rows.shape[0]), int(rows.data_ptr()))
+        cached = getattr(self, "_group_plan_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        nb = self._ring_dest.shape[0]
+        order = torch.argsort(rows, stable=True)
+        counts = torch.bincount(rows, minlength=nb)
+        goff = (torch.cumsum(counts, 0) - counts).to(torch.int32)
+        gcnt = counts.to(torch.int32)
+        woff = (order * D).to(torch.int32)
+        dlsoff = ((order // K) * D).to(torch.int32)
+        plan = (key, (woff, dlsoff, goff, gcnt))
+        self._group_plan_cache = plan
+        return plan[1]
 
     # ---------------- training step --------------------
     def step_batch(self, cs, ns, ends, fsp=None):
