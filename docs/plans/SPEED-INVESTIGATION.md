@@ -467,6 +467,38 @@ harness (a ±15% spread). The conclusions above are all larger than that
 spread except the grouped-vs-uniform comparison, which was re-run for both
 histograms in the same process.
 
+### 6.1 end to end: the whole `step_batch`, four paths, one seed
+
+A fresh model per arm, the same seed and the same byte stream, 40 timed
+steps after 8 warmups, B=1024, dim=512, 16 layers, T4:
+
+| path | ms/step | vs the default | the loss after 48 steps |
+|---|---:|---:|---|
+| `full` | 35.46 | 0.95x | 7.58001 |
+| **`compiled`** (the default) | 33.68 | 1.00x | 7.58001 |
+| **`nvrtc`** | **26.72** | **1.26x** | 7.58001 |
+| `grouped` | 27.92 | 1.21x | 7.58001 |
+
+(an earlier run of the same script: 36.02 / 33.02 / 28.22 / 28.43 — the
+ranking is stable, the absolute numbers move by ±5% on a shared T4.)
+
+**The four paths produce the SAME LOSS to the last digit** — not just the
+same credit, the same trajectory, end to end. That is the strongest form of
+the bit-identity claim the credit's arithmetic allows, and it is the
+evidence that the paths are interchangeable.
+
+Two things to read off it:
+
+* the default (`compiled`) is **1.26x slower than `nvrtc`** end to end,
+  while the credit alone says 1.35x — the difference is Inductor's own
+  per-call overhead (the compiled function's Python wrapper and its guard
+  checks), which is part of the same prize;
+* the byte ids in this synthetic bench are UNIFORM (random bytes), which is
+  the grouped path's best case. With a real corpus's byte histogram the
+  grouped path would be ~3 ms/step slower than `nvrtc` (the hot byte id,
+  §4.1) — i.e. the end-to-end ranking would be `nvrtc` < `grouped` <
+  `compiled` < `full`, with `nvrtc` first by a clear margin.
+
 ---
 
 ## 7. the gates
@@ -511,6 +543,12 @@ wall.** What IS on the table, at zero risk:
 3. the `triton` path (1.040 ms/call) is slower than `compiled` (0.671) and
    than `nvrtc` (0.497) on a T4 — it is the fallback for a machine with no
    Inductor, not a candidate.
+4. **the end-to-end ranking (T4, §6.1) is `nvrtc` 26.7 ms/step <
+   `grouped` 27.9 < `compiled` 33.7 < `full` 35.5**, with the same loss
+   to the last digit from all four.** The `nvrtc` path is already shipped,
+   already bit-identical, and already ~1.26x faster end to end than the
+   default — the grouped path is a legal alternative that ties it when the
+   byte ids are uniform and loses to it when they are not.
 
 **Still open, in order of value:**
 
