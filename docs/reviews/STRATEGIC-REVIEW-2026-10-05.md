@@ -50,7 +50,7 @@ Consequences:
   ARCHITECTURE question"* — is an artifact of that harness. The experiment
   measured its own correction.
 - The `1024×` figure quoted throughout `RESULTS.md` and the ROADMAP is the wrong
-  sign. Commit `93de9f3`'s message ("the decay rows miss a /B") is wrong.
+  sign. Commit `4e4fdc4`'s message ("the decay rows miss a /B") is wrong.
 - "Harmless under AdamW" (scale-invariance of `m/√v`) remains true, but it is
   true of every group, not a decay-role property.
 

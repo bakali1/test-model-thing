@@ -1,7 +1,7 @@
 # Response to external critique of the strategic review (2026-10-06)
 
 **Status:** accepted in part. This document records the point-by-point verdict on an
-external review of `STRATEGIC-REVIEW-2026-10-05.md` (rev 1, commit `255beb0`). The
+external review of `STRATEGIC-REVIEW-2026-10-05.md` (rev 1, commit `d11e7ee`). The
 review document was revised in place (rev 2) to remove the overclaims; this file
 keeps the full record of what was challenged, what stands, and what is now open.
 
@@ -57,7 +57,7 @@ the 16 decay slices by B, giving the decay role an effective learning rate
 1e-5 over 30,000 SGD steps → architecture question" — measured the harness's own
 correction. **Removed from the evidence base entirely** (not merely downgraded),
 matching the critique's instruction. Runnable as a check:
-`git show 93de9f3` (the commit claiming "the decay rows miss a /B").
+`git show 4e4fdc4` (the commit claiming "the decay rows miss a /B").
 
 Adam's per-coordinate scale invariance is why the bug hid under AdamW for 889,897
 steps and exploded only under plain SGD — exactly the critique's secondary point.
