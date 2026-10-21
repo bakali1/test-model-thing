@@ -180,8 +180,23 @@ def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
     if not tagged:
         print(f"[hub] {repo_id}: no tagged checkpoints yet")
         return None
-    best_t, best_f = tagged[-1]
+    # PREFER THIS ARM'S OWN FILES. The repo is shared by every run in the
+    # project, and a pull that takes the repo's GLOBAL best t would happily
+    # resume one arm from another arm's weights -- a silently wrong
+    # experiment. The tagged filename carries the arm's base name
+    # (<base>_t<step>.npz), so the arm's own files are identifiable, and the
+    # newest of THOSE is the right resume point. If the arm has no files
+    # yet, the global best is used (the historical behaviour).
     dest = os.path.abspath(dest)
+    base = os.path.splitext(os.path.basename(dest))[0]
+    own = [(t, f) for (t, f) in tagged
+           if os.path.splitext(os.path.basename(f))[0].startswith(base + "_")]
+    if own:
+        if (best_t, best_f) != own[-1]:
+            print(f"[hub] {repo_id}: resuming THIS arm ({base}): "
+                  f"t={own[-1][0]} (the repo's global best is t={best_t} from "
+                  f"another arm, ignored)")
+        best_t, best_f = own[-1]
     have = local_t(dest)
     if not force and best_t < have:
         print(f"[hub] {repo_id}: remote t={best_t} < local t={have}, skipping pull")
