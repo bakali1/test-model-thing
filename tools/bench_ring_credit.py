@@ -247,7 +247,10 @@ def main():
             print(f"{path:>10} | {'-':>9} | {'-':>9} | {atoms:>17,} | "
                   f"{'-':>9} | {per_addr:>9.0f} | {'-':>8} | {note}")
             continue
-        rate = (atoms / (ms / 1e3) / 1e9) if atoms else 0.0
+        # the RATE is per call: the atomics of one layer over the time of one
+        # layer's call. (atoms per STEP over the time of one CALL would
+        # overstate it by the number of layers.)
+        rate = (atoms / m.layercount) / (ms / 1e3) / 1e9
         print(f"{path:>10} | {ms:>9.3f} | {ms*m.layercount:>9.2f} | "
               f"{atoms:>17,} | {rate:>9.2f} | {per_addr:>9.0f} | "
               f"{'':>8} |")
@@ -261,6 +264,15 @@ def main():
           "grouped path is the one that matches numpy's order exactly):")
     try:
         ref = credit_result(m, "full")
+        # the SAME path twice: on CUDA the atomic order is the hardware's, so
+        # this measures whether the engine's "bit-identical" claim is a
+        # property of the order or of the code.
+        again = credit_result(m, "full")
+        same = torch.equal(ref, again)
+        d = (ref - again).abs().max().item()
+        print(f"  {'full vs full':>10}: "
+              f"{'RUN-TO-RUN IDENTICAL' if same else 'RUN-TO-RUN DIFFERS'} "
+              f"(max|d| {d:.3e})")
         for path in PATHS:
             if path == "full":
                 continue
@@ -279,8 +291,6 @@ def main():
         print(f"fastest path: {best[0]} at {best[1]:.3f} ms/call "
               f"= {best[1]*m.layercount:.2f} ms/step "
               f"({best[3]:.2f} G atomic adds/s)")
-        # the traffic floor: the ring is (B,K,D) fp32, and the decay writes
-        # it back, so a fused kernel must read AND write it.
         one = args.batch * K * m.dim * 4
         traffic = one * m.layercount
         bw = 320e9 if dev.type == "cuda" else 50e9
