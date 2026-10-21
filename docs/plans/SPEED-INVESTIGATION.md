@@ -508,11 +508,13 @@ Two things to read off it:
 | `tests/check_parity.py` | **PASS** (numpy ≡ torch; the T=1 bit-identity arm: 114 comparisons, 0 differing elements) |
 | `tests/check_safety.py` | **PASS** (8/8) |
 | `tests/check_seqlen_credit.py` | **PASS** (worst embed L1-mass deviation 1.2e-07, worst elementwise 6.5e-06) |
-| `tests/check_ring_grouped.py` (new) | **PASS** (the legality argument + the bit-identity of the candidate) |
-| `tools/check_nvrtc.py` (new) | both credit kernels compile for `compute_75` |
+| `tests/check_ring_grouped.py` (new) | **PASS** (the legality argument, the bit-identity of the candidate, and an element-by-element emulation of the CUDA kernel's index arithmetic) |
+| `tools/check_nvrtc.py` (new) | all three credit kernels compile for `compute_75` (with no GPU at all) |
+| `tools/bench_ring_credit.py` | the credit alone, per path, with the atomic arithmetic and the traffic floor beside it (§6) |
+| `tools/bench_step_paths.py` (new) | the whole step, per path, with the loss beside the timing (§6.1) |
 
 The default path is unchanged: `auto` → `compiled` on CUDA, `full` on CPU,
-and no number on the default path moved.
+and no number on the default path moved. `ring_credit="grouped"` is opt-in.
 
 ---
 
