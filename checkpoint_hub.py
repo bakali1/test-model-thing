@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import re
 import shutil
 import sys
 
@@ -189,8 +190,17 @@ def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
     # yet, the global best is used (the historical behaviour).
     dest = os.path.abspath(dest)
     base = os.path.splitext(os.path.basename(dest))[0]
+    # The repo's GLOBAL best (newest tagged file of any arm) -- used only
+    # for the "this is another arm" message, and as the fallback when the
+    # repo has no file of this arm and the run has not declared an arm.
+    best_t, best_f = tagged[-1]
+    # The arm's OWN files are "<base>_t<step>.npz" EXACTLY. A plain prefix
+    # match is too loose: the arm "A_p4_wd0_c" starts with "A_p4_wd0_", so a
+    # prefix match would hand it the FIRST run's control checkpoint
+    # (A_p4_wd0_t010000.npz) -- a different experiment, silently resumed.
     own = [(t, f) for (t, f) in tagged
-           if os.path.splitext(os.path.basename(f))[0].startswith(base + "_")]
+           if re.match(re.escape(base) + r"_t\d+\.npz$",
+                       os.path.basename(f))]
     if own:
         if (best_t, best_f) != own[-1]:
             print(f"[hub] {repo_id}: resuming THIS arm ({base}): "
