@@ -4207,3 +4207,81 @@ head, so there is no train/eval overlap, but the corpus is shared.
 (c) The r=0.99 row shows the model is not robust to a λ schedule that
 abandons back-off; the reported optimum (r≈0.85–0.9) is a real optimum,
 not a monotone drift.
+
+### 7. D5 — the measurement paradox is resolved: the state DOES hold an addressable payload
+
+`tools/d5_probe.py` (new) re-measures the read path on the C A/B's P4
+checkpoint with every instrument requirement from §5 applied: the state is
+read **at the cue** (the D4 padding bug avoided, via the fixed-gap
+generator, so every sequence is exactly 12+d bytes and no zero padding
+exists), the readout is the **fixed** `_ridge_score`, the payload uses a
+**matched 16-symbol alphabet** with a **matched null**, n=2048 (full class
+coverage: 100 % of the 256 byte values and 100 % of the payload values are
+in the training half), and every cell carries its own permuted-label veto
+and a nuisance control (the payload region replaced by fresh random bytes
+of the same alphabet).
+
+**The result (n=2048, alphabet 16, per-byte accuracy and its own matched
+null):**
+
+| gap | payload | null | ×null | **cue key** | null | ×null |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 28.03 % | 6.05 % | **4.63×** | 47.95 % | 0.29 % | **165×** |
+| 12 | 29.49 % | 6.42 % | **4.59×** | 43.21 % | 0.44 % | 98× |
+| 32 | 22.09 % | 6.64 % | **3.33×** | 28.64 % | 0.32 % | 90× |
+| 64 | 15.89 % | 5.66 % | 2.81× | 27.12 % | 0.42 % | 65× |
+| 128 | 10.16 % | 6.67 % | 1.52× | 26.88 % | 0.32 % | 84× |
+
+The nuisance control (the payload absent from the state) sits at its own
+chance at every gap — so the payload signal is not an artefact of the
+readout.
+
+**The paradox dissolves.** The capacity ruler (Δh retention) and the
+decodable payload now agree in shape:
+
+| distance | Δh retention | decodable payload **above its own null** |
+|---:|---:|---:|
+| 8 B | 37.5 % | 21.98 % |
+| 32 B | 17 % | 15.45 % |
+| 128 B | 5.3 % | 3.49 % |
+
+They are the same curve. The earlier "the readout never beats its own
+control" and the "12-byte horizon" were both artifacts of instruments that
+were broken in three separate ways at once (the λ swap, the byte-0 ravel,
+and the post-padding read), each of which pushed the measured payload
+toward its own null.
+
+**The new picture, which is stronger than the old one:**
+- **the ADDRESS is strongly present and persistent.** The cue key decodes
+  **65–165× over its own null** and holds ~27 % even at 128 B of lag. The
+  state *knows which key it is being asked about*, and keeps knowing it.
+- **the CONTENT is present and decays.** The payload decodes 4.6× over null
+  at 8–12 B, falling to 1.5× at 128 B. So the payload is genuinely in the
+  state, and what decays with distance is the payload's *separability*, not
+  its presence.
+- **this is the "address vs content" split the plan asked for**, and it
+  says the write path is *not* the problem in the way the old framing
+  assumed: the state holds an addressable, persistent address and a
+  decaying but real content.
+
+**What this does NOT say.** A 4.6× over-null per-byte rate is not a model
+that can *use* the memory: 28 %/byte on a 4-byte payload is 0.6 % of
+payloads fully recovered, against a chance of 2⁻³² — better, but the
+readout is still far from reading. And the fact that the ADDRESS survives
+where the CONTENT decays is exactly what an order-losing weighted average
+would do: the most recent key dominates the state, so the key is easy to
+read, while the older payload is averaged into a mixture and is only
+partially separable.
+
+**So D5's answer is (a) and (c) together, and not (b).** The write is
+partly order-losing (the content is mixed with the address and with the
+distractors), and the Δh ruler overstated the *usable* content even though
+it did not overstate the *capacity*. The readout is **not** key-blind —
+the global readout already recovers the payload at 4.6× null, so a per-key
+readout is not the missing piece. **The next lever is the write's
+selectivity, not the read's wiring** — which is a different conclusion from
+the one the 10-11 plan reached, and it points at the P3 gate rather than at
+the hierarchical feature-state wiring.
+
+Runtime: 1,558.9 s total on CPU (the forward is a numpy loop over
+timesteps x 16 layers; the ridge is 45–109 s per gap).

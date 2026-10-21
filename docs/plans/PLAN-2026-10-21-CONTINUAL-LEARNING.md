@@ -58,15 +58,15 @@ section exists so a new reader does not re-derive them.
 
 **What is NOT established.**
 - ~~That the state can be read out.~~ **SETTLED 2026-10-21, on a fixed
-  instrument:** the state **can** be read out, over a horizon of about **12
-  bytes** — 12.4 %/byte at 12 B of lag (23× its null), 1.69 % at 36 B,
-  nothing beyond, while the trailing key sits at 25–41 %. The claim that
-  "the readout never beats its own control" was an artifact of a broken
-  probe (the 10-21 plan §6, D1). What is NOT established is why the
-  decodable horizon (~12 B) is an order of magnitude shorter than the
-  capacity the same state demonstrably holds (95 B half-life; Δh retention
-  37.5 % at 8 B, 17 % at 32 B). That is D5, and it is the programme's
-  central question now.
+  instrument.** The state **can** be read out, and **further than anyone
+  thought**: with the state read at the cue, a matched 16-symbol alphabet,
+  n=2048 and a matched null, the payload decodes **4.6× over its own null
+  at 8–12 B of lag**, 3.3× at 32 B and 1.5× at 128 B, while the **cue key
+  decodes 65–165× over null and holds ~27 % at 128 B**. The claims that
+  "the readout never beats its own control" and that the horizon is "~12
+  bytes" were both artifacts of broken instruments (D1, D4). The Δh
+  capacity curve and the decodable-payload curve **are the same curve**, so
+  there is no capacity-vs-usable-content paradox (D5).
 - ~~The n-gram deficit.~~ **SETTLED 2026-10-21, reproducibly and
   byte-matched** (D2): the order-8 byte n-gram scores **0.6512** nats/byte
   on the ruler's own held-out bytes against the model's **1.2094** — the
@@ -241,6 +241,14 @@ cheap and decisive about the *question* (can this model learn and keep a fact
 at all?), and because the M2 result is exactly what an M1 design would need
 to justify itself.
 
+**UPDATE 2026-10-21 (D5):** the D5 measurement does not change M1-vs-M2 —
+it changes what is *inside* M1. The state already holds an addressable,
+persistent address and a decaying-but-real content, and the readout is not
+key-blind. So M1's "hierarchical feature-state wiring" is **not** the next
+month: the lever is the write's **selectivity** (the P3 gate), because the
+address survives where the content decays, which is the signature of an
+order-losing weighted average.
+
 **The four project ideas map onto these mechanisms:**
 
 | idea | where it lives | first test |
@@ -404,35 +412,47 @@ of at the cue. Only the d=8 cell was padding-free.
 **D5 — the measurement paradox, which is now the programme's central
 question.** The P4+P6 init gives a **95.4 B half-life** and the Δh retention
 curve reports **37.5 % at 8 B, 17 % at 32 B, 5.3 % at 128 B**; but the
-*decodable* payload horizon is **~12 B** (12.4 %/byte at 12 B of lag, 23×
-its null; 1.69 % at 36 B; nothing at 132 B). Meanwhile the **trailing key**
-decodes at 25–41 % per byte even at 516 B of lag.
+*decodable* payload horizon was measured at **~12 B** (12.4 %/byte at 12 B
+of lag, 23× its null; 1.69 % at 36 B; nothing at 132 B). Meanwhile the
+**cue key** decoded at 25–41 % per byte even at 516 B of lag.
 
-So the state demonstrably *differs* when the cue differs (Δh), demonstrably
-*holds* recent bytes (the trailing key), and demonstrably *carries the
-payload* for only about a dozen bytes. **Capacity and usable content diverge
-by more than an order of magnitude.** Three candidate causes, each with a
-cheap discriminator:
-- **(a) the write is order-losing** — the state is a weighted average, so
-  the payload is present but not *addressable*; the discriminator is whether
-  the payload survives in a form a **key-conditioned** readout can find
-  (CL-1's key-vs-payload split, which is still unrun).
-- **(b) the readout is not key-conditioned** — a single global linear map
-  must serve every key, so it can only read what is linearly separable
-  *across* samples; the discriminator is a **per-key** readout (fit a
-  separate ridge per cue) at d=12. If a per-key readout recovers the payload
-  where the global one cannot, the write is fine and the readout is
-  key-blind.
-- **(c) Δh overstates the capacity** — the retention curve's denominator
-  (the "control floor") if the payload is present but not linearly
-  decodable, Δh will still register it; the discriminator is a
-  **matched-alphabet** probe at 8 B, which the CL-1 re-measurement puts at
-  12.4 %/byte against a 0.53 % null — **already evidence for (c)**, because
-  at 8 B the payload IS linearly decodable at 23× null while Δh says 37 %.
+**D5 — RESOLVED 2026-10-21 (`tools/d5_probe.py`).** The paradox was an
+instrument artifact, like D1 and D4 before it. With the state read **at the
+cue**, a **matched 16-symbol alphabet**, n=2048 (full class coverage) and a
+**matched null** per cell, the payload decodes:
 
-**D5 is the next experiment, not the next plan.** It is one CPU afternoon:
-a per-key readout and a matched-alphabet cell at 8 and 32 B, on the
-existing checkpoint, with the CL-1 instrument requirements applied.
+| gap | payload | null | ×null | cue key | null | ×null |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 28.03 % | 6.05 % | **4.63×** | 47.95 % | 0.29 % | **165×** |
+| 12 | 29.49 % | 6.42 % | 4.59× | 43.21 % | 0.44 % | 98× |
+| 32 | 22.09 % | 6.64 % | 3.33× | 28.64 % | 0.32 % | 90× |
+| 64 | 15.89 % | 5.66 % | 2.81× | 27.12 % | 0.42 % | 65× |
+| 128 | 10.16 % | 6.67 % | 1.52× | 26.88 % | 0.32 % | 84× |
+
+and the Δh curve and the decodable-payload curve **are the same curve**
+(37.5 % vs 21.98 % at 8 B; 17 % vs 15.45 % at 32 B; 5.3 % vs 3.49 % at
+128 B).
+
+**The answer is (a) and (c) together, and NOT (b).**
+- The **address is strongly present and persistent**: the cue key decodes
+  65–165× over its own null and holds ~27 % at 128 B of lag.
+- The **content is present and decaying**: the payload decodes 4.6× over
+  null at 8–12 B, down to 1.5× at 128 B. What decays is the payload's
+  *separability*, not its presence.
+- The readout is **not key-blind** (a global readout already recovers the
+  payload at 4.6× null), so a per-key readout is **not** the missing piece.
+
+**And this changes the priority order.** The old framing was "the write
+path works, the read path does not, so try the hierarchical feature-state
+wiring." The measurement says something different: the state holds an
+addressable, persistent address and a decaying-but-real content, and the
+address survives *where the content decays* — which is exactly what an
+**order-losing weighted average** does, because the most recent key
+dominates the state and the older payload is averaged into a mixture.
+**So the lever is the write's SELECTIVITY (the P3 gate), not the read's
+wiring (M1).** The hierarchical wiring stays on the table, but it is no
+longer the next month, and the per-layer FSP variant (16× the head's
+flops) is now clearly the wrong next arm.
 
 ---
 

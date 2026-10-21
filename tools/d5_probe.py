@@ -41,8 +41,8 @@ re-implemented, never modified.
   perkey_veto  the per-key readout against PERMUTED payload labels (control)
   nuisance     the payload readout where the payload region of the sequence is
                REPLACED by fresh random bytes from the same alphabet, so the
-               labelled payload is absent from the state ("no signal" null at
-               the same alphabet size)
+               labelled payload is no longer at the payload position ("no
+               signal" null at the same alphabet size)
 
 EVERY cell reports: per-byte accuracy, exact-4-byte rate, sample count, the
 chosen lambda, a MATCHED NULL (same split, same training rows, permuted
@@ -165,8 +165,11 @@ def gen_fixed_gap_batch(d, n, rng, alpha, key_alpha=None):
 def nuisance_batch(batch, rng, alpha):
     """The NUISANCE arm: the payload region of every sequence is replaced by
     fresh random bytes drawn from the SAME alphabet, while the labels stay
-    the original payload.  The labelled payload is therefore absent from the
-    state: any accuracy above the null would be a leak, not a readout."""
+    the original payload.  The labelled payload is therefore no longer at the
+    payload position: any accuracy above the null would be a leak, not a
+    readout.  (Chance collisions of the alphabet symbols inside the
+    distractor bytes exist in the main arm as well, so the two arms are
+    matched in that respect.)"""
     seq = batch["seq"].copy()
     n = seq.shape[0]
     fresh = _draw(rng, alpha, (n, PAYLOAD_LEN))
@@ -430,7 +433,7 @@ def make_cell(name, X, Y, seed, label_alpha_size, note=None,
     }
     if note:
         out["note"] = note
-    out["verdict"] = verdict(cell, cov, label_alpha_size, null["per_byte"])
+    out["verdict"] = verdict(out, cov, label_alpha_size, null["per_byte"])
     if not expect_signal:
         out["expected"] = "NULL (this is a control; SIGNAL here would be a leak)"
     return out
@@ -493,9 +496,12 @@ def run_gap(m, d, n, seed, args, alpha):
     t0 = time.time()
     cells.append(make_cell("nuisance", Xn, Y_payload, seed, alpha_size,
                             note=("payload region replaced by fresh random "
-                                  "bytes of the same alphabet; labels = the "
-                                  "original payload, which is absent from the "
-                                  "state"),
+                                  "bytes of the same alphabet; the labels (the "
+                                  "original payload) are no longer at the "
+                                  "payload position, so any accuracy above "
+                                  "the null would be a leak (chance alphabet "
+                                  "collisions in the distractor bytes are "
+                                  "present in the main arm too)"),
                             expect_signal=False))
     t_ridge_nuis = time.time() - t0
 
@@ -727,6 +733,12 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true",
                     help="run the readout-power and read-at-the-cue selftest")
     args = ap.parse_args(argv)
+
+    # line-buffered stdout: the tables must survive a redirected run
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
     if args.selftest:
         return selftest(args.ckpt, seed=args.seed)
