@@ -57,9 +57,16 @@ section exists so a new reader does not re-derive them.
 | the B-reduction bet | **refuted** | B=64 is 3.7× worse; take T at B=1024 and keep the ring |
 
 **What is NOT established.**
-- That the state can be read out. The claim *"the readout never beats its own
-  control"* — which the previous plan pivoted on — rests on a **broken
-  instrument** (§6, defect D1).
+- ~~That the state can be read out.~~ **SETTLED 2026-10-21, on a fixed
+  instrument:** the state **can** be read out, over a horizon of about **12
+  bytes** — 12.4 %/byte at 12 B of lag (23× its null), 1.69 % at 36 B,
+  nothing beyond, while the trailing key sits at 25–41 %. The claim that
+  "the readout never beats its own control" was an artifact of a broken
+  probe (the 10-21 plan §6, D1). What is NOT established is why the
+  decodable horizon (~12 B) is an order of magnitude shorter than the
+  capacity the same state demonstrably holds (95 B half-life; Δh retention
+  37.5 % at 8 B, 17 % at 32 B). That is D5, and it is the programme's
+  central question now.
 - The n-gram deficit. `0.81 nats/byte` (order-8 byte n-gram) vs `1.2094`
   (TMT) is quoted in three documents, but the script that produced it
   (`lag5.py`) was never committed and is gone (§6, defect D2). It is also not
@@ -257,41 +264,41 @@ a CE-regression cell. **Nothing below CL-0 counts as a result.**
 checkpoint, it is broken — fix it before use.
 
 ### CL-1 — Re-measure the read path with a working instrument. (1 day, CPU)
-Fix the two defects in §6, then re-run the copy/retrieval cells on the
-existing P4+P6 checkpoint with (a) the corrected ridge readout, (b) all four
-payload bytes scored with the right chance level, and (c) a **key-identity vs
-payload-identity** split.
-*Why the split:* the state is a *mixture*; if the **key** is decodable but
-the **payload** is not, the write has address but no content (read-path
-framing is right). If **neither** is decodable, the write is order-losing and
-the priority is the write, not the readout. One hour of CPU decides which
-half of the previous plan's pivot was real.
-*Falsifier:* if the corrected readout beats its veto at d=32, the previous
-plan's central claim is refuted and the priority moves to the write — which
-is M1, and it is a bigger job than planned.
+**DONE 2026-10-21. The verdict changed, and it changed in the programme's
+favour.** The `λ` swap, the test-half leak and the payload ravel are fixed
+(`tools/membench/model_backend.py`), the cell is gated by
+`tests/check_ridge_readout.py` (which fails on the pre-fix code), and the
+re-measurement on `runs/taxis/A_p4_wd0_c.npz` gave:
 
-**CL-1b — the probe must be POWERED before its verdict means anything.**
-A second, deeper limit on the copy probe was found while fixing D1: the
-readout is a **256-way one-hot ridge**, so it can only ever *emit* a byte
-value it saw in its training half. The copy task's payloads are **random**,
-so with `n` samples the training half contains only ≈ `1 − exp(−n/256)` of
-the 256 byte values — with the ruler's `sample_count=128` that is **≈ 22 %**
-of the alphabet. The probe's per-byte accuracy is therefore capped near
-22 % *whatever the state contains*, and the 4-byte exact rate is capped near
-`0.22^4 ≈ 0.2 %`, against a stated chance of 2⁻³². The published metric and
-its chance level are not on the same scale, and a probe that is
-coverage-limited cannot distinguish "the state is empty" from "the probe
-cannot name the answer".
+* the instrument **has power** — the same ridge over the same states decodes
+  the **trailing key** at **41.7 %/byte** (d=8) and **21.4 %/byte** (d=32)
+  against a ~0.5 % veto;
+* class coverage is **not** the binding constraint (100 % coverage at
+  n=2048, still only 2.3 %/byte for the payload);
+* the payload **is** decodable, but only for **~12 bytes**: 12.4 %/byte at
+  12 B of lag (23× its null), 1.69 % at 36 B, nothing at 132 B or beyond,
+  while the trailing key stays at 25–41 % throughout.
 
-So CL-1 must report, for every cell: the **class coverage** (the fraction of
-test-half payload byte *values* that occur anywhere in the training half, at
-the byte level and at the 4-byte level) next to the accuracy. The probe is
-properly powered only when coverage ≈ 1, which needs `n` of a few thousand
-samples, or a **matched alphabet** (a fixed small set of payload byte
-values, with the alphabet size reported). A verdict from a coverage-limited
-probe is `UNMEASURED`, not `PASS` and not a null.
-*Falsifier:* if a fully powered probe still sits at its veto, the read-path
-null stands (on a sound instrument) and the pivot to the write is correct.
+So **"the read path does not work" was false** — it works over a horizon of
+about a dozen bytes — and **"the write path works" was too strong**, because
+the Δh capacity (37.5 % at 8 B, 17 % at 32 B) does **not** show up as
+decodable payload beyond ~12 B.
+
+**CL-1 is therefore not a step to run — it is the measurement that reframes
+the programme**, and it leaves one sharp question (§6, D5) that everything
+downstream depends on.
+
+**The instrument's own requirements, now fixed as gates** (three defects,
+one per requirement):
+1. read the state **at the cue**, not after the batch's zero padding
+   (D4 — `model_copy_readout` padded to the longest sample and read
+   `final_states` at `t == L-1`, so every d≥32 cell was read after 24–504
+   padding bytes);
+2. report **per-byte**, not exact-4-bytes, at 256 symbols — `per_byte^4 ≈
+   3e-7`, so the exact metric cannot report a trace this weak at any
+   feasible n;
+3. use a **matched alphabet** when an `exact` rate is wanted (16 symbols →
+   21.3 %/byte, 4 symbols → 44.9 %/byte, both with their own nulls).
 
 ### CL-2 — The first trained continual-learning run. (2 days, T4)
 Train on a synthetic fact stream with the fact **in the loss** — the
@@ -364,12 +371,47 @@ spread across **both** files in `data/eval/`), and the n-gram's training file
 (`data/eval/wiki_tinystories_005.txt`) is also one of the model's scored
 eval files.
 
-**D3 — the copy probe is coverage-limited (found while fixing D1).** See
-CL-1b. The readout can only emit byte values it saw in its training half;
-with random payloads and `sample_count=128` that is ≈ 22 % of the alphabet,
-so the probe's ceiling is far below the chance level it is quoted against.
-This is a third instance of the same failure mode — an instrument that was
-never checked against its own null.
+**D3 — the copy probe was coverage-limited (found while fixing D1; then
+REFUTED as the binding constraint).** See CL-1b below.
+
+**D4 — the copy cell read the state AFTER the batch's zero padding.**
+`model_copy_readout` pads the variable-length batch to the longest sample
+and reads `final_states`, which `_frozen_forward` takes at `t == L-1`; so
+at d≥32 every short-gap sample was read after 24–504 padding bytes instead
+of at the cue. Only the d=8 cell was padding-free.
+
+**D5 — the measurement paradox, which is now the programme's central
+question.** The P4+P6 init gives a **95.4 B half-life** and the Δh retention
+curve reports **37.5 % at 8 B, 17 % at 32 B, 5.3 % at 128 B**; but the
+*decodable* payload horizon is **~12 B** (12.4 %/byte at 12 B of lag, 23×
+its null; 1.69 % at 36 B; nothing at 132 B). Meanwhile the **trailing key**
+decodes at 25–41 % per byte even at 516 B of lag.
+
+So the state demonstrably *differs* when the cue differs (Δh), demonstrably
+*holds* recent bytes (the trailing key), and demonstrably *carries the
+payload* for only about a dozen bytes. **Capacity and usable content diverge
+by more than an order of magnitude.** Three candidate causes, each with a
+cheap discriminator:
+- **(a) the write is order-losing** — the state is a weighted average, so
+  the payload is present but not *addressable*; the discriminator is whether
+  the payload survives in a form a **key-conditioned** readout can find
+  (CL-1's key-vs-payload split, which is still unrun).
+- **(b) the readout is not key-conditioned** — a single global linear map
+  must serve every key, so it can only read what is linearly separable
+  *across* samples; the discriminator is a **per-key** readout (fit a
+  separate ridge per cue) at d=12. If a per-key readout recovers the payload
+  where the global one cannot, the write is fine and the readout is
+  key-blind.
+- **(c) Δh overstates the capacity** — the retention curve's denominator
+  (the "control floor") if the payload is present but not linearly
+  decodable, Δh will still register it; the discriminator is a
+  **matched-alphabet** probe at 8 B, which the CL-1 re-measurement puts at
+  12.4 %/byte against a 0.53 % null — **already evidence for (c)**, because
+  at 8 B the payload IS linearly decodable at 23× null while Δh says 37 %.
+
+**D5 is the next experiment, not the next plan.** It is one CPU afternoon:
+a per-key readout and a matched-alphabet cell at 8 and 32 B, on the
+existing checkpoint, with the CL-1 instrument requirements applied.
 
 ---
 

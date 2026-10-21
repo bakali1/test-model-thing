@@ -4069,3 +4069,72 @@ byte-matched to the ruler's held-out set (the n-gram was scored on a 300 kB
 head of `tinystories_valid.txt`; the model is scored on 6 × 20,001-byte
 slices across both files in `data/eval/`). Both are fixed in the plan's
 CL-0 step.
+
+### 5. The read path, re-measured with a working instrument — and the verdict changes
+
+The fixed `_ridge_score` was re-run against the C A/B's P4 checkpoint
+(`runs/taxis/A_p4_wd0_c.npz`, frozen numpy_port, seed 0). **The `lam=0`
+fingerprint is gone**: every cell now reports a real λ from {1, 1e3, 1e5}.
+The old instrument's `exact=0.0156` excursions (1/64 — a single test sample)
+were the unregularized-solve artefact, and they are gone with it.
+
+**The instrument has power.** The same ridge over the same states decodes the
+**trailing key** (the four bytes the sequence ends with) at **41.7 %/byte**
+(d=8) and **21.4 %/byte** (d=32) against a ~0.5 % veto. So the readout, the
+split, and the regularization all work; the state does hold recent bytes.
+
+**Class coverage is NOT the binding constraint** (D3 refuted). At n=2048 the
+training half covers **100 %** of the 256 byte values and 100 % of the
+4-byte payloads, and the payload readout still reaches only **2.3 %/byte**.
+Coverage is ~60 % at n=128 and the readout is ~0; coverage is 100 % at
+n=2048 and the readout is 2.3 %. Coverage does not set the level in either
+direction. **The state is the limit, and the instrument is not the problem.**
+
+**The payload is decodable, but only for about a dozen bytes.** The
+padding-free fixed-gap curve at n=2048 (matched null in brackets):
+
+| gap (distance) | payload, per byte | null | trailing key, per byte |
+|---|---|---|---|
+| 8 (12 B) | **12.4 %** | 0.53 % | 41 % |
+| 32 (36 B) | 1.69 % | 0.48 % | 27 % |
+| 128 (132 B) | 0.66 % | 0.44 % | 25 % |
+| 512 (516 B) | 0.56 % | 0.42 % | 25 % |
+
+**A matched alphabet makes the metric usable**: at d=32, n=2048, a
+16-symbol payload alphabet gives **21.3 %/byte** (null 6.2 %) and a 4-symbol
+alphabet **44.9 %/byte** (null 24.7 %) with `exact` = 0.0293 (30/1024
+samples). With the full 256-symbol alphabet the `exact`-4-bytes metric is
+hopeless at any feasible n, because `per_byte^4 ≈ 3e-7` — **the exact-4-byte
+metric is the wrong instrument for a 256-symbol payload and cannot report
+this trace.**
+
+**D4 — the copy cell read the state AFTER the padding.** `model_copy_readout`
+pads the variable-length batch with **zero bytes** to the longest sample and
+then reads `final_states`, which `_frozen_forward` takes at `t == L-1` — so
+at d≥32 the short-gap samples are read after 24–504 padding bytes, not at the
+cue. The d=8 cell is the only padding-free one. The fixed-gap curve above is
+the padding-free re-measurement; the ruler's own d≥32 cells are not.
+
+**What this changes.**
+
+1. **"The read path does not work" is false.** It works, over a horizon of
+   about a dozen bytes: 12.4 %/byte at 12 B of lag, 23× its own null, while
+   the trailing key sits at 41 %. The claim was an artifact of the broken
+   probe.
+2. **"The write path works" is also too strong.** The state does not hold a
+   *decodable* payload past ~32 B, and the trailing key is at 25–41 % even at
+   516 B of lag — so what decays is the **payload's addressability**, not the
+   state's ability to hold recent bytes.
+3. **The sharpest open question in the programme is now a measurement
+   paradox**: the P4+P6 init gives a **95.4 B half-life** and the Δh
+   retention curve reports **37.5 % at 8 B and 17 % at 32 B**, yet the
+   *decodable* payload horizon is **~12 B**. Capacity (Δh) and usable content
+   (decodable payload) diverge by more than an order of magnitude. Which of
+   the two is lying is the next experiment, and it is a question about the
+   write, not about the readout.
+4. **The ruler's read cells must be re-specified** before any of them is
+   quoted again: read the state **at the cue** (not after padding), report
+   **per-byte** (not exact-4-bytes) at 256 symbols, and use a **matched
+   alphabet** when an `exact` rate is wanted. Every read-path number in this
+   file before this section was produced by an instrument that was broken in
+   at least one of those three ways.
