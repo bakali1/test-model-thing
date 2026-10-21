@@ -262,6 +262,9 @@ class Trainer:
         # logits (the decaytrace) -- i.e. it reaches the MEMORY, not just the
         # read-out.
         self.fsp_alpha = float(fsp_alpha)
+        self._fsp_pos_seen = 0
+        self._fsp_accum = 0.0
+        self._fsp_n = 0
         self.fsp_r = int(fsp_r)
         self.fsp_tau = int(fsp_tau)
         self.fsp_pos_weight = float(fsp_pos_weight)
@@ -618,11 +621,21 @@ class Trainer:
                         ce_value = float(ce_win / n_win)
                         fsp_txt = ""
                         if self.fsp_alpha > 0.0 and m.fsp_positions:
-                            # The FSP term is printed separately, like the CE:
-                            # the two are on different scales (the CE is in
-                            # nats/byte, the FSP is a weighted BCE), and a
-                            # single blended "loss" would hide which one moved.
-                            fsp_txt = f" | fsp {m.last_fsp:.3f}"
+                            # The FSP fires on ONE window in r, so the last
+                            # window's value is zero 15 times in 16 and
+                            # printing it would report a false zero. Average
+                            # over the log window instead: the engine exposes
+                            # the cumulative position count, so the window's
+                            # own count is the delta.
+                            n_pos = m.fsp_positions - self._fsp_pos_seen
+                            self._fsp_pos_seen = m.fsp_positions
+                            if n_pos > 0:
+                                self._fsp_accum += m.last_fsp * n_pos
+                                self._fsp_n += n_pos
+                                fsp_txt = (f" | fsp "
+                                           f"{self._fsp_accum / self._fsp_n:.3f}")
+                            self._fsp_accum = 0.0
+                            self._fsp_n = 0
                         print(f"  {total/1e6:.1f} MB | {total/dt:.0f} B/s | "
                               f"step {m.t} | loss {loss_value:.3f} | "
                               f"ce {ce_value:.3f}{fsp_txt}", flush=True)
