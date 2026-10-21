@@ -4138,3 +4138,72 @@ the padding-free re-measurement; the ruler's own d≥32 cells are not.
    alphabet** when an `exact` rate is wanted. Every read-path number in this
    file before this section was produced by an instrument that was broken in
    at least one of those three ways.
+
+### 6. D2 — the n-gram baseline is rebuilt, byte-matched, and the claim survives
+
+`tools/ngram_ce.py` is the rebuild of the lost `lag5.py`. The original
+script was never committed, so the `0.81` figure was quoted but not
+reproducible, and it was not byte-matched to the ruler's held-out set.
+
+**Protocol (now in the script and in `--help`).** Train: the first 8,000,000
+bytes of `data/eval/wiki_tinystories_005.txt`. Held-out, byte-matched: for
+each file matched by `data/eval/**/*` (two files), the 3 disjoint
+20,001-byte windows that `tools/eval.py:_slices` uses, each scored as the
+mean of -log P(byte[t+1] | byte[t]) over its 20,000 positions, the file's
+score the unweighted mean of its 3 windows, and the final score the
+unweighted mean of the per-file scores (the ruler's own aggregation,
+`tools/eval.py:358`). 120,000 scored positions.
+
+**Model:** Jelinek-Mercer interpolation with a geometrically falling
+order-dependent weight, `lambda_k = 1 - r**(k-1)`. Counting is exact: an
+n-gram is keyed by its bytes packed big-endian into a uint64, which is
+lossless for orders ≤ 8, so there is no rolling hash and no aliasing.
+`--selftest` checks the keying against a pure-Python dict of byte tuples
+(order by order, exact agreement).
+
+**The result, byte-matched, on the same bytes the model is scored on:**
+
+| | CE (nats/byte) |
+|---|---:|
+| **order-8 byte n-gram, 0 parameters, 8 MB** (r=0.9) | **0.6512** |
+| — per file: `tinystories_valid.txt` | 0.6617 |
+| — per file: `wiki_tinystories_005.txt` | 0.6407 |
+| the TMT model, same held-out set | **1.2094** |
+| **the gap** | **0.5582 nats/byte in the n-gram's favour** (×1.74 in perplexity) |
+
+**The result is insensitive to the interpolation hyperparameter.** The whole
+sweep (byte-matched aggregate):
+
+| r | 0.5 | 0.6 | 0.7 | 0.8 | **0.9** | 0.95 | 0.99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CE | 0.9037 | 0.8315 | 0.7458 | 0.6582 | **0.6512** | 0.8482 | 1.7245 |
+
+Absolute discounting is worse (0.9088 / 0.9292 / 0.9584 at D = 0.5 / 0.75 /
+0.9). Every setting except the pathological λ→1 (r=0.99) beats the model.
+
+**And the original figure is consistent with this.** On the original
+protocol (the 300 kB head of `tinystories_valid.txt`, one segment) the same
+model scores **0.6190** at r=0.9 and 0.7035 at r=0.7 — the quoted **0.81**
+sits inside the sweep's range, so the original number is reproducible in
+magnitude even though the script that made it is gone.
+
+**What this does and does not say.** It says that on this corpus, at this
+scale, a **zero-parameter lookup table with 8 bytes of context** is half a
+nat per byte better than a **4.5-million-parameter trained recurrent
+model**. It does **not** say the recurrent state is useless — the retention
+and decode measurements above are about a *different* property (carrying a
+specific payload across a gap) and they are not contradicted. But it does
+mean that **the CE ruler cannot be the headline**, and it sets the bar the
+model has to clear before any memory claim is worth making: the model's CE
+must first approach the n-gram's.
+
+**Caveats recorded, not hidden.** (a) The original script is documented as
+MAXORD=12; this rebuild supports orders 1–8 exactly (an order-9+ gram does
+not fit in a uint64), so it is a **weaker** baseline than the original — if
+it still beats the model, the original claim survives. (b) The n-gram's
+training file is also one of the model's scored eval files; the scored
+slices are at strides of ~13.8 MB and ~27.5 MB, far past the 8 MB training
+head, so there is no train/eval overlap, but the corpus is shared.
+(c) The r=0.99 row shows the model is not robust to a λ schedule that
+abandons back-off; the reported optimum (r≈0.85–0.9) is a real optimum,
+not a monotone drift.

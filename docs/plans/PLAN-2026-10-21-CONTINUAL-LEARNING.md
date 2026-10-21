@@ -67,10 +67,12 @@ section exists so a new reader does not re-derive them.
   capacity the same state demonstrably holds (95 B half-life; Δh retention
   37.5 % at 8 B, 17 % at 32 B). That is D5, and it is the programme's
   central question now.
-- The n-gram deficit. `0.81 nats/byte` (order-8 byte n-gram) vs `1.2094`
-  (TMT) is quoted in three documents, but the script that produced it
-  (`lag5.py`) was never committed and is gone (§6, defect D2). It is also not
-  byte-matched to the ruler's held-out set.
+- ~~The n-gram deficit.~~ **SETTLED 2026-10-21, reproducibly and
+  byte-matched** (D2): the order-8 byte n-gram scores **0.6512** nats/byte
+  on the ruler's own held-out bytes against the model's **1.2094** — the
+  model is **0.56 nats/byte worse than a zero-parameter table lookup**. The
+  deficit is real, larger than the 0.40 the old (unmatched) comparison
+  suggested, and now has a script.
 - Anything about continual learning. `grep -c forgetting RESULTS.md` → **0**.
 
 ---
@@ -370,6 +372,25 @@ of `tinystories_valid.txt`; the model is scored on 6 × 20,001-byte slices
 spread across **both** files in `data/eval/`), and the n-gram's training file
 (`data/eval/wiki_tinystories_005.txt`) is also one of the model's scored
 eval files.
+
+**D2 — RESOLVED 2026-10-21.** `tools/ngram_ce.py` is the rebuild, with an
+exact (aliasing-free) keying and a `--selftest` against a pure-Python dict.
+**Byte-matched on the ruler's own held-out bytes, the order-8 n-gram scores
+0.6512 nats/byte (0.7458 at r=0.7; 0.90–0.65 across the r sweep) against
+the model's 1.2094 — 0.56 nats/byte better, ×1.74 in perplexity.** The
+original 0.81 is consistent with that range, so the claim survives and is
+now reproducible. The rebuild supports orders 1–8 (the original was
+MAXORD=12), so it is a **weaker** baseline than the original — which makes
+the conclusion stronger, not weaker. Full table and caveats in `RESULTS.md`
+§6.
+
+**Consequence for the programme:** the CE ruler cannot be the headline. A
+zero-parameter, 8-byte-context lookup table beats the 4.5M-parameter trained
+recurrent model by half a nat per byte on the same bytes. **The bar the
+model has to clear before any memory claim is worth making is the n-gram's
+CE**, and the plan's own criterion (§1) should be read with that in mind:
+ACQUIRE and RETAIN are the memory claims; NO REGRESSION is the *floor*, and
+the floor is currently **0.56 nats/byte above a table lookup**.
 
 **D3 — the copy probe was coverage-limited (found while fixing D1; then
 REFUTED as the binding constraint).** See CL-1b below.
