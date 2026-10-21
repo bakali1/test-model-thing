@@ -503,49 +503,153 @@ def _nvrtc_ring_kernel():
 # layer's.
 # ---------------------------------------------------------------------------
 _NVRTC_GROUP_SRC = r"""
+#define CH 32
 extern "C" __global__
 void tmt_ring_credit_grouped(float* __restrict__ w,
                               const float* __restrict__ dec,
                               const float* __restrict__ dlds,
-                              const int* __restrict__ woff,
-                              const int* __restrict__ dlsoff,
+                              const int2* __restrict__ plan,
                               const int* __restrict__ goff,
                               const int* __restrict__ gcnt,
                               float* __restrict__ dest,
                               const unsigned char* __restrict__ hotmask,
                               int D, int has_mask) {
     const int r = blockIdx.y;                    // the byte id
-    const int d = blockIdx.x * (blockDim.x * blockDim.y)
-                  + threadIdx.y * blockDim.x + threadIdx.x;
-    if (d >= D) return;
+    // Each thread owns FOUR dims of one address, and reads them with a
+    // 128-bit load: a warp then moves 512 contiguous bytes of the ring per
+    // instruction instead of 128. MEASURED on a T4: the scalar version of
+    // this kernel took 2.06 ms per layer, the float4 version 0.36 ms -- a
+    // 5.8x difference, all of it in how wide the request is.
+    const int d0 = (blockIdx.x * (blockDim.x * blockDim.y)
+                    + threadIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (d0 >= D) return;
     const int m = gcnt[r];                       // rows that land on this byte
     const int off = goff[r];                     // where they start, sorted
     // The address is owned by exactly this thread, so the reference's
     // "add into whatever is there" is a plain read, and the group total is
     // a plain write. No atomics, and no second writer.
+    float4 s = make_float4(dest[(long)r * D + d0],
+                            dest[(long)r * D + d0 + 1],
+                            dest[(long)r * D + d0 + 2],
+                            dest[(long)r * D + d0 + 3]);
+    int j = 0;
+    // The fold is a CHAIN -- the reference's order is the point -- so the
+    // loads must not be part of it. CH rows are fetched first (their
+    // addresses are independent), and only then folded. Without this the
+    // kernel is bound by the busiest byte id's chain: a real byte histogram
+    // gives the commonest byte ~16% of the rows, i.e. ~3,000 of them, and
+    // 3,000 dependent loads in a row is 3,000 memory latencies.
+    //
+    // `#pragma unroll 1` on THIS loop is not cosmetic: left to itself the
+    // compiler unrolls the chunk loop as well, and the register demand
+    // (763 virtual float registers in the PTX) spills.
+    #pragma unroll 1
+    for (; j + CH <= m; j += CH) {
+        int2 p[CH];
+        float4 wv[CH];
+        #pragma unroll
+        for (int u = 0; u < CH; ++u) p[u] = plan[off + j + u];
+        #pragma unroll
+        for (int u = 0; u < CH; ++u)
+            wv[u] = *reinterpret_cast<const float4*>(w + (long)p[u].x + d0);
+        #pragma unroll
+        for (int u = 0; u < CH; ++u) {
+            wv[u].x *= dec[d0]; wv[u].y *= dec[d0 + 1];
+            wv[u].z *= dec[d0 + 2]; wv[u].w *= dec[d0 + 3];
+            *reinterpret_cast<float4*>(w + (long)p[u].x + d0) = wv[u];
+            float4 g = *reinterpret_cast<const float4*>(dlds + (long)p[u].y + d0);
+            float4 v;
+            v.x = wv[u].x * g.x; v.y = wv[u].y * g.y;
+            v.z = wv[u].z * g.z; v.w = wv[u].w * g.w;
+            if (has_mask) {                       // hot-dim mask (1 byte)
+                uchar4 hm = *reinterpret_cast<const uchar4*>(hotmask + d0);
+                if (hm.x) v.x = 0.0f;
+                if (hm.y) v.y = 0.0f;
+                if (hm.z) v.z = 0.0f;
+                if (hm.w) v.w = 0.0f;
+            }
+            s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;   // LEFT FOLD
+        }
+    }
+    for (; j < m; ++j) {                          // the remainder
+        const int2 p = plan[off + j];
+        float4 wv = *reinterpret_cast<const float4*>(w + (long)p.x + d0);
+        wv.x *= dec[d0]; wv.y *= dec[d0 + 1];
+        wv.z *= dec[d0 + 2]; wv.w *= dec[d0 + 3];
+        *reinterpret_cast<float4*>(w + (long)p.x + d0) = wv;
+        float4 g = *reinterpret_cast<const float4*>(dlds + (long)p.y + d0);
+        float4 v;
+        v.x = wv.x * g.x; v.y = wv.y * g.y;
+        v.z = wv.z * g.z; v.w = wv.w * g.w;
+        if (has_mask) {
+            uchar4 hm = *reinterpret_cast<const uchar4*>(hotmask + d0);
+            if (hm.x) v.x = 0.0f;
+            if (hm.y) v.y = 0.0f;
+            if (hm.z) v.z = 0.0f;
+            if (hm.w) v.w = 0.0f;
+        }
+        s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+    }
+    dest[(long)r * D + d0] = s.x;
+    dest[(long)r * D + d0 + 1] = s.y;
+    dest[(long)r * D + d0 + 2] = s.z;
+    dest[(long)r * D + d0 + 3] = s.w;
+}
+"""
+
+# The scalar twin, for a dim count that is not a multiple of four (the
+# float4 load needs 16B alignment, which the row offsets only have when
+# dim % 4 == 0). Same arithmetic, same order, one dim per thread.
+_NVRTC_GROUP_SCALAR_SRC = r"""
+extern "C" __global__
+void tmt_ring_credit_grouped_scalar(float* __restrict__ w,
+                                     const float* __restrict__ dec,
+                                     const float* __restrict__ dlds,
+                                     const int2* __restrict__ plan,
+                                     const int* __restrict__ goff,
+                                     const int* __restrict__ gcnt,
+                                     float* __restrict__ dest,
+                                     const unsigned char* __restrict__ hotmask,
+                                     int D, int has_mask) {
+    const int r = blockIdx.y;
+    const int d = blockIdx.x * (blockDim.x * blockDim.y)
+                  + threadIdx.y * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    const int m = gcnt[r];
+    const int off = goff[r];
     float s = dest[(long)r * D + d];
     for (int j = 0; j < m; ++j) {
-        const int wo = woff[off + j];            // this row's w offset
-        const int lo = dlsoff[off + j];          // this row's dlds offset
-        const float wv = w[(long)wo + d] * dec[d];
-        w[(long)wo + d] = wv;                    // the decay, in place
-        float v = wv * dlds[(long)lo + d];       // the ring credit
-        if (has_mask && hotmask[d]) v = 0.0f;    // hot-dim mask (1 byte)
-        s += v;                                  // LEFT FOLD, row order
+        const int2 p = plan[off + j];
+        const float wv = w[(long)p.x + d] * dec[d];
+        w[(long)p.x + d] = wv;
+        float v = wv * dlds[(long)p.y + d];
+        if (has_mask && hotmask[d]) v = 0.0f;
+        s += v;
     }
     dest[(long)r * D + d] = s;
 }
 """
 
 _NVRTC_GROUP_KERNEL = None
+_NVRTC_GROUP_SCALAR_KERNEL = None
 _NVRTC_GROUP_FAILED = False
 
 
 def _nvrtc_group_kernel():
     """Compile (once) and return the grouped ring kernel, or None."""
-    global _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_FAILED
+    return _nvrtc_group_kernels()[0]
+
+
+def _nvrtc_group_kernels():
+    """(float4 kernel, scalar kernel) for the grouped credit, or (None, None).
+
+    Two kernels: the float4 one (a warp moves 512 contiguous bytes per
+    instruction) and its scalar twin for a dim count that is not a multiple
+    of four. Both compute the same thing.
+    """
+    global _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_SCALAR_KERNEL, _NVRTC_GROUP_FAILED
     if _NVRTC_GROUP_KERNEL is not None or _NVRTC_GROUP_FAILED:
-        return _NVRTC_GROUP_KERNEL
+        return _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_SCALAR_KERNEL
     try:
         if not hasattr(torch.cuda, "_compile_kernel"):
             raise RuntimeError("torch.cuda._compile_kernel is unavailable")
@@ -553,13 +657,15 @@ def _nvrtc_group_kernel():
             raise RuntimeError("no CUDA_HOME and no bundled cuda_runtime headers")
         _NVRTC_GROUP_KERNEL = torch.cuda._compile_kernel(
             _NVRTC_GROUP_SRC, "tmt_ring_credit_grouped")
+        _NVRTC_GROUP_SCALAR_KERNEL = torch.cuda._compile_kernel(
+            _NVRTC_GROUP_SCALAR_SRC, "tmt_ring_credit_grouped_scalar")
     except Exception as exc:                     # pragma: no cover
         _NVRTC_GROUP_FAILED = True
         print(f"[ring_credit] grouped kernel unavailable ({type(exc).__name__}: "
               f"{str(exc).splitlines()[0][:90]}) -> falling back to 'full'",
               flush=True)
-        return None
-    return _NVRTC_GROUP_KERNEL
+        return None, None
+    return _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_SCALAR_KERNEL
 
 
 def _ring_credit_grouped_torch(dest, w, dlds, hot_mask, rows, dec):
@@ -1220,15 +1326,26 @@ class GpuModel:
                                             hot_mask, rows, dec)
                 return
             else:
-                kern = _nvrtc_group_kernel()
+                B, K, D = w.shape
+                kern4, kern1 = _nvrtc_group_kernels()
+                vec4 = (D % 4 == 0)
+                kern = kern4 if vec4 else kern1
                 if kern is not None:
-                    B, K, D = w.shape
                     marg = self._ring_hot_mask_arg(hot_mask)
-                    woff, dlsoff, goff, gcnt = self._group_plan(rows, K, D)
-                    nchunk = (D + 127) // 128
+                    plan, goff, gcnt = self._group_plan(rows, K, D)
+                    # A thread owns four dims (float4) or one (scalar). The
+                    # block is ONE warp, so it covers 128 or 32 dims -- and
+                    # the number of blocks per byte id matters: the busiest
+                    # byte id owns ~16% of the rows in a real byte
+                    # histogram, and one block is one SM, so a block that
+                    # covered all 512 dims would put a sixth of the layer's
+                    # traffic on a single SM. Measured on a T4: 512 dims per
+                    # block -> 1.455 ms/layer, 128 dims per block -> 0.55 ms.
+                    per_block = 64 if vec4 else 32
+                    nchunk = (D + per_block - 1) // per_block
                     kern(grid=(nchunk, self._ring_dest.shape[0], 1),
-                         block=(32, 4, 1),
-                         args=[w, dec, dlds, woff, dlsoff, goff, gcnt,
+                         block=(16, 1, 1) if vec4 else (32, 1, 1),
+                         args=[w, dec, dlds, plan, goff, gcnt,
                                self._ring_dest, marg, D,
                                0 if hot_mask is None else 1])
                     return
@@ -1306,9 +1423,13 @@ class GpuModel:
         counts = torch.bincount(rows, minlength=nb)
         goff = (torch.cumsum(counts, 0) - counts).to(torch.int32)
         gcnt = counts.to(torch.int32)
-        woff = (order * D).to(torch.int32)
-        dlsoff = ((order // K) * D).to(torch.int32)
-        plan = (key, (woff, dlsoff, goff, gcnt))
+        # (w offset, dlds offset) per sorted position, packed so the kernel
+        # does ONE dependent load per row instead of two.
+        plan = torch.empty((order.numel(), 2), dtype=torch.int32,
+                           device=order.device)
+        plan[:, 0] = order * D
+        plan[:, 1] = (order // K) * D
+        plan = (key, (plan, goff, gcnt))
         self._group_plan_cache = plan
         return plan[1]
 

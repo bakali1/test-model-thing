@@ -2,19 +2,23 @@
 
 **Date:** 2026-10-21
 **Status:** the legality analysis is DONE and gated; the candidate is
-implemented and gated; the T4 measurement of the candidate is PENDING (the
-free-tier T4s are busy — see §6).
+implemented, gated, and MEASURED on a T4; the verdict is that the credit
+cannot be made faster on a T4 without giving up the arithmetic — and the
+cheapest win available is to switch the default from `compiled` to the
+already-shipped `nvrtc` (bit-identical, 1.35x on the credit).
 
-> **One sentence:** the ring credit's cost is **not** mostly the atomics —
-> it is mostly the bytes, and the bytes can be halved by fusing (which the
-> shipped `nvrtc` path already does, 2.7x on the credit) — but the atomics
-> that remain are **removable without changing a single float**, by grouping
-> the rows by byte id and folding each group in the reference's own order.
+> **One sentence:** the ring credit's cost is **not** the atomics — it is the
+> bytes, and the bytes can be halved by fusing (which the shipped `nvrtc`
+> path already does) — and the legal, bit-identical way to remove the
+> atomics entirely (group the rows by byte id, fold each group in the
+> reference's own order) **is slower on a T4**, because the legal grouping
+> concentrates the commonest byte's 16% of the rows onto a few SMs while the
+> atomics spread the same work evenly.
 
 **What is in here:** §1 the credit, §2 the legality analysis (the core),
 §3 the removed `segmented` candidate, §4 the candidate that survives the
 analysis, §5 the arithmetic per path, §6 the measurement, §7 the gates,
-§8 what is still open.
+§8 the verdict and what is still open.
 
 ---
 
@@ -187,25 +191,32 @@ Per layer, at the production shape, on a T4 (320 GB/s):
 
 | | bytes moved | floor | measured | the gap |
 |---|---:|---:|---:|---:|
-| `full` | 5 passes = 189 MB | 0.59 ms | **1.285 ms** | 0.70 ms: the atomics + the extra launches |
+| `full` | 5 passes = 189 MB | 0.59 ms | **1.230 ms** | 0.64 ms: the atomics + the extra launches |
 | `compiled` | ~2 passes + atomics | ~0.25 ms | **0.671 ms** | ~0.42 ms |
-| `triton` | 2 passes + atomics | ~0.25 ms | **1.024 ms** | ~0.77 ms |
-| `nvrtc` | 1 pass (read+write) + atomics | 0.244 ms | **0.475 ms** | **~0.23 ms: the atomics** |
-| `grouped` | 1 pass (read+write) | 0.244 ms | **pending** | the target is ~0 |
+| `triton` | 2 passes + atomics | ~0.25 ms | **1.040 ms** | ~0.79 ms |
+| `nvrtc` | 1 pass (read+write) + atomics | 0.244 ms | **0.497 ms** | **~0.25 ms: the atomics** |
+| `grouped` | 1 pass (read+write) | 0.244 ms | **0.693 ms** | **~0.45 ms: the hot byte id's SM** |
 
-So on a T4 the contended fp32 atomics cost **~0.23 ms per layer, ~3.7 ms per
+So on a T4 the contended fp32 atomics cost **~0.25 ms per layer, ~4 ms per
 step**, and the ceiling for a contention-free credit is the traffic floor of
-**3.77 ms per step**. The `nvrtc` path is already within 2x of that floor;
-the grouped path's whole prize is the remaining 3.7 ms/step.
+**3.77 ms per step**. The `nvrtc` path is already within 2.1x of that
+floor; the grouped path's whole prize was the remaining ~4 ms/step, and it
+did not collect it (§6).
 
 **The hypothesis in the task brief — "contended fp32 atomics are the wall" —
 is half right and half wrong, and the measurement says which half.** The
-atomics are a fifth of the step's ring-credit phase and ~7% of a 51 ms step
-(the profiler's unprofiled wall); the *bytes* are the other four fifths of
-the credit's cost, and they are what the shipped fused paths already fixed.
-The MX150 is where the atomics hurt most in relative terms (2.52 ms/layer,
-3.5x the bandwidth-optimal, 21% of the step) because its memory system is 8x
-slower while its L2 atomics are no faster.
+atomics are a fifth of the step's ring-credit phase and ~8% of a 51 ms
+step (the profiler's unprofiled wall); the *bytes* are the other four fifths
+of the credit's cost, and they are what the shipped fused paths already
+fixed. The MX150 is where the atomics hurt most in relative terms (2.52
+ms/layer, 3.5x the bandwidth-optimal, 21% of the step) because its memory
+system is 8x slower while its L2 atomics are no faster.
+
+**And the decisive experiment is §6:** removing the atomics entirely, in the
+one way the arithmetic allows, makes the credit *slower* on a T4. The
+atomics are an L2-side operation; the fused atomic path hides them behind a
+sequential read of the ring, and the legal grouped path pays for them with a
+scattered read.
 
 ---
 
@@ -316,24 +327,54 @@ compiled, the path falls back to `full` and says so.
 
 **Gated** by `tests/check_ring_grouped.py` (new): the grouped credit is
 bit-identical to `full`, to numpy's own scatter, and to a 12-step engine
-run's `theta`/`m`/`v`; and the gate also pins the two illegal moves (the lag
-reduction, the reassociation) so nobody re-introduces them by accident.
+run's `theta`/`m`/`v`; the gate also emulates the CUDA kernel's index
+arithmetic element by element (the part of a kernel that can be wrong
+without a device), and it pins the two illegal moves (the lag reduction, the
+reassociation) so nobody re-introduces them by accident.
 
 **The default path is untouched.** `auto` still resolves to `compiled` on
 CUDA and `full` elsewhere.
+
+### 4.1 The three kernel changes the T4 forced (each measured)
+
+| change | zipf ms/call | why |
+|---|---:|---|
+| the first kernel (scalar, one dim per thread) | 2.576 | a warp moved 128 B per instruction |
+| **float4** (four dims per thread, a 128-bit load) | 2.576 → 0.367* | a warp now moves 512 B per instruction; *5.8x* on a uniform byte histogram |
+| **one warp per block, 64 dims per block** | 1.455 → 0.812 | the busiest byte id's work is spread over 8 SMs instead of 1 |
+| **CH = 32 rows fetched before the fold** | 0.812 → 0.693 | the fold is a chain, so the LOADS must not be in it: 3,000 dependent loads is 3,000 memory latencies |
+
+\* the float4 number is measured on the uniform histogram, where there is no
+imbalance to correct; the zipf column is the realistic one.
+
+**The mechanism of the last one** is the interesting part. The fold must be
+sequential (the reference's order is the point), so the *arithmetic* is a
+chain of up to 3,000 dependent adds — but the *loads* are not dependent on
+each other, only on the plan. Fetching CH = 32 rows into registers first and
+folding them afterwards takes the memory latency out of the chain: the
+chain becomes 94 chunks instead of 3,012 loads.
+
+**The mechanism of the second one** is the one that decides the verdict. A
+real byte histogram is not uniform: the commonest byte of a text corpus
+takes ~16% of the rows, and here that is **3,012 of the 18,432 rows**. The
+legal grouping gives all 3,012 to ONE byte id, and one byte id is one
+block, and one block is one SM. So the legal reduction puts **a sixth of the
+layer's traffic on a single SM** — while the atomic scatter, which spreads
+every row over every SM, has no such hot spot. That is why the grouped path
+loses on a realistic histogram and wins on a uniform one (§6).
 
 ---
 
 ## 5. the arithmetic per path (at B=1024, K=18, dim=512, 16 layers)
 
-| path | atomic element-adds / layer | per step | plain RMW writes / step | passes over the ring | notes |
-|---|---:|---:|---:|---:|---|
-| `full` | 9,437,184 | 150,994,944 | — | 5 | the portable reference |
-| `compiled` | 9,437,184 | 150,994,944 | — | ~2 + scatter | Inductor; `auto` on CUDA |
-| `triton` | 9,437,184 | 150,994,944 | — | 2 + scatter | needs cc ≥ 7.0 |
-| `nvrtc` | 9,437,184 | 150,994,944 | — | 1 (read+write) | no cc floor |
-| **`grouped`** | **0** | **0** | 256·512·16 = 2,097,152 | 1 (read+write) | the candidate |
-| `segmented` (removed) | 0 | 0 | 2,097,152 | **4** | +113 MB/step: why it lost (§3) |
+| path | atomic element-adds / layer | per step | plain RMW writes / step | passes over the ring | ms/call (T4) | notes |
+|---|---:|---:|---:|---:|---:|---|
+| `full` | 9,437,184 | 150,994,944 | — | 5 | 1.230 | the portable reference |
+| `compiled` | 9,437,184 | 150,994,944 | — | ~2 + scatter | 0.671 | Inductor; `auto` on CUDA |
+| `triton` | 9,437,184 | 150,994,944 | — | 2 + scatter | 1.040 | needs cc ≥ 7.0 |
+| `nvrtc` | 9,437,184 | 150,994,944 | — | 1 (read+write) | **0.497** | no cc floor; the fastest |
+| **`grouped`** | **0** | **0** | 256·512·16 = 2,097,152 | 1 (read+write) | 0.693 | the candidate; 0.486 on a uniform histogram |
+| `segmented` (removed) | 0 | 0 | 2,097,152 | **4** | — | +113 MB/step: why it lost (§3) |
 
 Traffic floor: 604 MB/step read, 1,208 MB/step read+write → **1.89 ms** and
 **3.77 ms** at 320 GB/s.
@@ -370,18 +411,30 @@ both are fixed:
 
 ### T4 (Tesla T4, cc 7.5, torch 2.11+cu130), B=1024, K=18, dim=512, 16 layers
 
+Realistic byte histogram (Zipf-like: the commonest byte takes 16.3% of the
+rows, the mean contention is 72 atomics per address), 50 iterations:
+
 | path | ms/call | ms/step (×16) | atomic adds/step | G adds/s | adds/address |
 |---|---:|---:|---:|---:|---:|
-| `full` | 1.285 | 20.56 | 150,994,944 | 7.34 | 72 |
-| `compiled` (the default on CUDA) | 0.671 | 10.74 | 150,994,944 | 14.07 | 72 |
-| `triton` | 1.024 | 16.38 | 150,994,944 | 9.22 | 72 |
-| `nvrtc` | **0.475** | **7.61** | 150,994,944 | 19.87 | 72 |
-| `grouped` | **pending** | | **0** | — | 72 (folded in-register) |
+| `full` | 1.230 | 19.68 | 150,994,944 | 7.67 | 72 |
+| `compiled` (the default on CUDA) | 0.671 | 10.74 | 150,994,944 | 14.06 | 72 |
+| `triton` | 1.040 | 16.64 | 150,994,944 | 9.07 | 72 |
+| **`nvrtc`** | **0.497** | **7.95** | 150,994,944 | 18.99 | 72 |
+| `grouped` | 0.693 | 11.09 | **0** | — | 72 (folded in-register) |
 
 Traffic floor for the same work: 604 MB/step read → 1.89 ms at 320 GB/s;
 1,208 MB/step read+write → 3.77 ms.
 
-**All four existing paths agree BIT-FOR-BIT on the T4** (max|Δ| = 0.0 against
+The same table with a **uniform** byte histogram (each byte id 72 rows —
+the contention the arithmetic assumes, and the harness's *old*, wrong
+assumption):
+
+| path | ms/call (uniform) | vs `nvrtc` |
+|---|---:|---:|
+| `nvrtc` | 0.559 | — |
+| `grouped` | **0.486** | **1.15x faster** |
+
+**All five paths agree BIT-FOR-BIT on the T4** (max|Δ| = 0.0 against
 `full`, on the same device, in the same process) — including `full` against
 itself. That is a stronger result than the MX150's record, which found the
 same path differing from itself by 8.8e-07 of RMS over a 150-step run: the
@@ -390,20 +443,29 @@ GPU it holds for a single call and not necessarily for a run. The harness
 now prints `full vs full` so the difference between those two claims is
 visible on the device the measurement runs on.
 
-**Reading the table.** The credit is 20.6 ms/step in the baseline (`full`,
-which matches the profiler's 21.3 ms/step for the ring-credit phase) and
-7.6 ms/step with the best shipped path. The `grouped` path's target is
-**~4 ms/step** (the traffic floor plus the fold) — i.e. it would take the
-credit from 7.6 to ~4-5.5 ms/step, and from the *default* path's 10.7 to
-~4-5.5 ms/step. On a 51 ms step that is 10-13% of the step, and it is the
-LAST of the credit's costs: after it, the credit is at its byte floor and
-no further kernel can help.
+**Reading the table.**
 
-**Pending:** the `grouped` row. The free-tier T4s were busy (one running the
-P4-vs-FSP A/B), and the allocation of a second one was refused repeatedly.
-The kernel compiles (checked for `compute_75` by `tools/check_nvrtc.py`,
-which compiles CUDA to PTX with no GPU at all), and its arithmetic is gated
-on CPU; what is missing is its wall-clock on a T4.
+1. The credit is 19.7 ms/step in the baseline (`full`, which matches the
+   profiler's 21.3 ms/step for the ring-credit phase) and **7.95 ms/step**
+   with the best shipped path. The harness and the profiler agree.
+2. **`nvrtc` is 1.35x faster than the DEFAULT (`compiled`) and is
+   bit-identical to it** (max|Δ| = 0.0, measured above). The default is
+   leaving a third of the credit on the table, for no arithmetic reason.
+   That is the cheapest win in this document and it needs no new code.
+3. The grouped path is **1.39x slower than `nvrtc`** on the realistic
+   histogram and **1.15x faster** on the uniform one. The difference is
+   entirely the hot byte id (§4.1): 3,012 rows → one block → one SM.
+4. The credit's floor is its traffic: 3.77 ms/step read+write. The best
+   shipped path is at 7.95 ms/step, i.e. 2.1x the floor, and the grouped
+   path is at 11.09 ms/step, 2.9x the floor. **No legal reorganisation of
+   the scatter gets below the floor**, and the floor is 8-10% of a 51 ms
+   step.
+
+**Measurement noise.** The T4 is a shared free-tier machine: `nvrtc`
+measured 0.475/0.497/0.555/0.557/0.560 ms/call across five runs of the same
+harness (a ±15% spread). The conclusions above are all larger than that
+spread except the grouped-vs-uniform comparison, which was re-run for both
+histograms in the same process.
 
 ---
 
@@ -422,20 +484,49 @@ and no number on the default path moved.
 
 ---
 
-## 8. what is still open
+## 8. the verdict, and what is still open
 
-1. **the `grouped` path's T4 wall-clock** (§6) — the one number missing.
-2. **the plan's cost on the T4** — the sort of 18,432 keys per byte; the
-   arithmetic says ~0.1 ms/step, but it should be measured, and if the sort
-   is expensive the plan can be built once per byte *and* reused by the 16
-   layers (it is, by construction) or replaced by a counting sort.
-3. **whether the grouped path is worth the default** — it is a new default
-   only if it is measurably faster than `nvrtc` on a T4 *and* the bit-identity
-   claim survives a full training run (the MX150's 8.8e-07 run-to-run spread
-   says a GPU run cannot promise bit-identity anyway; the claim that can be
-   made is "within the reference's own spread", which is the standard the
-   `nvrtc` path was adopted under).
-4. **the other half of the credit's cost is not the credit's fault**: the
-   `masked_fill` (5.1 ms/step) that zeroes the 1.4% hot columns of the ring,
-   and the 1,072 launches/step (10.1 ms of CPU time). Both are bigger
-   prizes than the atomics, and both are outside this investigation.
+**The verdict, in one paragraph.** The credit's arithmetic is NOT what makes
+it slow. On a T4 the credit costs 19.7 ms/step in the baseline and 7.95
+ms/step in the best shipped path, and its traffic floor is 3.77 ms/step —
+so the whole prize on the table is ~16 ms/step of a 51 ms step, and the
+atomics are a part of that, not all of it. The legal, bit-identical way to
+remove the atomics exists (group the rows by byte id, fold each group left
+in row order) and is implemented, gated and measured — and it is **slower**
+on a realistic byte histogram (0.693 vs 0.497 ms/call), because the legal
+grouping hands the commonest byte's 16% of the rows to a single SM while
+the atomic scatter spreads them evenly. So: **the ring credit cannot be
+made faster on a T4 by removing the contention; the contention is not the
+wall.** What IS on the table, at zero risk:
+
+1. **switch the default from `compiled` to `nvrtc`** — measured 1.35x on the
+   credit (0.671 → 0.497 ms/call, 10.74 → 7.95 ms/step) and **bit-identical
+   to it** (max|Δ| = 0.0, measured on the T4). No float moves. This is a
+   one-line change in `_ring_mode` and it is the recommendation of this
+   document. (Not applied here: the default is the orchestrator's policy,
+   and the task was to keep it bit-identical, not to move it.)
+2. **the `masked_fill` (5.1 ms/step)** that zeroes the 1.4% hot columns of
+   the ring, and **the 1,072 launches/step** (10.1 ms of CPU time), are
+   bigger prizes than the atomics and are outside this investigation.
+3. the `triton` path (1.040 ms/call) is slower than `compiled` (0.671) and
+   than `nvrtc` (0.497) on a T4 — it is the fallback for a machine with no
+   Inductor, not a candidate.
+
+**Still open, in order of value:**
+
+1. **the hot byte id.** The grouped path's only real handicap is that one
+   byte id owns 16% of the rows. If the engine ever wanted the grouped
+   credit, the fix is a two-phase kernel: phase 1 loads the hot group's
+   rows into a global staging buffer (all SMs, in parallel), phase 2 folds
+   them (one thread, from L2). The extra traffic is 2× the hot group's
+   bytes. The arithmetic is unchanged; only the schedule is.
+2. **the plan's cost on the T4** — the stable sort of 18,432 keys per byte.
+   The arithmetic says ~0.1 ms/step (1/16 of a layer) and the harness does
+   not include it (the plan is cached across the 50 iterations); it should
+   be measured end-to-end, and a counting sort would replace the sort.
+3. **a run-level bit-identity claim on a GPU.** Every path here is
+   bit-identical for a single credit call on a T4, but the MX150's record
+   says a 150-step run differs from itself by 8.8e-07 of RMS, so the claim
+   that can be made for a GPU is "within the reference's own spread" — the
+   standard the `nvrtc` path was adopted under, and the standard a new
+   default would have to meet.
