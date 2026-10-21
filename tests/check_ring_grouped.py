@@ -249,6 +249,68 @@ def test_engine_trajectory(m_args, steps=12):
     return True
 
 
+def test_kernel_index_arithmetic(m):
+    """The CUDA kernel's index arithmetic, emulated element by element.
+
+    The kernel cannot be run without a GPU, so the part of it that can be
+    wrong without a device -- the INDEX arithmetic (which row of the ring,
+    which stream of `dlds`, which address of `dest`) -- is emulated here in
+    the same order the kernel does it, from the same plan the kernel builds.
+    A mistake in the plan (a wrong stream, a wrong row) would show up here
+    as a number that is not the reference's.
+    """
+    torch.manual_seed(31337)
+    l = m.layers[0]
+    with torch.no_grad():
+        l.ring_w.copy_(m._pristine_ring)
+    w0 = l.ring_w.detach().clone()
+    dlds = torch.randn((m.B, m.dim))
+    dec = torch.sigmoid(l.decay)
+    rows = m.ring_b.reshape(m.B * m.ring_k)
+    K, D, nb = m.ring_k, m.dim, 256
+
+    # ---- the reference: numpy_port's walk ---------------------------------
+    wref = w0.clone()
+    wref.mul_(dec[None, None, :])
+    vals = (wref * dlds[:, None, :]).reshape(-1, D)
+    ref = torch.zeros(nb, D)
+    for i in range(m.B * K):
+        ref[rows[i]] += vals[i]
+
+    # ---- the plan the kernel builds ---------------------------------------
+    order = torch.argsort(rows, stable=True)
+    counts = torch.bincount(rows, minlength=nb)
+    goff = torch.cumsum(counts, 0) - counts
+    woff = order * D
+    dlsoff = (order // K) * D
+
+    # ---- the kernel, emulated ---------------------------------------------
+    w = w0.clone()
+    wflat = w.reshape(-1)              # the kernel sees a raw pointer
+    dlsflat = dlds.reshape(-1)
+    dest = torch.zeros(nb, D)
+    for r in range(nb):
+        m_r = int(counts[r])
+        off = int(goff[r])
+        for d in range(D):
+            s = dest[r, d]
+            for j in range(m_r):
+                wo = int(woff[off + j])
+                lo = int(dlsoff[off + j])
+                wv = wflat[wo + d] * dec[d]
+                wflat[wo + d] = wv
+                v = wv * dlsflat[lo + d]
+                s = s + v
+            dest[r, d] = s
+    assert torch.equal(ref, dest), (
+        "the kernel's index arithmetic does not reproduce the reference: "
+        f"max|d| = {(ref - dest).abs().max().item():.3e}")
+    assert torch.equal(wref, w), "the kernel decays a different ring"
+    print("[PASS] the CUDA kernel's index arithmetic, emulated, reproduces the "
+          "reference bit for bit")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--B", type=int, default=64)
@@ -270,6 +332,7 @@ def main():
     ok &= test_reassociation_is_a_different_float()
     ok &= test_grouped_is_bit_identical(m)
     ok &= test_grouped_matches_numpy(m)
+    ok &= test_kernel_index_arithmetic(m)
     ok &= test_engine_trajectory({"B": args.B, "dim": args.dim,
                                    "layers": args.layers})
     print("\n== verdict:", "PASS" if ok else "FAIL", "==")
