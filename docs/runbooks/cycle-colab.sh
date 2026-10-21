@@ -61,6 +61,7 @@ for cycle in $(seq 1 "$CYCLES"); do
   # RESUME it (not start over); if not, it starts from scratch. Asking the
   # hub is the only honest way to decide.
   $SSH "$ALIAS" 'cd /content && tar xzf code_only2.tar.gz && mkdir -p runs/taxis && \
+      rm -f runs/DONE && \
       (bash fetch-corpus-box.sh > runs/fetch.log 2>&1; \
        FROM=$(python3 -c "
 from huggingface_hub import HfApi
@@ -69,19 +70,28 @@ own = [f for f in fs if f.startswith((\"A_p4_wd0_c_t\", \"A_p4_wd0_fsp_c_t\"))]
 print(\"1\" if own else \"\")
 "); \
        export FROM_SCRATCH=$FROM; \
-       setsid nohup bash run-box.sh > runs/box.log 2>&1 < /dev/null) & sleep 30; \
-       tail -3 runs/box.log' 2>&1 | tail -4
+       setsid nohup bash run-box.sh > runs/box.log 2>&1 < /dev/null; \
+       touch runs/DONE) & sleep 20; \
+      tail -2 runs/fetch.log' 2>&1 | tail -3
   echo "  (the hub decides: an arm with no checkpoint of its own starts from scratch,"
   echo "   an arm with one resumes it)"
   echo "  arms launched; polling"
 
-  # wait for the arms to finish, or for the runtime to die
-  for _ in $(seq 1 60); do
-    sleep 30
-    if ! $SSH "$ALIAS" 'true' 2>/dev/null; then
-      echo "  runtime went away at $(date -u +%H:%M:%SZ)"
-      break
-    fi
+  # Wait for the arms, ON THE BOX, over ONE long-lived connection. The
+  # Colab bridge allows a single client per runtime ("another `colab ssh`
+  # is connected to this runtime"), so reconnecting every 30 s races
+  # against the previous connection and the poll fails for reasons that
+  # have nothing to do with the run. If this connection dies, the runtime
+  # died with it, and the next cycle resumes the arms from the hub.
+  $SSH "$ALIAS" 'cd /content && for i in $(seq 1 90); do
+       if [ -f runs/DONE ]; then echo BOX_DONE; break; fi
+       sleep 20
+     done;
+     echo "--- control ---"; tail -2 runs/taxis/A_p4_wd0_c.log 2>/dev/null;
+     echo "--- fsp ---"; tail -2 runs/taxis/A_p4_wd0_fsp_c.log 2>/dev/null' 2>&1 | tail -8
+  if ! $SSH "$ALIAS" 'true' 2>/dev/null; then
+    echo "  runtime went away at $(date -u +%H:%M:%SZ)"
+  fi
     # "BOTH ARMS DONE" is printed even when the arms FAILED (it is printed
     # unconditionally at the end of the script), so the completion test is
     # the arms' own final checkpoints: they must exist AND be at the target
@@ -105,7 +115,6 @@ sys.exit(0 if ok else 1)
       echo "  rulers pulled"
       exit 0
     fi
-  done
   $SCP "$ALIAS":/content/runs/taxis/A_p4_wd0_c.log "$REPO/runs/taxis/" 2>/dev/null
   $SCP "$ALIAS":/content/runs/taxis/A_p4_wd0_fsp_c.log "$REPO/runs/taxis/" 2>/dev/null
   $SSH "$ALIAS" 'cd /content && tail -1 runs/taxis/A_p4_wd0_c.log; tail -1 runs/taxis/A_p4_wd0_fsp_c.log' 2>&1 | tail -2
