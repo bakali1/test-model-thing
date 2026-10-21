@@ -549,7 +549,7 @@ class Trainer:
             if self.telemetry is not None:
                 self.telemetry.maybe_emit(m, self.telemetry_every, digest)
 
-        t0 = time.time()
+        wall_t0 = time.time()
         # THE DATA POSITION. A resume must CONTINUE the corpus, not replay
         # it: the file loop below always starts at the first file, so without
         # this a resumed run re-reads bytes it had already trained on and the
@@ -584,21 +584,21 @@ class Trainer:
                 ets = torch.from_numpy(np.array(
                     [e[:L] for e in endss], dtype=np.float32).T).to(self.device)
                 self.distill = self._kd_provider(file, m)
-                for c, n_, e_, Tw, t0 in self._windows(mats, ets, L):
-                    if file_idx == start_file and t0 < start_off:
+                for c, n_, e_, Tw, win_off in self._windows(mats, ets, L):
+                    if file_idx == start_file and win_off < start_off:
                         continue                  # already trained on these bytes
                     if (not logged_resume and start_off
-                            and file_idx == start_file and t0 == start_off):
+                            and file_idx == start_file and win_off == start_off):
                         # The first window AFTER the resume, and the byte it
                         # starts on: printed so a gate can assert that the
                         # stream CONTINUED rather than replayed.
                         print(f"  [data] the first window after the resume "
-                              f"starts at window {t0} of file {file_idx}, "
+                              f"starts at window {win_off} of file {file_idx}, "
                               f"byte {int(c[0, 0])}", flush=True)
                         logged_resume = True
-                    m.data_pos = (file_idx, t0)   # persisted with the next save
+                    m.data_pos = (file_idx, win_off)   # persisted with the next save
                     loss = m.step_batch(c, n_, e_,
-                                        self._fsp_args(mats, t0, Tw))
+                                        self._fsp_args(mats, win_off, Tw))
                     if self.telemetry is not None:
                         self.telemetry.observe(loss, m.last_ce)
                         if m.t == self.start_t + self.measure_after:
@@ -654,7 +654,7 @@ class Trainer:
                         continue
                     emit_telemetry()
                     if self.log_every and total % self.log_every == 0:
-                        dt = time.time() - t0
+                        dt = time.time() - wall_t0
                         # Async metric mode keeps CUDA work queued; synchronize
                         # only at the logging boundary, not once per step.
                         loss_value = float(loss_win / n_win)
@@ -685,10 +685,17 @@ class Trainer:
     def bench(self, Bs=(1024, 2048, 4096), steps=30):
         m = self.model
         cuda = str(self.device).startswith("cuda")
-        cs = torch.randint(1, 250, (max(Bs),), device=self.device)
-        ns = torch.randint(1, 250, (max(Bs),), device=self.device)
-        ends = torch.zeros(max(Bs), dtype=torch.float32, device=self.device)
-        print(f"device {m.device} ring_k {m.ring_k} params {m.theta.shape[0]:,}")
+        # T comes from the SHAPE of the call (gpu_port.step_batch: a (B,) call
+        # is unsqueezed to (B,1) and means T=1), so the bench has to build a
+        # (B,T) window to measure the T it was asked to measure.  A (B,)
+        # window here would silently report the T=1 throughput under a
+        # --seqlen 4 heading.
+        T = max(1, int(getattr(self, "seqlen", 1)))
+        cs = torch.randint(1, 250, (max(Bs), T), device=self.device)
+        ns = torch.randint(1, 250, (max(Bs), T), device=self.device)
+        ends = torch.zeros((max(Bs), T), dtype=torch.float32, device=self.device)
+        print(f"device {m.device} ring_k {m.ring_k} params {m.theta.shape[0]:,}"
+              f"  T={T}")
         for B in Bs:
             m.new_states(B)
             for _ in range(4):
@@ -703,8 +710,12 @@ class Trainer:
                 torch.cuda.synchronize()          # else timing is meaningless
             dt = (time.time() - t0) / steps
             peak = (torch.cuda.max_memory_allocated() / 1e9) if cuda else 0.0
-            print(f"  B={B:5d}: {1/dt:7.1f} steps/s = {B/dt:9.0f} B/s "
-                  f"({dt*1000:6.1f} ms/step) peak_alloc={peak:.2f} GB")
+            # bytes per step is B * T: one update covers T bytes of every
+            # stream, so the byte count is not B unless T=1.
+            bps = B * T / dt
+            print(f"  B={B:5d}: {1/dt:7.1f} steps/s = {bps:9.0f} B/s "
+                  f"({dt*1000:6.1f} ms/step, {B*T} B/step) "
+                  f"peak_alloc={peak:.2f} GB")
 
 
 def main():
