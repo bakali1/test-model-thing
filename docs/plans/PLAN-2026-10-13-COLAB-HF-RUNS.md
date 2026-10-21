@@ -196,3 +196,67 @@ token never touches this machine.
 The one thing this plan cannot protect against is the MX150's own
 availability — and at 3.4 kB/s it is a 13-hour machine for a 1-epoch arm,
 which is why the runs belong on the box.
+
+---
+
+## 9. The C run, as it actually happened (2026-10-21)
+
+This section is the plan's own audit: what the protocol had to survive, and
+what it had to be corrected for.
+
+**The free tier fought back.** For most of the day the allocation was
+refused outright (`Allocation refused (precondition failed)`, ~16 attempts),
+and the runtimes that did come were recycled *within minutes* — twice inside
+a single launch command. One of them was so short-lived that the SSH bridge
+landed on a container with no GPU at all (`nvidia-smi: command not found`),
+which is a failure mode the allocator handles (it recreates the runtime) but
+which is easy to mistake for "the GPU is gone".
+
+**The protocol needed three corrections, all of them silent-failure kinds.**
+
+1. *A stale code tarball.* The arms died in the first second on
+   `unrecognized arguments: --stop-at-t` — the tarball had been built by hand
+   and predated the change. The cycle now builds it fresh, from the working
+   tree, every cycle.
+2. *A completion test that believed a failed arm.* `BOTH ARMS DONE` is
+   printed unconditionally at the end of the arm script, so a cycle whose
+   arms died in the first second looked like a success. The test is now the
+   arms' own final checkpoints: they must exist and be at the target step.
+3. *The bridge is exclusive.* Colab allows one SSH client per runtime
+   ("another `colab ssh` is connected to this runtime"), so a polling loop
+   that reconnects every 30 s races itself. The wait now happens on the box
+   over a single long-lived connection. Every connection in the cycle goes
+   through a retry, and the cycle trusts the allocator's own `nvidia-smi`
+   probe instead of probing a second time (the second probe was being
+   refused — for a reason that had nothing to do with the GPU).
+
+**And the hub's pull was broken in a way that would have silently corrupted
+the experiment.** `best_t` was never assigned in the arm-aware patch, so
+every pull that reached it died; and the arm's own files were matched by
+*prefix*, which is too loose — the new arm `A_p4_wd0_c` starts with
+`A_p4_wd0_`, so a prefix match would have handed it the first run's control
+checkpoint. Both are fixed, and both are now tested against the real repo:
+`A_p4_wd0` resumes its own t=10000, `A_p4_wd0_c` declines.
+
+**What made the run survive the recycling** is the pair of mechanisms this
+plan was written around, plus one that was added to it:
+
+* the checkpoint's **data position** — a resume continues the corpus instead
+  of replaying it (without it, the arm's unique data is capped at the push
+  cadence: 10 MB seen sixteen times);
+* **`--stop-at-t`**, an absolute step target, so a resumed run finishes at
+  exactly the same step and the byte budget cannot drift;
+* the **cycle loop** itself: allocate → ship → fetch the corpus (4 s on the
+  box) → resume both arms from the hub → wait for the runtime to die →
+  repeat.
+
+Both arms reached t=19,000 and were pushed. The verdict is in
+`RESULTS.md` ("C: the P4-vs-FSP A/B on a T4").
+
+**What the infrastructure cost, for the record:** roughly five hours of
+fighting the free tier, and about nine bugs that each looked like a
+successful run until something was measured. The most valuable of them was
+the one that was *not* an infrastructure bug at all: the FSP arm's null
+result came with a measurement showing the objective had been satisfied by
+the byte-frequency prior, and that is now the project's most useful single
+number.
