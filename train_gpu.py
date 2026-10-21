@@ -181,7 +181,7 @@ class Trainer:
                  distill_alpha=0.0, distill_block=32, distill_repo=None,
                  distill_null_target=False, distill_floor=0.05,
                  ce_only=False, seqlen=1, fsp_alpha=0.0, fsp_r=16, fsp_tau=64,
-                 fsp_pos_weight=50.0, fsp_layer=-1, **model_kw):
+                 fsp_pos_weight=50.0, fsp_layer=-1, stop_at_t=0, **model_kw):
         # The init is drawn from a numpy Generator seeded inside GpuModel, so
         # --seed is threaded through to make starting weights reproducible. Two
         # from-scratch A/B arms with the same seed start bit-identical, which
@@ -294,6 +294,10 @@ class Trainer:
         self.keep_k = keep_k
         self.tagged = tagged
         self.max_steps = max_steps          # "train N MORE steps" (relative)
+        # An ABSOLUTE target instead: the remaining budget is computed from
+        # where the run actually resumes, so a run that dies and resumes
+        # still lands on the same step (and therefore the same byte budget).
+        self.stop_at_t = int(stop_at_t)
         self.data_seed = data_seed
         self.device = device
         # Local saves and Hub uploads intentionally have independent cadences.
@@ -429,6 +433,8 @@ class Trainer:
                 del ck
         # --steps is RELATIVE: train N more steps from wherever we resumed
         self.start_t = m.t
+        if self.stop_at_t:
+            self.max_steps = max(0, self.stop_at_t - self.start_t)
         self.stop_t = self.start_t + self.max_steps if self.max_steps else 0
         print(f"[train] resume t={self.start_t} -> "
               f"{self.stop_t or '∞'} | B={self.batch} | device {m.device}",
@@ -481,6 +487,11 @@ class Trainer:
             # so --steps still means "this many TIMED steps"; warmup is extra.
             if self.max_steps:
                 self.start_t = m.t
+                if self.stop_at_t:
+                    # the warmup moved the counter, so the ABSOLUTE target
+                    # has to be re-applied: --stop-at-t means the step the run
+                    # finishes at, not the number of steps it takes.
+                    self.max_steps = max(0, self.stop_at_t - m.t)
                 self.stop_t = m.t + self.max_steps
         if self.telemetry_every:
             self.telemetry = RunTelemetry(
@@ -548,7 +559,7 @@ class Trainer:
         start_file, start_off = 0, 0
         if m.data_pos is not None:
             start_file, start_off = m.data_pos
-            print(f"  [data] RESUMING the stream at file {start_file}, byte "
+            print(f"  [data] RESUMING the stream at file {start_file}, window "
                   f"{start_off} (the corpus is NOT replayed from the start)",
                   flush=True)
         file_idx = -1
@@ -887,6 +898,13 @@ def main():
                          "weight decay at 0, --lr-decay also stops scaling a "
                          "weight-decay term, which is the 'knob wired to a "
                          "trap' this plan flagged.")
+    ap.add_argument("--stop-at-t", type=int, default=0,
+                    help="train until the ABSOLUTE step counter reaches this "
+                         "value (0 = off). --steps is RELATIVE, so a resumed "
+                         "run cannot land on a fixed byte budget with it; "
+                         "this can. A resumed run computes its own remaining "
+                         "budget from where it starts, so a run that dies and "
+                         "resumes still finishes at exactly the same step.")
     ap.add_argument("--fsp-alpha", type=float, default=0.0,
                     help="FSP: the weight of the Future State Prediction "
                          "auxiliary loss (FlashLM, Chang 2026, §3.1). 0 = off "
@@ -984,6 +1002,7 @@ def main():
                 distill_null_target=args.distill_null_target,
                 distill_floor=args.distill_floor,
                 ce_only=args.ce_only,
+                stop_at_t=args.stop_at_t,
                 half_life_init=(
                     (args.half_min, args.half_max)
                     if args.half_min is not None and args.half_max is not None
