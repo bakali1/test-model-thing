@@ -197,6 +197,15 @@ def pull(dest, repo_id=None, token=None, repo_type=None, force=False,
                   f"t={own[-1][0]} (the repo's global best is t={best_t} from "
                   f"another arm, ignored)")
         best_t, best_f = own[-1]
+    elif os.environ.get("TMT_RUN_ID"):
+        # The run declares WHICH arm it is, and that arm has no checkpoints
+        # yet. Falling back to the repo's global best would load ANOTHER
+        # arm's weights into this one -- a silently wrong experiment -- so
+        # the pull declines instead, and the run starts from scratch.
+        print(f"[hub] {repo_id}: no checkpoints for THIS arm ({base}) yet; "
+              f"not falling back to the repo's global best (t={best_t}, "
+              f"{best_f}, another arm) -- starting from scratch")
+        return None
     have = local_t(dest)
     if not force and best_t < have:
         print(f"[hub] {repo_id}: remote t={best_t} < local t={have}, skipping pull")
