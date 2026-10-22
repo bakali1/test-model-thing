@@ -1,0 +1,67 @@
+{
+ "label": "armA_ungated",
+ "ckpt": "/home/baku/tmt-work/runs/cl2/armA_f2_end.npz",
+ "gated": false,
+ "cells": {
+  "no-conflict": {
+   "behav_per_byte": 0.1865234375,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.17138671875,
+   "head_exact4": 0.001953125,
+   "ridge_target_exact4": 0.21875,
+   "ridge_target_per_byte": 0.31640625,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.09765625
+  },
+  "no-conflict/copy-control": {
+   "behav_per_byte": 0.169921875,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.14599609375,
+   "head_exact4": 0.0,
+   "ridge_target_exact4": 0.21875,
+   "ridge_target_per_byte": 0.3046875,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.095703125
+  },
+  "random-key": {
+   "behav_per_byte": 0.18505859375,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.1708984375,
+   "head_exact4": 0.001953125,
+   "ridge_target_exact4": 0.21875,
+   "ridge_target_per_byte": 0.3359375,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.091796875
+  },
+  "random-key/copy-control": {
+   "behav_per_byte": 0.1640625,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.14697265625,
+   "head_exact4": 0.0,
+   "ridge_target_exact4": 0.1953125,
+   "ridge_target_per_byte": 0.30859375,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.109375
+  },
+  "confusable": {
+   "behav_per_byte": 0.20947265625,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.1591796875,
+   "head_exact4": 0.0,
+   "ridge_target_exact4": 0.2421875,
+   "ridge_target_per_byte": 0.330078125,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.18359375
+  },
+  "confusable/copy-control": {
+   "behav_per_byte": 0.18603515625,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.13671875,
+   "head_exact4": 0.0,
+   "ridge_target_exact4": 0.2421875,
+   "ridge_target_per_byte": 0.31640625,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.189453125
+  }
+ }
+}

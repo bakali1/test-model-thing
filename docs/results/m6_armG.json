@@ -1,0 +1,67 @@
+{
+ "label": "armG_gated",
+ "ckpt": "runs/p3/armG_f2_end.npz",
+ "gated": true,
+ "cells": {
+  "no-conflict": {
+   "behav_per_byte": 0.1982421875,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.32763671875,
+   "head_exact4": 0.01953125,
+   "ridge_target_exact4": 0.1875,
+   "ridge_target_per_byte": 0.294921875,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.10546875
+  },
+  "no-conflict/copy-control": {
+   "behav_per_byte": 0.09765625,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.20263671875,
+   "head_exact4": 0.0,
+   "ridge_target_exact4": 0.1875,
+   "ridge_target_per_byte": 0.287109375,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.1015625
+  },
+  "random-key": {
+   "behav_per_byte": 0.20458984375,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.322265625,
+   "head_exact4": 0.013671875,
+   "ridge_target_exact4": 0.1796875,
+   "ridge_target_per_byte": 0.296875,
+   "ridge_distractor_exact4": 0.0078125,
+   "ridge_distractor_per_byte": 0.083984375
+  },
+  "random-key/copy-control": {
+   "behav_per_byte": 0.103515625,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.20263671875,
+   "head_exact4": 0.001953125,
+   "ridge_target_exact4": 0.1796875,
+   "ridge_target_per_byte": 0.29296875,
+   "ridge_distractor_exact4": 0.0078125,
+   "ridge_distractor_per_byte": 0.091796875
+  },
+  "confusable": {
+   "behav_per_byte": 0.1982421875,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.34716796875,
+   "head_exact4": 0.025390625,
+   "ridge_target_exact4": 0.2421875,
+   "ridge_target_per_byte": 0.32421875,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.19921875
+  },
+  "confusable/copy-control": {
+   "behav_per_byte": 0.10205078125,
+   "behav_exact4": 0.0,
+   "head_per_byte": 0.2216796875,
+   "head_exact4": 0.001953125,
+   "ridge_target_exact4": 0.2421875,
+   "ridge_target_per_byte": 0.3125,
+   "ridge_distractor_exact4": 0.0,
+   "ridge_distractor_per_byte": 0.21484375
+  }
+ }
+}

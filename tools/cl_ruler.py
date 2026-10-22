@@ -859,8 +859,10 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
                                 "here says the recall is a memorisation, not "
                                 "a state read.",
                            expect_signal=False)
-        cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                              board=bname, readout="ridge (mb._ridge_score)")
+        setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                       board=bname, readout="ridge (mb._ridge_score)")
+        if isinstance(cw.get("setting"), dict): setting.update(cw["setting"])
+        cw["setting"] = setting
         cells.append(cw)
         hw = make_head_cell(cname + "_copy_control_head", Xw, Y,
                             heads["post"][0], heads["post"][1], args.seed,
@@ -897,8 +899,10 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
         c = ridge_cell(f"retain_replay_{tag}", X, Y, stream,
                          note=("the PRE-STREAM facts (board A) replayed, read "
                                f"at the cue of the {tag}-stream checkpoint"))
-        c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                            board="A", readout="ridge (mb._ridge_score)")
+        setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                       board="A", readout="ridge (mb._ridge_score)")
+        if isinstance(c.get("setting"), dict): setting.update(c["setting"])
+        c["setting"] = setting
         cells.append(c)
         hc = make_head_cell(f"retain_replay_{tag}_head", X, Y, hd[0], hd[1],
                             args.seed, alpha_size, prior_byte=prior_byte,
@@ -914,8 +918,10 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
                            "and PAYLOAD are both replaced, so the target is "
                            "absent from the state AND from the weights.",
                       expect_signal=False)
-    cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                          board="A", readout="ridge (mb._ridge_score)")
+    setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                   board="A", readout="ridge (mb._ridge_score)")
+    if isinstance(cn.get("setting"), dict): setting.update(cn["setting"])
+    cn["setting"] = setting
     cells.append(cn)
     hn = make_head_cell("retain_replay_nuisance_head", Xn, Y, heads["post"][0],
                         heads["post"][1], args.seed, alpha_size,
@@ -926,10 +932,12 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
     cells.append(hn)
     cw = ridge_cell("retain_replay_copy_control", Xw, Y, stream,
                     note="COPY CONTROL for the replay: the "
-                           "payload is replaced, the key is kept.",
-                      expect_signal=False)
-    cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                          board="A", readout="ridge (mb._ridge_score)")
+                         "payload is replaced, the key is kept.",
+                    expect_signal=False)
+    setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                   board="A", readout="ridge (mb._ridge_score)")
+    if isinstance(cw.get("setting"), dict): setting.update(cw["setting"])
+    cw["setting"] = setting
     cells.append(cw)
     hw = make_head_cell("retain_replay_copy_control_head", Xw, Y,
                         heads["post"][0], heads["post"][1], args.seed,
