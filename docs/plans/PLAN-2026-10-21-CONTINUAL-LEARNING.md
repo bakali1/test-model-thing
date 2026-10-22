@@ -399,87 +399,96 @@ reach >= 0.50 exact recall at d=32 the recurrent state cannot be trained to
 hold a fact" — the head's 0.975 is at the **read-out**, not yet at the
 **behaviour**, and the ruler's verdict governs.
 
-### CL-2b — THE STORE. (2026-10-22, rewritten twice; this is the current step)
+### CL-2b — THE TRAINING SIGNAL. (2026-10-22; rewritten three times; this is the current step)
 
-**What CL-2 actually measured** (`RESULTS.md` §17, §20; the raw output is
-`docs/results/cl2/armA_ruler.json`; the ruler was run in the arm's exact
-regime — facts 4, gaps 8/32/64, alphabet 16, n 512):
+**What CL-2 measured** (`RESULTS.md` §20, §22; the ruler's raw output is
+`docs/results/cl2/armA_ruler.json` and the fact-capacity output is
+`docs/results/cl2/factcap.log`):
 
 | | board B (the stream's facts) | board A (pre-stream, no replay) | board C (never trained) |
 |---|---:|---:|---:|
 | the model's own head, per-byte / exact-4 | **0.9697 / 0.8906** | **0.1978 / 0.0020** | 0.1011 / 0.0 |
 
 * **ACQUIRE: PASS** (0.8906 exact-4, null 0.0020, threshold 0.50).
-* **RETAIN: FAIL** — pre 0.9644/0.8691 -> post 0.1978/0.0020, **ratio
+* **RETAIN: FAIL** — pre 0.9644/0.8691 → post 0.1978/0.0020, **ratio
   0.0022** against a threshold of 0.90. The pre-stream facts are gone.
-* **NO REGRESSION: FAIL** — held-out CE 3.0695 (base) -> 5.2037 (post), and
+* **NO REGRESSION: FAIL** — held-out CE 3.0695 (base) → 5.2037 (post), and
   the post model is **within 0.34 nats of the unigram baseline 5.5452**.
 
-**THE SYNTHESIS, and it names the bottleneck in one sentence (§21):**
+**THE PICTURE, AFTER THE AUDIT THAT CORRECTED IT TWICE (§17, §19, §21,
+§22).**
 
-| | what it holds | generic to unseen facts? | survives the next stream? |
-|---|---|---|---|
-| the **recurrent state** | a **COPY** of the input's payload (a *fitted* probe reads board C at 0.1953 exact-4; collapses to NULL when the key AND payload are replaced) | **yes** | **no** — a copy is overwritten by the next write |
-| the **trained head** | a **TABLE** of key->payload in the **weights** (survives replacing the input's payload) | **no** | **no** — board B's 512 entries overwrote board A's |
+> **The recurrent state carries the ADDRESS — the key — durably and
+> generically, even for facts the model was never taught. The CONTENT —
+> the payload — lives only in the WEIGHTS, in a table, and only for the
+> facts it was trained on.** Board B's 512 entries overwrote board A's,
+> which is why RETAIN is 0.0022.
 
-**The goal needs a THIRD KIND of store: one that is written once, read
-many times, and does not overwrite itself when a new fact arrives.**
-Neither the copy nor the table has that property, and that is why
-ACQUIRE passes and RETAIN is 0.0022 in the *same* run.
+The state does **not** hold a copy of the payload: a fresh ridge readout
+on the state, fitted on board facts 0-255 and tested on facts 256-511,
+scores **exact-4 = 0.0000 in every cell**, on board B and on board C
+(`tools/state_fact_capacity.py`). The ruler's apparent 0.1953 exact-4 on
+board C was a **table over the board**: its split is over rows, and rows
+share board facts, so the state supplied the *index* and the readout's
+weights supplied the *content*.
 
-**WHAT THIS RETIRES.**
-* *"The state must hold the payload"* — it does, for a copy, and D5's copy
-  control proves it for a sibling model.
-* **P3 (write selectivity in the recurrent state) as the lever.** Selective
-  writing can prolong a *copy* — and D5's copy IS decaying — but RETAIN's
-  failure is **overwriting a table**, which a selective state write cannot
-  touch, because the state was never the store. P3 was aimed at the wrong
-  object. M1 ("does the gate engage at all?") is still worth measuring, but
-  as a question about the copy's lifetime, not about the criterion.
+**AND D5 IS EXPLAINED BY THE LOSS, NOT THE ARCHITECTURE.** D5's model —
+trained on a delayed-copy task — demonstrably **does** hold a decodable
+payload in its state (19.2x over null at 8 B, with its copy control
+collapsing to chance). The CL-2 model does **not**. Same architecture,
+same state size. **D5's objective asked the state to carry the payload;
+CL-2's objective never did** — the memory loss `state_cue @ wm` is far
+cheaper to satisfy by fitting the *head's weights* to a table, and the
+gradient took that path. **So the CL-2 failure is a TRAINING-SIGNAL
+failure: the state was never asked.**
 
-**WHAT THE CAPACITY BUDGET SAYS** (`tools/state_capacity_budget.py`): the
-state is 16x512 = **8192 scalars**, and a linear-readable store of 512
-facts needs **8 704 dims** (optimal coding) or **33 280** (one-hot) —
-**1.06x-4.06x short for ONE board**, 2.12x-8.12x for two. So the answer
-is *not* "make the state bigger": **a recurrent linear state is the wrong
-KIND of object for a store that must hold hundreds of facts at once.** The
-store must change in kind.
+**THE DECISIVE EXPERIMENT, AND IT IS CHEAP. ARM H1 — REMOVE THE HEAD'S
+TABLE FROM THE EQUATION.** Train the same arm with the memory loss
+computed so the head's weights **cannot** carry the content (the head is
+re-initialised every step, or replaced by a fixed random projection, or
+frozen at a random init). Then the only way to reduce the memory loss is
+to **write the payload into the state**. Everything else identical to
+armA. **Pre-registered:**
 
-**THE NEXT ARMS, in priority order.**
+* the memory loss must fall **below armA's 0.0200-0.0453**;
+* with the head **zeroed at eval**, the head's exact-4 on board B must
+  stay **>= 0.50** (the ACQUIRE threshold);
+* the head's exact-4 on board A (post) must rise by **>= 0.05** over
+  0.0020 (RETAIN);
+* the held-out CE must stay within **0.05 nats/B** of armA's 5.2037.
 
-1. **A SMALLER BOARD — the cheapest decisive test of the capacity theory.**
-   `board_size` was arbitrary in the arm's spec; at **64 facts per board**,
-   two boards are 128 facts = 2 176 dims, **inside** the 8 192 the state
-   has. Same model, same everything, `--board-size 64` instead of 512: a
-   20x cheaper change than growing the model, and it puts the state route
-   back inside the budget. **Pre-registered:** the head's exact-4 on board
-   A (post) must rise by >= 0.05 over the board-512 arm's 0.0020; ACQUIRE
-   must not drop by more than 0.05; the held-out CE must be within 0.05
-   nats/B of the board-512 arm's. With a matched `--board-size 64` control.
-2. **A CONTENT-ADDRESSED SLOT STORE** — a key-value memory with learned
-   addressing, so a write is placed *at a key* and never evicts another
-   fact. This is the architectural version of the goal ("written once, read
-   many times"), and the ruler already has the readout to score it.
-3. **A PROTECTED TABLE** — a global table whose entries for old keys are
-   not overwritten (e.g. a key-indexed store with more slots than facts, or
-   an offset assignment). Cheaper than (2) and tests the same question:
-   is the problem the *kind* of store or the *capacity*?
-4. **REPLAY** — the standard baseline, and the reference point the
-   programme still does not have. **Until a replay baseline is measured on
-   the same three numbers, "continual learning is hard" is a claim without
-   a control.**
-5. **A BIGGER STATE** (dim >= 1088 optimal / >= 4160 one-hot for two
-   boards) or a nonlinear/sparse store. The plan's own §3 "16 layers and
-   512 dim" was chosen for other reasons and happens to sit exactly on
-   boundary — the kind of coincidence that silently decides an
-   architecture's fate.
+**A FAILURE IS A RESULT AND IT IS WORTH HAVING.** If the loss cannot fall
+with the table removed, the state cannot carry the payload under this
+objective, the D5-style copy circuit must be trained explicitly, and the
+programme's next architecture is a **content-addressed store with learned
+addressing** — a third kind of store, neither a copy nor a table.
 
-**A PASSING RETAIN DOES NOT SHOW THE STATE IS DOING THE WORK.** A bigger
-head that can hold 1024 facts would also make RETAIN non-zero, and that is
-the *global-table* route, not the state route. **The copy control (the
-payload in the input replaced, the key kept) plus the zeroed-head eval are
-what tell them apart** — and the copy control is now mandatory in every
-cell.
+**ARM H2 = H1 with `--board-size 64`.** The capacity budget
+(`tools/state_capacity_budget.py`) says the state (8192 scalars) is
+**1.06x-4.06x short** for one board of 512 facts in a linear-readable
+store, and that 64 facts per board (2 176 dims for two boards) fits
+comfortably. **If only one of H1/H2 can be run, run H2** — it is the arm
+most likely to succeed and the most informative.
+
+**THE OTHER ARMS, AND THEIR PLACE NOW.** The **capacity** arm (a bigger
+state, dim >= 1088 optimal / >= 4160 one-hot) and the **store-kind** arms
+(a content-addressed slot store, a protected table, **replay**) are still
+needed, but they are now **downstream of the training-signal question**:
+if H1/H2 succeed, the programme has a working memory and the question
+becomes how to make it scale; if they fail, the store kind becomes the
+priority. **REPLAY remains the missing reference point** — until a replay
+baseline is measured on the same three numbers, "continual learning is
+hard" is a claim without a control.
+
+**WHAT THE AUDITS TAUGHT, AND IT IS THE PROGRAMME'S REAL METHOD NOW.**
+Four times tonight a measurement's meaning was set by a control that was
+absent: a missing copy control (§17), a missing nuisance control (§19), a
+missing criterion wiring (§20), and a **split that let a readout memorise
+the board instead of generalising** (§22). The rule that comes out of it:
+**when a readout is fitted, the split must be over the things the readout
+could memorise** — here, over the board facts, not over the rows — and
+**every fitted readout in the ruler must be re-run with the fact-level
+split before it is believed.**
 
 **TWO FIXES TO THE INSTRUMENT, both the same class of bug (a tool default
 that does not match the question).**
@@ -487,7 +496,7 @@ that does not match the question).**
   which asks a different question from the criterion's "recall the NEW
   facts" (board B) and **turns a PASS into a FAIL**. Both cells must be
   reported; the criterion's ACQUIRE is board B, with board C beside it as
-  the separate, stronger claim (the in-state route).
+  the separate, stronger claim.
 * **The ruler's `--facts` default (64) does not match the trainer's (4).**
   The checkpoint stores `cl2_facts`/`cl2_gap`/`cl2_alphabet`, so the ruler
   should read the arm's regime **from the checkpoint**.
