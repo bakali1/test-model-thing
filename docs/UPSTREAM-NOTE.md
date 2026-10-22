@@ -42,8 +42,46 @@ Below are concrete, checkable findings from our measurements. All numbers/locati
 With fixed instruments (`tools/d5_probe.py`, padding-free, correct ridge, matched 16-symbol alphabet, per-sample veto):
 - **Cue/address:** Trailing key decodes **65–165× over null**, holds **~27% at 128 B** (persistent address).
 - **Content/payload:** Decodes **4.6× over null at 8–12 B**, falls to **1.5× at 128 B** (decaying but real). Δh retention curve and decodable payload agree in shape.
-- **Conclusion:** Write is partly order-losing (content mixed) but **readout is not key-blind**; next lever is **write selectivity** (e.g. P3 gate), not read wiring. Capacity vs usable content paradox resolved.
+- **Conclusion (SUPERSEDED 2026-10-22 — see the qualification above and do not act on this line):** Write is partly order-losing (content mixed) but **readout is not key-blind**. ~~next lever is **write selectivity** (e.g. P3 gate)~~ **WRONG, AND WE MEASURED IT: the "next lever" named here is CLOSED.** We built the P3 gate (a per-dim retention gate), pinned its gradient against autograd, and measured it: the gate **engages** (its parameter reaches 0.110 max) but it is **not selective** — its between-sample spread is **2.4e-05** of its within-sample spread, so it is a global per-dimension re-scaling rather than a per-sample choice. And more fundamentally: **a selective *state* write could not have fixed the failure we found**, because the failure was a **table in the weights being overwritten**, not a state being overwritten. The lever is the **kind of store**, not the kind of write.
 - **Refs:** `RESULTS.md` §7 (D5), `tools/d5_probe.py`, `docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md` §0/§4.
+
+## 6) Our own continual-learning result: a FAIL, reported because it is the most useful thing we have
+
+Your project advertises **test-time / continual training**, so this is the
+measurement a reader would most want, and we got it wrong before we got it
+right. Our plan (`docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`) sets
+continual learning as the goal and scores it on three pre-registered
+numbers with a matched null on every cell. The first **trained** arm:
+
+| | measured | threshold | verdict |
+|---|---|---|---|
+| **ACQUIRE** — recalls the stream's facts | 0.8906 exact-4 (null 0.0020) | >= 0.50 | **PASS** |
+| **RETAIN** — still recalls the pre-stream facts | ratio **0.0022** | >= 0.90 | **FAIL** |
+| **NO REGRESSION** — held-out CE | 3.0695 -> **5.2037** nats/B (unigram baseline 5.5452) | <= +0.02 | **FAIL** |
+
+**The cause, which we think is the transferable part.** The recurrent state
+carries the **address**; the **content** ended up in a **table in the
+weights**; a new stream overwrites that table, so the pre-stream facts are
+gone (RETAIN 0.0022). With the head's table removed from the training
+equation, the memory loss **does not fall at all** — the state never
+learns to carry the payload, because the objective made the table the
+cheaper path. **So the state is not the place the content lives, and
+"make the write more selective" is not the fix.** The next thing we are
+building is a **content-addressed store** (a fact written once at a key and
+read many times, without evicting its neighbours) plus a training-signal
+arm that asks the state to carry the payload directly.
+
+**And the methodological warning, which is the thing we would most like
+reviewed.** Four times in one night we drew a wrong conclusion because a
+**control was absent** and its absence silently became the interpretation
+(a missing copy control; a missing nuisance control; a criterion wired to
+the wrong board; and — the worst — a readout whose train/test split let it
+**memorise a table over the board** instead of generalising). **A
+measurement's meaning is set by its controls, and a control that is absent
+silently becomes the interpretation.** If our review of your work is going
+to be useful to you, that is the sentence we would most want you to take
+from it. Every number above is reproducible from `RESULTS.md` and the
+`tools/` scripts, and we would be glad to share the exact commands.
 
 **Note on architecture:** We verified the structure matches your design — `state = states*a + enc` with `enc` from a single embedding per byte and 16 layers reading one multi-scale EMA bank (512 distinct time-scales under P4; ~0.18% of params control decay). This matches `gpu_port.py:228-256`, `:1701-1707`, `numpy_port.py`.
 

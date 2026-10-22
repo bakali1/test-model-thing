@@ -22,12 +22,26 @@ Budget: `tools/state_capacity_budget.py`
      **0.34 nats of unigram baseline 5.5452** — **FAIL** (counterfactual A5
      can only make regression larger; failure certain, A5 quantifies).
 
-**Synthesis (§21):** the recurrent state holds a **COPY** of the input's
-payload (a fitted probe reads board C at 0.1953 exact-4; collapses to NULL
-when key AND payload replaced). The trained head holds a **TABLE** of
-key→payload in the **weights** (survives replacing input payload). **Neither
-is a store written once and read many times.** P3 (write selectivity) is
-retired as the lever for RETAIN (overwriting a table, not decaying a copy).
+**Synthesis (§21) — SUPERSEDED by §22, and this is the last place in the
+repo that still carried it.** §21 said the recurrent state holds a **COPY**
+of the input's payload, citing a fitted probe that reads board C at 0.1953
+exact-4. **That 0.1953 was a TABLE over the board.** The ruler's ridge
+split is over ROWS, and the rows share board facts, so the readout
+memorised the board: the state supplied the *index* and the readout's
+weights supplied the *content*. With the split taken over **board facts**
+instead of rows, **every cell scores exact-4 = 0.0000** — on board B
+(trained) and board C (never trained).
+
+**THE CORRECTED SYNTHESIS (§22–§23):** the recurrent state carries the
+**ADDRESS** (the key) — durably and generically, even for facts the model
+was never taught. The **CONTENT** lives only in the **WEIGHTS**, in a
+table, and only for the facts it was trained on; the new stream overwrites
+that table, which is why RETAIN is 0.0022. **Neither a copy nor a table is
+a store written once and read many times** — that sentence survives, and
+it is the reason the next architecture is a content-addressed store. And
+P3 remains retired: with the head's table removed, the memory loss does
+not fall at all (§23), so **the state was never asked to carry the
+payload**.
 
 **A PASSING RETAIN DOES NOT SHOW THE STATE IS DOING THE WORK.** A bigger
 head holding more facts is the global-table route, not the state route.
