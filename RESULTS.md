@@ -4565,3 +4565,52 @@ looked fine and measured the wrong thing.)
 **Timing, for planning.** The n=2048 forward took **3247.8 s** (54 min) and
 the ridge 357.1 s, i.e. **3605 s for one gap**. The forward dominates and
 is a pure-numpy loop over timesteps x 16 layers. Iteration must use n=512.
+
+### 13. The CL-RULER's full first result set (P4 checkpoint, n=2048, alphabet 16, 64 facts)
+
+The criterion instrument now produces all three numbers, each with its own
+matched null, its own nuisance control and its own coverage figure.
+
+| cell | lag | per_byte | null | verdict |
+|---|---:|---:|---:|---|
+| **acquire** | 8 | **16.04 % ± 1.15 %** | 6.37 % | **SIGNAL (2.52× null)** |
+| **acquire** | 32 | **10.08 % ± 0.94 %** | 6.52 % | **SIGNAL (1.55× null)** |
+| retain_pre | 536 | 6.71 % | 5.98 % | NULL |
+| retain_post | 536 | 6.71 % | 5.96 % | NULL |
+| nuisance_acquire (gap 8 / 32) | 8 / 32 | 6.47 % / 5.81 % | 6.27 % / 6.91 % | NULL ✓ |
+| nuisance_retain_pre / _post | 536 | 6.59 % / 6.20 % | 5.79 % / 6.03 % | NULL ✓ |
+| **NO REGRESSION** (held-out CE) | — | **1.6973 ± 0.0276** nats/B (6 slices, 120,000 B) | unigram 3.0634, bigram 2.2908 | dCE = 0.0 **by construction** → UNMEASURED |
+
+**ACQUIRE is SIGNAL at both gaps** (2.52× and 1.55× its own null), and
+every nuisance control sits at its null — so the readout is not inventing
+signal. And the two gaps bracket it: the same shape as the D5 curve
+(2.5× at 8 B decaying to 1.55× at 32 B), on a different instrument, which
+is the consistency check the D5 result needed.
+
+**NO REGRESSION reports its CE with its SE and labels its own dCE
+UNMEASURED**, because the checkpoint is frozen and the fact stream is not
+in the loss — so dCE = 0 is true *by construction* and is NOT evidence of
+no regression. The tool says so in its own output. That is the discipline
+the whole file insists on, applied to the tool's own most flattering
+number.
+
+**RETAIN is UNMEASURED, and for a second time for the same reason** — the
+probe is placed at lag 536, beyond the ~128 B horizon the state has. The
+fix is known (score RETAIN at lag 8/32/64) and is now the first item on
+the CL-2 runner's brief.
+
+**So the state of the criterion is:**
+- **ACQUIRE** — MEASURABLE, and it is SIGNAL on a frozen checkpoint (a
+  diagnostic; the goal needs the facts in the loss).
+- **RETAIN** — the instrument works; the LAG is wrong. MEASURABLE, not yet
+  MEASURED.
+- **NO REGRESSION** — MEASURABLE (the CE is measured with its SE); the
+  DELTA needs a trained arm.
+
+**That is the first time in 14 plans that all three numbers of the goal
+have an instrument.** Everything before this was proxies.
+
+Timing, for planning: the n=2048 forward is 3247.8 s (gap 8) and 3612.9 s
+(gap 32), the ridge 357.1 s and 116.8 s — **~1 hour per gap**. The forward
+is a pure-numpy loop over timesteps x 16 layers and it dominates. Iterate
+at n=512.
