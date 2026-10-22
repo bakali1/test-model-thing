@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmt"
+version = "0.1.0"
+description = "TMT CLI — community onboarding for the byte-level recurrent LM PoC"
+readme = "README-FORK.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+gpu = ["torch"]
+
+[project.scripts]
+tmt = "tmt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tmt*"]
