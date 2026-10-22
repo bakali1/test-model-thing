@@ -467,6 +467,44 @@ wiring (M1).** The hierarchical wiring stays on the table, but it is no
 longer the next month, and the per-layer FSP variant (16× the head's
 flops) is now clearly the wrong next arm.
 
+**AND THE P3 GATE IS NOT BLOCKED BY THE REASON WE GAVE**
+(`docs/design/P3-GATE-ANALYSIS.md`, 2026-10-22, 632 lines). The plan and
+the code both said the ring credit, the tail and the decaytrace "all assume
+a per-dim `(dim,)` decay vector". The *shape* part is true and trivial; the
+*substance* — "the ring's stored value and the credit's decay no longer
+agree" — **does not survive a numerical check**: the ring's per-step
+`w *= a` **is** the exact survival product for a time-varying, per-sample
+retention (measured max rel dev **0.000e+00**).
+
+The **real** blocker is the **truncation bound**: the ring drops the credit
+beyond lag K because `σ_d^K ≤ 1e-4` for every dim, and a two-sided
+per-sample gate can push the effective retention `a` for *any* dim
+arbitrarily close to 1, so the bound evaporates (at `a = 0.99`, K = 14, the
+ring silently drops **87 %** of the credit mass for that (stream, dim)).
+The hot set, which protects the hot dims, is computed from the **ungated**
+`σ_d` — per-dim and input-independent — which is exactly the invariant a
+two-sided gate destroys.
+
+**And the repo already has an exact credit path with no such bound:** the
+**dense trace** (`trace_mode="dense"`), which is bit-identical to
+ring+tail (`0.00e+00`) and has **no `ring_k`, no hot set, no mask, no
+rebase and no truncation** — so it is exact for *any* per-sample `a`, with
+a one-line broadcast change. The gate gradient needs **no change** at all
+(`gate_trace_update` already handles `(B, dim)` and is pinned against
+autograd and finite differences).
+
+**So the next step is concrete and cheap** (the design's §5.3): ~12 lines
+in `gpu_port.py`, ~35 in `numpy_port.py` (the reference has no dense path),
+~15 to flip `check_gated_recurrence.py`'s refusal assertion into a run
+assertion, ~5 for a `--gated` flag, ~5 for the probe — and, above all, the
+gate that does **not** exist today: `tests/check_gated_credit.py` pinning
+the gated step's **full** gradient (`dembed`, `ddecay`, `dgate`) against
+torch autograd. `check_gate_grad.py` pins the *recurrence*'s gradient and
+never touches the *credit* — and the arm's whole reason for refusing is
+the risk of a plausible-but-wrong credit. **That gate is the deliverable.**
+Memory is the dense bill (`B·256·dim·4` per layer) — the **same** bill the
+P4 ring already pays, since `ring_k` saturates at 256 under the P4 init.
+
 ---
 
 ## 7. Why the last 14 plans did not converge, and what changes
