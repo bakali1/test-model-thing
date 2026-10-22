@@ -977,6 +977,28 @@ class GpuModel:
         if trace_mode not in ("ring", "dense"):
             raise ValueError(f"trace_mode must be 'ring' or 'dense', got "
                              f"{trace_mode!r}")
+        # P3 (gated): the gate makes the retention per-SAMPLE, a = sigmoid(decay
+        # + gate * x_in) of shape (B, dim). The ring's truncation contract is
+        # sigma_d ** ring_k <= RING_TOL for EVERY dim, i.e. it is bounded by a
+        # PER-DIM ceiling on the retention -- and a two-sided gate has no such
+        # ceiling: it can push any dim's effective retention arbitrarily close
+        # to 1, so the bound evaporates and the ring would silently drop most
+        # of that (stream, dim)'s credit mass.
+        #
+        # The DENSE trace has NO ring_k, NO hot set, NO mask, NO rebase and NO
+        # truncation, so it is exact for ANY per-sample retention -- at the
+        # price of the B*256*dim*4 memory bill. So the gated arm runs the
+        # dense trace. (See docs/design/P3-GATE-ANALYSIS.md section 5.1.)
+        #
+        # The DEFAULT engine is untouched: gated=False keeps trace_mode exactly
+        # as asked for, so theta's layout, the numerics and check_parity are
+        # bit-for-bit what they were.
+        if gated and trace_mode == "ring":
+            print("[gated] P3: the gated arm runs the DENSE trace -- the ring's "
+                  "truncation bound assumes a per-dim retention, and a "
+                  "per-sample gate has none (docs/design/P3-GATE-ANALYSIS.md "
+                  "5.1). trace_mode forced to 'dense'.", flush=True)
+            trace_mode = "dense"
         self.trace_mode = trace_mode
         self.dense_E = None
         # gated (P3): the per-dim gate on the recurrence, a = sigmoid(decay +
@@ -1798,62 +1820,59 @@ class GpuModel:
         # hands every byte of the window the SAME teacher distribution. A
         # silently-wrong KD gradient is worse than a refused run, so refuse,
         # before any state has moved.
-        # P3 gated recurrence: REFUSED until the credit machinery is reworked.
+        # P3 gated recurrence: RUNNABLE, on the DENSE trace.
         #
-        # The blocker is architectural, not a missing line. Gating makes the
-        # retention factor input-dependent, a = sigmoid(decay + gate * x), so it
-        # becomes PER-SAMPLE (B, dim) instead of the per-dim (dim,) vector every
-        # consumer assumes:
+        # HISTORY, because the refusal's own comment was misleading and this
+        # is where the record lives.
+        #
+        # The arm used to REFUSE here, and it listed four blockers:
+        #
         #   - _scatter_ring_credit does w.mul_(dec[None, None, :]) at three
         #     sites, including the fused nvrtc/kloop paths, and w is (B, K, dim);
         #   - TorchTail.begin_step takes sig_hot for the hot dims, i.e. a vector;
         #   - the decaytrace recurrence multiplies by dec[None, :];
         #   - ring_k is INFERRED from sigma_max, which stops being a single
         #     number once sigma depends on the input.
-        # Each of those, patched to broadcast a per-sample a, is the kind of
-        # change that yields a plausible-looking gradient that is quietly wrong
-        # -- the failure class this project is organised around avoiding. A
-        # refused run is recoverable; a silently-wrong one is not.
         #
-        # The forward, the gate parameter (created only in this arm, so theta's
-        # layout is unchanged otherwise) and the GATE GRADIENT are
-        # IMPLEMENTED, and the gate gradient is now KNOWN and VERIFIED:
+        # Three of those were BROADCAST changes, and broadcast changes are
+        # arithmetically identical in the ungated case (dec[:, None, :] and
+        # dec[None, None, :] are the same elementwise product). The fourth was
+        # the REAL blocker, and it was not "sigma_max stops being a scalar" --
+        # it was that the ring's truncation contract (sigma_d ** ring_k <=
+        # RING_TOL for EVERY dim) is a PER-DIM CEILING on the retention, and a
+        # two-sided per-sample gate has no such ceiling. With a = 0.99 and
+        # K = 14 the ring silently dropped 87% of that (stream, dim)'s credit
+        # mass. The hot set did not save it either: it is computed from the
+        # decay LOGITS, so it is per-dim and input-independent -- exactly the
+        # invariant a two-sided gate destroys.
         #
-        #   gatetrace_t = a_t*gatetrace_{t-1} + a_t(1-a_t)*x_t*s_{t-1}
-        #   dL/dgate    = sum_t dL/ds_t * gatetrace_t        (readout-only dlds)
+        # THE DENSE TRACE DISSOLVES IT. trace_mode="dense" is the tail with
+        # every dim hot: no ring_k, no hot set, no mask, no rebase, no
+        # truncation -- so it is exact for ANY per-sample retention, and
+        # tests/check_dense_trace.py shows it is BIT-IDENTICAL to ring+tail
+        # (max rel dev 0.00e+00). The gated arm therefore runs the dense
+        # trace: one broadcast change in the decay, and the einsum and the
+        # add were already per-stream. The whole analysis, with the numbers,
+        # is in docs/design/P3-GATE-ANALYSIS.md.
         #
-        # The old formula was a plain sum of the LOCAL effect of a_t on s_t
-        # and it was wrong in two ways at once: it dropped the cross-time
-        # chain (which the decay's decaytrace already carries) and it summed
-        # the wrong axis, so nothing was summed over the batch. The four-way
-        # truth table -- plain/trace x readout-only/total dL/ds_t, measured
-        # against torch autograd -- is in tools/gate_grad_probe.py, and
-        # tests/check_gate_grad.py pins the fixed formula against autograd AND
-        # against a central finite difference of the loss.
+        # WHAT IS STILL NOT CLAIMED. The gate's own gradient was already
+        # implemented and pinned (the traced form, against autograd AND a
+        # central finite difference, by tests/check_gate_grad.py). What the
+        # credit had NEVER been pinned against is the thing the refusal was
+        # really about -- "a plausible-looking gradient that is quietly wrong"
+        # -- so the credit is now pinned by tests/check_gated_credit.py: the
+        # gated step_batch's FULL gradient (dembed, ddecay, dgate) against
+        # torch autograd on the same window, plus the dense-vs-ring
+        # equivalence under a per-sample dec. That gate is the deliverable of
+        # lifting this refusal; without it the refusal was the right call.
         #
-        # So the REFUSAL is now about the CREDIT machinery only, not about the
-        # gradient: the gated arm still cannot run, because the ring credit,
-        # the tail and ring_k's inference all assume a per-dim retention. That
-        # is a separate, larger piece of work, and until it lands the arm
-        # refuses rather than emitting a plausible wrong credit.
-        #
-        # (An earlier version of this comment said the gate gradient was
-        # "finite-difference-pinned in tests/check_gated_recurrence.py". That
-        # was false -- the gate file says the opposite -- and a comment that
-        # contradicts the gate it points at is worse than no comment, because
-        # it is a green light on a known-wrong gradient. The gradient is now
-        # pinned, by tests/check_gate_grad.py, which is the file that says so.)
-        if self.gated:
-            raise NotImplementedError(
-                "gated=True (P3) is not yet runnable: gating makes the retention "
-                "factor per-sample (B, dim), but the ring-credit, tail and "
-                "decaytrace machinery all assume a per-dim (dim,) decay vector, "
-                "and ring_k is inferred from sigma_max which is then not a "
-                "scalar. Reworking that is a separate, deliberate change -- see "
-                "PLAN-2026-10-11-T-AXIS.md P3. Refusing rather than emitting a "
-                "plausible wrong credit. (The gate GRADIENT itself is not the "
-                "blocker any more: it is the traced form, pinned against "
-                "autograd and finite differences by tests/check_gate_grad.py.)")
+        # The gate gradient is the traced form:
+        #     gatetrace_t = a_t*gatetrace_{t-1} + a_t(1-a_t)*x_t*s_{t-1}
+        #     dL/dgate    = sum_t dL/ds_t * gatetrace_t        (readout-only dlds)
+        # where the chain the engine does not have (the states are
+        # stop_gradient) is rebuilt by the trace. Fed the TOTAL state gradient
+        # instead, the trace double counts that chain -- measured in
+        # tools/gate_grad_probe.py.
         if T > 1 and self.distill_alpha > 0.0:
             raise RuntimeError(
                 f"seqlen={T} with distill_alpha={self.distill_alpha}: the KD "
@@ -2174,13 +2193,26 @@ class GpuModel:
                     # rhythm -- and therefore which lag each credit term sits
                     # at -- matches.
                     E = self.dense_E[i]
-                    if self.tail_fused:
+                    # The dense trace's decay broadcast, ndim-GUARDED. `dec` is
+                    # the effective retention a_t the forward returned: (dim,)
+                    # in the ungated arm and (B, dim) in the gated one. The two
+                    # broadcasts are the SAME elementwise product -- dec[None,
+                    # None, :] and dec[:, None, :] differ only in which axis
+                    # the batch lands on -- so the ungated path is
+                    # bit-identical to what it was, and the gated path is the
+                    # per-sample decay the gate actually produced.
+                    dec_b = (dec[:, None, :] if dec.dim() == 2
+                             else dec[None, None, :])
+                    if self.tail_fused and self.tail is not None:
                         # FUSED: decay+credit in one pass over E (1 read).
+                        # The fused kernel indexes the retention per HOT DIM
+                        # (sig[h]), so it cannot serve a per-sample (B, dim)
+                        # retention; the gated arm takes the unfused path.
                         with rf("dense_decay_credit"):
                             dembed += self.tail._fused_credit(E, dlds, dec)
                     else:
                         with rf("dense_decay"):
-                            E.mul_(dec[None, None, :])
+                            E.mul_(dec_b)
                         with rf("dense_credit"):
                             dembed += torch.einsum("bvd,bd->vd", E, dlds)
                     with rf("dense_add"):
@@ -2214,8 +2246,17 @@ class GpuModel:
                     # overwritten at the bottom of this block — which is what
                     # makes the recurrence s_t = a*s_{t-1} + e_t yield
                     # ds_t/ddec = a(1-a)*s_{t-1} + a*ds_{t-1}/ddec exactly.
-                    l.decaytrace = (dec[None, :] * l.decaytrace +
-                                    dec[None, :] * (1.0 - dec[None, :]) * l.states)
+                    #
+                    # The broadcast is ndim-GUARDED: `dec` is (dim,) in the
+                    # ungated arm and (B, dim) in the gated one. dec[None, :]
+                    # on a (B, dim) dec broadcasts to (1, B, dim) -- a SILENT
+                    # wrong-shape multiply that survives the .sum(dim=0) below
+                    # (which then sums an axis of size 1 and keeps a batch axis
+                    # a (dim,) parameter cannot have). This is the same
+                    # broadcast bug the gate gradient once had.
+                    dec_v = dec if dec.dim() == 2 else dec[None, :]
+                    l.decaytrace = (dec_v * l.decaytrace +
+                                    dec_v * (1.0 - dec_v) * l.states)
                     decay_grads[i] += (dlds * l.decaytrace).sum(dim=0)
                     if self.gated:
                         # The GATE's chain, which the plain sum did not have.
@@ -2468,12 +2509,16 @@ class GpuModel:
         for i, l in enumerate(self.layers):
             out[f"state.{i}"] = l.states.detach().cpu().numpy()
             out[f"decaytrace.{i}"] = l.decaytrace.detach().cpu().numpy()
-            # The GATE's trace is NOT persisted: the gated arm refuses to run
-            # today, so the buffer is always zero and there is nothing to
-            # lose. When the per-sample credit plumbing lands, the gate trace
-            # MUST be added here and to load(): a resumed gated run that
+            # The GATE's trace IS persisted now that the gated arm runs. It
+            # used not to be, because the arm refused to run and the buffer
+            # was therefore always zero -- but that was an artefact of the
+            # refusal, not a property of the buffer. A resumed gated run that
             # started the trace at zero would silently lose the chain across
-            # the resume -- i.e. exactly the bug the trace exists to fix.
+            # the resume: exactly the bug the trace exists to fix. The
+            # key is written only in the gated arm, so a default checkpoint's
+            # key set is unchanged.
+            if getattr(l, "gated", False) and getattr(l, "gatetrace", None) is not None:
+                out[f"gate_trace.{i}"] = l.gatetrace.detach().cpu().numpy()
         out["t"] = np.array(self.t, np.int64)
         out["bytes"] = np.array(self.bytes_seen, np.int64)
         # WHERE THE DATA STREAM IS. The trainer restarts the corpus from the
@@ -2626,8 +2671,9 @@ class GpuModel:
         with torch.no_grad():
             for i, l in enumerate(self.layers):
                 for key, attr in ((f"state.{i}", "states"),
-                                  (f"decaytrace.{i}", "decaytrace")):
-                    if key not in d:
+                                  (f"decaytrace.{i}", "decaytrace"),
+                                  (f"gate_trace.{i}", "gatetrace")):
+                    if key not in d or not hasattr(l, attr):
                         continue
                     v = d[key].astype(np.float32)
                     if v.shape[0] != self.B:
@@ -2636,10 +2682,7 @@ class GpuModel:
                         resized[:n] = v[:n]
                         v = resized
                     t = torch.from_numpy(v).to(self.device)
-                    if attr == "states":
-                        l.states.copy_(t)
-                    else:
-                        l.decaytrace.copy_(t)
+                    getattr(l, attr).copy_(t)
         self.tail_state = {}
         if self.tail_enabled:
             for i in range(self.layercount):
@@ -2659,6 +2702,16 @@ class GpuModel:
         for i, l in enumerate(np_model.layers):
             d[f"state.{i}"] = l.states
             d[f"decaytrace.{i}"] = l.decaytrace
+            if getattr(l, "gated", False) and getattr(l, "gatetrace", None) is not None:
+                d[f"gate_trace.{i}"] = l.gatetrace
+        if self.trace_mode == "dense" and self.dense_E is not None:
+            # The dense trace and the trace_mode key, so a dense engine can
+            # load a dense bridge at all: load() REFUSES a checkpoint with no
+            # trace_mode key into a dense engine (absent means ring), and
+            # without the trace a resume would start the credit at zero.
+            for i in range(self.layercount):
+                d[f"dense_E.{i}"] = self.dense_E[i].cpu().numpy()
+            d["trace_mode"] = np.array(0, np.int64)   # 0 == dense
         d["t"] = np.array(np_model.t, np.int64)
         d["bytes"] = np.array(np_model.bytes_seen, np.int64)
         d["m"] = np_model.m

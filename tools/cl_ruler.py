@@ -94,6 +94,9 @@ USAGE
         --ckpt runs/taxis/A_p4_wd0_c.npz --mode probe \
         --gaps 8,32 --n 2048 --alphabet 16 --out cl_ruler.json
     .venv/bin/python tools/cl_ruler.py --selftest
+    .venv/bin/python tools/cl_ruler.py --resummarize cl_ruler.json --out x.json
+        # re-derive the top-level verdicts of a stored run with THIS code
+        # (deterministic: it re-reads the stored numbers, it measures nothing)
 """
 from __future__ import annotations
 

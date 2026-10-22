@@ -210,10 +210,29 @@ class Model:
     def __init__(self, dim=512, layers=16, temp=0.75, lr=5e-4, decay_init=None,
                  half_life_init=None,
                  grad_clip=0.0, nan_guard=True, wd_decay=0.01, gated=False,
-                 fsp=False):
+                 fsp=False, trace_mode="ring"):
         self.dim = dim
         self.layercount = layers
         self.gated = bool(gated)
+        # trace_mode: "ring" (the incumbent: K-lag ring + the tail's exact EMA
+        # for the hot dims) or "dense" (the exact (B, 256, dim) eligibility
+        # trace per layer -- the tail with EVERY dim hot: no ring_k, no hot
+        # set, no mask, no rebase, no truncation).
+        #
+        # The gated (P3) arm is FORCED onto the dense trace, for the same
+        # reason gpu_port does it (see gpu_port.GpuModel.__init__ and
+        # docs/design/P3-GATE-ANALYSIS.md 5.1): the ring's truncation
+        # contract is a per-dim ceiling on the retention, and a per-sample
+        # gate has none. The reference MUST mirror the shipped engine here,
+        # or the parity gate would be comparing two different credit paths.
+        if trace_mode not in ("ring", "dense"):
+            raise ValueError(f"trace_mode must be 'ring' or 'dense', got "
+                             f"{trace_mode!r}")
+        if self.gated and trace_mode == "ring":
+            print("[gated] P3: the gated arm runs the DENSE trace (the ring's "
+                  "truncation bound assumes a per-dim retention).", flush=True)
+            trace_mode = "dense"
+        self.trace_mode = trace_mode
         self.temp = temp
         self.lr = F(lr)
         self.b1, self.b2, self.eps, self.wd = F(0.9), F(0.999), F(1e-8), F(0.01)
@@ -352,7 +371,23 @@ class Model:
         # one-hot selector, only needed by the BLAS fallback (unused with numba)
         self.ring_M = (np.zeros((256, B * self.ring_k), F)
                        if _scatter_credit is None else None)
-        self.ring_vals = np.zeros((B, self.ring_k, self.dim), F)   # scratch, no per-step alloc
+        # On the dense path the ring is not used at all: the exact (B,256,dim)
+        # trace replaces it, and the ring's buffer and scratch are allocated
+        # EMPTY (width 0) rather than not at all, so the code that touches
+        # them stays valid and costs no memory.
+        dense = (self.trace_mode == "dense")
+        self.ring_vals = np.zeros((B, 0 if dense else self.ring_k,
+                                   self.dim), F)   # scratch, no per-step alloc
+        # The DENSE trace: the exact per-byte-id embedding eligibility trace,
+        # one (B, 256, dim) buffer per layer. This is the tail with every dim
+        # hot (tail_credit.py maintains the same object for the dims whose
+        # sigma**ring_k would drop more than 1% of the credit mass), so the
+        # dense path is not a new mechanism -- it is the approximation removed.
+        if dense:
+            self.dense_E = [np.zeros((B, 256, self.dim), F)
+                            for _ in self.layers]
+        else:
+            self.dense_E = None
         for l in self.layers:
             l.states = np.zeros((B, self.dim), F)
             l.decaytrace = np.zeros((B, self.dim), F)
@@ -363,7 +398,8 @@ class Model:
             # have.
             if getattr(l, "gated", False):
                 l.gatetrace = np.zeros((B, self.dim), F)
-            l.ring_w = np.zeros((B, self.ring_k, self.dim), F)
+            l.ring_w = np.zeros((B, 0 if dense else self.ring_k,
+                                 self.dim), F)
 
     # ---------- tail credit (exact long-lag embed credit) ----------
     def _ensure_tail(self):
@@ -371,6 +407,12 @@ class Model:
         hot-dim membership against the current decay. Idempotent; a no-op by
         default but ~microseconds once the tail matches B."""
         if not getattr(self, "tail_enabled", False):
+            return
+        if self.trace_mode == "dense":
+            # The dense trace REPLACES the tail: it is the tail with every dim
+            # hot, so the tail's accumulator would be allocated and then never
+            # read. Mirrors gpu_port._ensure_tail exactly.
+            self.tail = None
             return
         if self.tail is None or self.tail.B != self.B:
             self.tail = TailCredit(self.B, self.ring_k,
@@ -399,6 +441,10 @@ class Model:
             if getattr(l, "gated", False):
                 l.gatetrace[:] = 0
             l.ring_w[:] = 0
+        if getattr(self, "trace_mode", "ring") == "dense" and \
+                getattr(self, "dense_E", None) is not None:
+            for E in self.dense_E:
+                E[:] = 0
 
     def count(self):
         per_layer = self.dim * self.dim + 3 * self.dim
@@ -432,31 +478,28 @@ class Model:
     # ---------- training (B streams in lockstep) ----------
     def step_batch(self, cs, ns, ends):
         """cs, ns, ends: lists of length B. One AdamW update for B byte-steps."""
-        # P3 gated recurrence: REFUSED, exactly as gpu_port refuses it, and for
-        # the same reason. Gating makes the retention factor per-sample
-        # (B, dim), while the ring credit, the tail and the ring_k inference
-        # all assume a per-dim (dim,) vector. That is a separate, larger piece
-        # of work; until it lands, refusing is the honest answer.
+        # P3 gated recurrence: RUNNABLE, on the DENSE trace.
         #
-        # What is NOT missing is the gradient: the gate gradient is implemented
-        # below and in gate_gradient() above, in the traced form, and
-        # tests/check_gate_grad.py pins it against torch autograd and against
-        # a central finite difference -- and pins this file's copy against
-        # gpu_port's, element by element.
+        # This refusal is lifted in lockstep with gpu_port's, and for exactly
+        # the same reason: the DENSE trace (trace_mode="dense") has no ring_k,
+        # no hot set, no mask, no rebase and no truncation, so it is exact for
+        # ANY per-sample retention -- including the gate's (B, dim) a -- and
+        # the ring's truncation contract (a per-dim ceiling on the retention)
+        # was the ONLY real blocker. See gpu_port.py's comment at the same
+        # place and docs/design/P3-GATE-ANALYSIS.md 5.1.
         #
-        # The refusal comes FIRST, before self.t += 1, so that a refused call
-        # leaves theta, the moments and the step counter exactly as they were.
-        if self.gated:
-            raise NotImplementedError(
-                "gated=True (P3) is not yet runnable: gating makes the retention "
-                "factor per-sample (B, dim), but the ring-credit, tail and "
-                "decaytrace machinery all assume a per-dim (dim,) decay vector, "
-                "and ring_k is inferred from sigma_max which is then not a "
-                "scalar. Reworking that is a separate, deliberate change -- see "
-                "PLAN-2026-10-11-T-AXIS.md P3. Refusing rather than emitting a "
-                "plausible wrong credit. (The gate GRADIENT itself is not the "
-                "blocker any more: it is the traced form, pinned against "
-                "autograd and finite differences by tests/check_gate_grad.py.)")
+        # What was never missing is the gradient: the gate gradient is
+        # implemented below and in gate_gradient() above, in the traced form,
+        # and tests/check_gate_grad.py pins it against torch autograd and
+        # against a central finite difference -- and pins this file's copy
+        # against gpu_port's, element by element. The CREDIT is pinned by
+        # tests/check_gated_credit.py (the gated step_batch's full gradient
+        # against autograd, and the dense-vs-ring equivalence under a
+        # per-sample dec).
+        #
+        # The refusal used to come FIRST, before self.t += 1, so that a
+        # refused call left theta, the moments and the step counter exactly
+        # as they were. There is nothing to refuse any more.
         self.t += 1
         B = len(cs)
         self.bytes_seen += B
@@ -553,46 +596,72 @@ class Model:
             M[self.ring_rows, np.arange(B * K)] = 1.0
         for i, l in enumerate(self.layers):
             dlds = lgrads[i]                             # (B, dim)
-            w = l.ring_w                                 # (B, K, dim) lag weights
-            # main.py credits the trace to the FULL (256, dim) embedding matrix:
-            #   grads["encoder"]["embed"]["weight"] += dlds * (embedtrace * decay)
-            # using the pre-update trace. Reading only row c_b drops the temporal
-            # credit for every byte except the current one (and double-counts it).
-            #
-            # The (B,256,dim) bookkeeping is memory-bound (~117 MB moved per layer
-            # per step), so: compute the decayed trace ONCE and reuse it for both
-            # the credit and the update (it used to be computed twice), sum across
-            # streams with einsum (bit-identical to the broadcast+sum it replaces,
-            # but without materialising a (B,256,dim) product), and add this byte's
-            # one-hot in place instead of building a (B,256,1) array.
-            # decay first: the dense credit uses (T_{t-1} * decay_t), not T_{t-1}
-            w *= decays[i]
-            # Fused mode folds begin_step's decay into credit(); skip it and
-            # pass the per-hot-dim sigma to credit instead.
-            sig_hot = None
-            if self.tail is not None and self.tail.nhot(i):
-                if self.tail.fused:
-                    sig_hot = decays[i][self.tail.cols_of(i)]
+            dec = decays[i]
+            if self.trace_mode == "dense":
+                # ---- the DENSE trace: the exact (B, 256, dim) eligibility
+                # trace, one per layer. This is tail_credit.py with EVERY dim
+                # hot: begin_step -> E *= sigma, credit -> dEmb += sum_b
+                # E[b,v,:]*dlds[b,:], add_byte -> E[b, c_b, :] += 1.0 -- the
+                # same three operations, the same order, so the rhythm (and
+                # therefore which lag each credit term sits at) matches.
+                #
+                # The decay broadcast is ndim-GUARDED: `dec` is (dim,) in the
+                # ungated arm and (B, dim) in the gated one, and the two
+                # broadcasts are the SAME elementwise product.
+                E = self.dense_E[i]
+                if dec.ndim == 2:
+                    E *= dec[:, None, :]
                 else:
-                    self.tail.begin_step(i, decays[i][self.tail.cols_of(i)])
-            np.multiply(w, dlds[:, None, :], out=scratch)
-            if self.tail is not None and self.tail.nhot(i):
-                # ring skips hot dims (their credit would be truncated); the
-                # tail EMA covers them exactly at every lag
-                scratch[:, :, self.tail.mask(i)] = 0.0
-                tailc = self.tail.credit(i, dlds, sig_hot)
-                if tailc is not None:
-                    np.add.at(dembed, (slice(None), self.tail.cols_of(i)), tailc)
-            sv = scratch.reshape(B * K, self.dim)
-            if _scatter_credit is not None:
-                _scatter_credit(dembed, self.ring_rows, sv)
+                    E *= dec[None, None, :]
+                dembed += np.einsum("bvd,bd->vd", E, dlds)
+                E[np.arange(B), c_arr, :] += 1.0
             else:
-                np.add(dembed, M @ sv, out=dembed)
-            w[:, p] = 1.0        # this byte becomes lag 1 (empty product = 1)
-            if self.tail is not None and self.tail.nhot(i):
-                self.tail.add_byte(i, c_arr)
-            l.decaytrace = (decays[i][None, :] * l.decaytrace +
-                            decays[i][None, :] * (1.0 - decays[i][None, :]) * l.states)
+                w = l.ring_w                                 # (B, K, dim) lag weights
+                # main.py credits the trace to the FULL (256, dim) embedding matrix:
+                #   grads["encoder"]["embed"]["weight"] += dlds * (embedtrace * decay)
+                # using the pre-update trace. Reading only row c_b drops the temporal
+                # credit for every byte except the current one (and double-counts it).
+                #
+                # The (B,256,dim) bookkeeping is memory-bound (~117 MB moved per layer
+                # per step), so: compute the decayed trace ONCE and reuse it for both
+                # the credit and the update (it used to be computed twice), sum across
+                # streams with einsum (bit-identical to the broadcast+sum it replaces,
+                # but without materialising a (B,256,dim) product), and add this byte's
+                # one-hot in place instead of building a (B,256,1) array.
+                # decay first: the dense credit uses (T_{t-1} * decay_t), not T_{t-1}
+                w *= dec
+                # Fused mode folds begin_step's decay into credit(); skip it and
+                # pass the per-hot-dim sigma to credit instead.
+                sig_hot = None
+                if self.tail is not None and self.tail.nhot(i):
+                    if self.tail.fused:
+                        sig_hot = dec[self.tail.cols_of(i)]
+                    else:
+                        self.tail.begin_step(i, dec[self.tail.cols_of(i)])
+                np.multiply(w, dlds[:, None, :], out=scratch)
+                if self.tail is not None and self.tail.nhot(i):
+                    # ring skips hot dims (their credit would be truncated); the
+                    # tail EMA covers them exactly at every lag
+                    scratch[:, :, self.tail.mask(i)] = 0.0
+                    tailc = self.tail.credit(i, dlds, sig_hot)
+                    if tailc is not None:
+                        np.add.at(dembed, (slice(None), self.tail.cols_of(i)), tailc)
+                sv = scratch.reshape(B * K, self.dim)
+                if _scatter_credit is not None:
+                    _scatter_credit(dembed, self.ring_rows, sv)
+                else:
+                    np.add(dembed, M @ sv, out=dembed)
+                w[:, p] = 1.0        # this byte becomes lag 1 (empty product = 1)
+                if self.tail is not None and self.tail.nhot(i):
+                    self.tail.add_byte(i, c_arr)
+            # The decaytrace's broadcast is ndim-GUARDED, for the same reason:
+            # dec[None, :] on a (B, dim) dec would broadcast to (1, B, dim) --
+            # a SILENT wrong-shape multiply that survives the .sum(axis=0)
+            # below (which then sums an axis of size 1). Arithmetically
+            # identical in the ungated case.
+            dec_v = dec if dec.ndim == 2 else dec[None, :]
+            l.decaytrace = (dec_v * l.decaytrace +
+                            dec_v * (1.0 - dec_v) * l.states)
             decay_grads.append((dlds * l.decaytrace).sum(axis=0))
             if self.gated:
                 # The GATE's chain, which the plain sum did not have -- the
@@ -676,11 +745,22 @@ class Model:
         for i, l in enumerate(self.layers):
             data[f"state.{i}"] = l.states
             data[f"decaytrace.{i}"] = l.decaytrace
-            # The GATE's trace is NOT persisted (see gpu_port.params_dict):
-            # the gated arm refuses to run today, so the buffer is always
-            # zero. It must be added here when the per-sample credit
-            # plumbing lands, or a resumed gated run would silently lose the
-            # chain across the resume.
+            # The GATE's trace IS persisted now that the gated arm runs. It
+            # used not to be, because the arm refused to run and the buffer
+            # was therefore always zero -- an artefact of the refusal, not a
+            # property of the buffer. A resumed gated run that started the
+            # trace at zero would silently lose the chain across the resume,
+            # which is exactly the bug the trace exists to fix.
+            if getattr(l, "gated", False) and getattr(l, "gatetrace", None) is not None:
+                data[f"gate_trace.{i}"] = l.gatetrace
+        if getattr(self, "trace_mode", "ring") == "dense" and \
+                getattr(self, "dense_E", None) is not None:
+            # The exact trace, exactly as the ring persisted ring_w: without
+            # it a resumed run would start the trace at zero and quietly lose
+            # the credit of every byte written before the resume.
+            for i in range(self.layercount):
+                data[f"dense_E.{i}"] = self.dense_E[i]
+            data["trace_mode"] = np.array(0, np.int64)   # 0 == dense
         data["t"] = np.array(self.t, np.int64)
         data["bytes"] = np.array(self.bytes_seen, np.int64)
         # The DATA STREAM's position, so a resume continues the corpus
@@ -759,8 +839,9 @@ class Model:
         # preserved; extra streams are zero-padded.
         for i, l in enumerate(self.layers):
             for key, attr in ((f"state.{i}", "states"),
-                              (f"decaytrace.{i}", "decaytrace")):
-                if key not in d:
+                              (f"decaytrace.{i}", "decaytrace"),
+                              (f"gate_trace.{i}", "gatetrace")):
+                if key not in d or not hasattr(l, attr):
                     continue
                 v = d[key].astype(F)
                 if v.shape[0] != self.B:
@@ -769,6 +850,20 @@ class Model:
                     resized[:n] = v[:n]
                     v = resized
                 setattr(l, attr, v)
+        # the dense trace (the exact (B,256,dim) eligibility trace)
+        if getattr(self, "trace_mode", "ring") == "dense" and \
+                getattr(self, "dense_E", None) is not None:
+            for i in range(self.layercount):
+                k = f"dense_E.{i}"
+                if k not in d:
+                    continue
+                E = d[k].astype(F)
+                if E.shape[0] != self.B:
+                    r = np.zeros((self.B, 256, self.dim), F)
+                    n = min(self.B, E.shape[0])
+                    r[:n] = E[:n]
+                    E = r
+                self.dense_E[i][:] = E
 
         # tail-credit state (exact long-lag embed credit); handed to a freshly
         # created tail in _ensure_tail (B is adapted there like the state rows)
@@ -782,7 +877,9 @@ class Model:
 
         if self.layers:
             sigs = [sigmoid(l.decay) for l in self.layers]
-            if self.tail_enabled:
+            if self.tail_enabled and self.trace_mode != "dense":
+                # (on the dense path there is no truncation to warn about:
+                #  the exact trace keeps every lag.)
                 hot = np.concatenate([s[s ** self.ring_k > HOT_FRAC] for s in sigs])
                 if hot.size:
                     print(f"[tail] {hot.size} hot dim(s) get exact embed credit "

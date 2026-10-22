@@ -3,18 +3,19 @@
 
 WHAT THIS GATE DOES, PLAINLY
 ----------------------------
-The engine's gated `step_batch` still REFUSES to run: gating makes the
-retention factor per-sample (B, dim), while the ring credit, the tail and
-ring_k's inference all assume a per-dim (dim,) vector. That is a separate,
-larger piece of work (see PLAN-2026-10-11-T-AXIS.md P3) and the refusal
-stands.
+The engine's gated `step_batch` RUNS (on the dense trace -- see
+docs/design/P3-GATE-ANALYSIS.md 5.1). This gate still does NOT run a full
+training step: it tests the GRADIENT FORMULA on the recurrence directly --
+and it does so through the engine's OWN function, `gpu_port.gate_gradient`,
+the one `step_batch` calls, so what is pinned is the shipped code and not a
+re-derivation of it. The last section asserts that the arm runs, so the file
+cannot be read as claiming more than it checks.
 
-So this gate does NOT run a full training step. It tests the GRADIENT FORMULA
-on the recurrence directly -- and it does so through the engine's OWN
-function, `gpu_port.gate_gradient`, the one `step_batch` calls, so what is
-pinned is the shipped code and not a re-derivation of it. The last section
-re-asserts the refusal, so the file cannot be read as claiming more than it
-checks.
+The CREDIT -- the part the gated step_batch's embedding gradient depends on,
+and the part that used to be unpinned -- is a SEPARATE gate:
+tests/check_gated_credit.py compares the gated step_batch's full gradient
+against torch autograd, and the dense trace's exactness under a per-sample
+retention.
 
 THE MECHANISM (now known, and measured -- tools/gate_grad_probe.py)
 --------------------------------------------------------------------
@@ -56,7 +57,8 @@ WHAT IS PINNED HERE
       (numpy_port is the reference implementation of the engine, and
       check_parity.py compares the two engines element by element);
   (d) the per-dim and per-sample retention both work in the trace;
-  (e) the engine's gated step_batch still refuses, before anything moves.
+  (e) the engine's gated step_batch RUNS (the refusal is lifted; the credit
+      it needed is pinned by tests/check_gated_credit.py).
 """
 import os
 import sys
@@ -380,20 +382,17 @@ def main():
           float(np.abs(g3 - g1.numpy()).max()) == 0.0,
           f"max abs diff {float(np.abs(g3 - g1.numpy()).max()):.3e}")
 
-    # ---- the arm still refuses, before anything moves --------------------
-    print("\nthe gated ARM still refuses (the credit machinery, not the "
-          "gradient)")
+    # ---- the arm runs, on the dense trace -------------------------------
+    print("\nthe gated ARM runs (the credit machinery, not the gradient, was "
+          "the blocker)")
     snap = (m.theta.detach().clone(), m.m.detach().clone(), m.t)
-    try:
-        m.new_states(B)
-        m.step_batch(cs, ns, torch.zeros((B, T), dtype=torch.float32))
-        check("gated step_batch refuses", False, "it ran")
-    except NotImplementedError as e:
-        check("gated step_batch refuses", True,
-              str(e).split(":", 1)[1].strip()[:58] + "...")
-    check("the refusal fires before theta, moments or t move",
-          torch.equal(snap[0], m.theta.detach())
-          and torch.equal(snap[1], m.m.detach()) and m.t == snap[2])
+    m.new_states(B)
+    m.step_batch(cs, ns, torch.zeros((B, T), dtype=torch.float32))
+    check("gated step_batch runs", m.t == 1,
+          f"trace_mode={m.trace_mode!r}")
+    check("and it moved theta, moments and the step counter",
+          not torch.equal(snap[0], m.theta.detach())
+          and not torch.equal(snap[1], m.m.detach()) and m.t == snap[2] + 1)
 
     print("\n" + ("P3 GATE (gradient): PASS" if PASS
                   else "P3 GATE (gradient): FAIL"))

@@ -4,12 +4,13 @@
 P3 adds a per-dim gate on the recurrence: a = sigmoid(decay + gate * x),
 s = a*s + x.
 
-STATUS: the gated arm is implemented but REFUSES at step_batch, because gating
-makes the retention factor per-sample (B, dim) while the ring-credit, tail and
-decaytrace machinery all assume a per-dim (dim,) vector, and ring_k is inferred
-from sigma_max which then is not a scalar. Until that rework lands the arm
-cannot run, so this gate deliberately pins ONLY the claims that hold without
-it, and asserts the refusal.
+STATUS: the gated arm is IMPLEMENTED and RUNNABLE. It runs on the DENSE
+trace (trace_mode="dense"), because the ring's truncation contract --
+sigma_d ** ring_k <= RING_TOL for every dim -- is a per-dim CEILING on the
+retention, and a two-sided per-sample gate has no such ceiling. The dense
+trace has no ring_k, no hot set, no mask, no rebase and no truncation, so it
+is exact for ANY per-sample retention. See docs/design/P3-GATE-ANALYSIS.md
+5.1.
 
 WHAT IS VERIFIED HERE
   (a) gate=0 is bit-identical to the incumbent -- parameters, and the recurrence
@@ -19,8 +20,8 @@ WHAT IS VERIFIED HERE
       and is elementwise (layers*dim, not a matmul). Its absence from the
       default engine is what keeps theta's layout -- and check_parity's
       numpy==torch identity -- intact.
-  (c) the gate has real authority over the loss, and the arm refuses BEFORE any
-      state moves.
+  (c) the gate has real authority over the loss, and the arm RUNS (the refusal
+      is lifted; the credit it needed is pinned by tests/check_gated_credit.py).
 
 THE GATE GRADIENT: KNOWN NOW, AND PINNED ELSEWHERE
   This file used to say the gate gradient was UNKNOWN and that the missing
@@ -56,10 +57,10 @@ THE GATE GRADIENT: KNOWN NOW, AND PINNED ELSEWHERE
   tests/check_gate_grad.py. That file is the one to read for the gradient;
   this one keeps the claims that are about the ARM, and the refusal.
 
-  What is still NOT claimed here: that the gated arm can RUN. It cannot, and
-  the blocker is the per-sample CREDIT machinery (the ring credit, the tail
-  and ring_k's inference), not the gradient. That is a separate, larger piece
-  of work -- PLAN-2026-10-11-T-AXIS.md P3.
+  What is NOT claimed here: that the CREDIT is right. It is a separate gate --
+  tests/check_gated_credit.py -- which pins the gated step_batch's FULL
+  gradient (dembed, ddecay, dgate) against torch autograd, and the dense
+  trace's exactness under a per-sample retention.
 
 The plan wrote the update as s = a*s + (1-a)*x. That form cannot satisfy (a):
 (1-a) is not 1.0, so gate=0 would still not reproduce the incumbent and the
@@ -199,19 +200,19 @@ def main():
     check("gate is elementwise, not a matmul", n_gate == LAYERS * DIM,
           f"{n_gate} params == {LAYERS}*{DIM}")
 
-    # ---- (c) the arm refuses, before any state moves --------------------
-    print("\n(c) the gated ARM refuses rather than emitting a wrong credit")
+    # ---- (c) the arm RUNS, on the dense trace ---------------------------
+    print("\n(c) the gated ARM RUNS (on the dense trace)")
     snap = (a.theta.detach().clone(), a.m.detach().clone(), a.t)
-    try:
-        a.new_states(B)
-        a.step_batch(cs, ns, ends)
-        check("gated step_batch refuses", False, "it ran")
-    except NotImplementedError as e:
-        check("gated step_batch refuses", True,
-              str(e).split(":", 1)[1].strip()[:58] + "...")
-    check("the refusal fires before theta, moments or t move",
-          torch.equal(snap[0], a.theta.detach())
-          and torch.equal(snap[1], a.m.detach()) and a.t == snap[2])
+    a.new_states(B)
+    a.step_batch(cs, ns, ends)
+    check("the gated step_batch runs", a.t == 1,
+          "the refusal is lifted: the dense trace has no ring_k, no hot set, "
+          "no mask and no truncation, so it is exact for a per-sample "
+          "retention (docs/design/P3-GATE-ANALYSIS.md 5.1)")
+    check("and it actually updated theta",
+          not torch.equal(snap[0], a.theta.detach()))
+    check("the gated arm runs the dense trace", a.trace_mode == "dense",
+          f"trace_mode={a.trace_mode!r}")
 
     # ---- (d) the gate has real authority over the loss ------------------
     print("\n(d) the gate has real authority over the loss")

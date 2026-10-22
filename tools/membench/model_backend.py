@@ -53,10 +53,21 @@ CHANCE_CE_NATS = math.log(G.VOCAB)                        # ln 256
 # new_states, so a fresh stream is scored rather than a stream's surviving
 # training state)
 # ---------------------------------------------------------------------------
-def load_frozen(ckpt):
+def load_frozen(ckpt, gated=False):
     """Load a frozen numpy_port checkpoint into a Model that starts at zero
     state.  Returns (model, info) where info carries the architecture and
-    decay statistics used to state the estimator convention."""
+    decay statistics used to state the estimator convention.
+
+    `gated=True` builds the model with the P3 gate parameter present, so a
+    GATED checkpoint (one whose theta carries a `layer{i}.gate` vector) can
+    be scored: the parameter LAYOUT has to match the checkpoint's, or the
+    load would silently drop the gate (or the load would refuse on the
+    parameter count -- numpy_port.Model.load compares the m/v lengths, so a
+    mismatch is an error, not a silent truncation).  With gated=True the
+    model also runs the DENSE trace, which is the credit path the gated arm
+    needs; the frozen forward does not use the credit at all, so this only
+    affects the memory bill (B*256*dim*4 per layer).
+    """
     d = np.load(ckpt)
     dim = int(d["Wd"].shape[1])
     layers = sum(1 for k in d.files if k.startswith("layer") and k.endswith(".W"))
@@ -66,7 +77,8 @@ def load_frozen(ckpt):
     # runs the auxiliary loss) -- it only has to be present, in the same
     # order, so the parameter vector lines up.
     fsp = ("fsp.W" in d.files)
-    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4, fsp=fsp)
+    m = N.Model(dim=dim, layers=layers, temp=0.75, lr=5e-4, fsp=fsp,
+                gated=bool(gated))
     m.new_states(1)
     m.load(ckpt)                       # honours the checkpoint's ring_k
     m.new_states(1)                    # zero memory: score the weights

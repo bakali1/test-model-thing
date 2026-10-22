@@ -883,6 +883,21 @@ def main():
                          "--half-max 512 actually be reachable. Cost: "
                          "B*256*dim*4 bytes per layer. Cannot resume a ring "
                          "checkpoint.")
+    ap.add_argument("--gated", action="store_true",
+                    help="P3: the gated recurrence. Adds a per-dim gate on the "
+                         "retention, a = sigmoid(decay + gate * x_in), so the "
+                         "retention becomes PER-SAMPLE (B, dim) and "
+                         "content-adaptive. The gate starts at exactly 0, so "
+                         "the arm's starting point is bit-identical to the "
+                         "incumbent and an incumbent checkpoint can be "
+                         "resumed into it as its own control. The arm runs on "
+                         "the DENSE trace (the ring's truncation bound assumes "
+                         "a per-dim retention, and a per-sample gate has no "
+                         "such ceiling -- docs/design/P3-GATE-ANALYSIS.md "
+                         "5.1), so it costs B*256*dim*4 bytes per layer and "
+                         "cannot run at B=1024 on a 4 GB card. The credit is "
+                         "pinned against autograd by "
+                         "tests/check_gated_credit.py.")
     ap.add_argument("--half-max", type=float, default=None,
                     help="P4: log-spaced half-life init, upper end in BYTES. "
                          "Needs --half-min. The SET of half-lives is geometric "
@@ -1052,7 +1067,7 @@ def main():
                 grad_clip=args.grad_clip,
                 nan_guard=not args.no_nan_guard,
                 wd_decay=args.wd_decay,
-                gated=False)
+                gated=args.gated)
     if args.grad_clip > 0.0:
         print(f"  [clip] global L2 grad clip at {args.grad_clip} (absolute "
               f"gradient units -- NOT comparable across --seqlen values)")

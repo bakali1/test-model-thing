@@ -84,6 +84,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -149,7 +150,7 @@ class TextPool:
         chunks = []
         for f in files:
             with open(f, "rb") as fh:
-                chunks.append(fh.read())
+                chunks.append(np.frombuffer(fh.read(), dtype=np.uint8))
         if not chunks:
             raise SystemExit("no text files for the background")
         self.data = np.concatenate(chunks)
@@ -190,9 +191,9 @@ def build_fact_batch(B, board, alpha, text_pool, text_frac, d, rng,
     """One batch of fact streams.  Returns the sequence and the labels."""
     lay = sample_layout(n_facts, d)
     L = lay["length"]
-    idx = rng.integers(0, board["keys"].shape[0], size=B)
-    keys = board["keys"][idx]
-    pays = board["payloads"][idx]
+    idx = rng.integers(0, board["keys"].shape[0], size=(B, n_facts))
+    keys = board["keys"][idx]  # (B, n_facts, KEY_LEN)
+    pays = board["payloads"][idx]  # (B, n_facts, PAYLOAD_LEN)
     seq = np.empty((B, L), np.uint8)
     facts = np.concatenate([keys, pays], axis=2)          # (B, N, 8)
     seq[:, lay["facts0"]:lay["gap0"]] = facts.reshape(B, -1)
