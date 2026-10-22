@@ -4516,3 +4516,52 @@ torch path is. The parity gate's tolerance absorbs that; the fused path
 simply exposed it. That is the gate doing its job, not the fusion being
 wrong — but "the fusion is closer" is a claim that has to be PROVED, and
 until it is, the default stays off.
+
+### 12. The CL-RULER: the criterion exists, and its first numbers are in
+
+`tools/cl_ruler.py` is the instrument the programme lacked: the three
+numbers of the plan's §1 — **ACQUIRE** (are the new facts recalled),
+**RETAIN** (are the old ones still recalled), **NO REGRESSION** (has the
+general held-out CE moved) — with the discipline the rest of this file
+insists on: every cell carries its own matched null, a nuisance control
+(target provably absent from the state) and a class-coverage figure, and a
+cell that does not beat its own null is `UNMEASURED` or `NULL`, never
+`PASS`. The state is read **at the cue** (the D4 padding bug avoided, by
+using the fixed-length generator), the readout is the FIXED `_ridge_score`,
+and the payload uses a **matched alphabet**.
+
+**Its selftest passes** and independently re-confirms the D4 fingerprint:
+changing the bytes after the cue moves the features at the cue by **0**,
+while the padded read differs by 6.44 — the bug is real in the old path.
+
+**First numbers** (P4 checkpoint `runs/taxis/A_p4_wd0_c.npz`, n=2048,
+alphabet 16, 64 facts in the stream, 524 B/sequence, gap 8):
+
+| cell | per_byte | null | verdict |
+|---|---:|---:|---|
+| **acquire** (lag 8) | **16.04 % ± 1.15 %** | 6.37 % | **SIGNAL** (2.5× null) |
+| retain_pre (lag 512) | 6.54 % | 6.49 % | NULL |
+| retain_post (lag 512) | 6.23 % | 6.84 % | NULL |
+| nuisance_acquire | 6.47 % | 6.27 % | NULL ✓ |
+| nuisance_retain_pre / _post | 6.88 % / 6.15 % | 6.84 % / 6.57 % | NULL ✓ |
+
+**ACQUIRE is SIGNAL at 2.5× its own null**, and every nuisance control sits
+at its null — so the readout is not inventing signal. But this is a
+**DIAGNOSTIC**, not the goal: the checkpoint is FROZEN and the facts were
+never in the loss, so nothing was learned. The goal needs `--mode train`,
+which the tool correctly REFUSES to run, naming what is missing.
+
+**And the instrument exposed a design bug in the criterion itself, which is
+worth recording.** The RETAIN cell was scored at **lag 512**, and the D5
+run established that the payload is decodable to ~128 B and gone by ~132 B.
+So the RETAIN probe was placed **out of reach of the very thing it is
+measuring**, and it came out UNMEASURED by construction — not because the
+model forgot, but because the probe looked where nothing can reach. The
+rule for every future use: **the RETAIN lag must be inside the horizon the
+state actually has**, or the cell is meaningless. (This is the same class
+of error as the n-gram comparison that was not byte-matched: the number
+looked fine and measured the wrong thing.)
+
+**Timing, for planning.** The n=2048 forward took **3247.8 s** (54 min) and
+the ridge 357.1 s, i.e. **3605 s for one gap**. The forward dominates and
+is a pure-numpy loop over timesteps x 16 layers. Iteration must use n=512.
