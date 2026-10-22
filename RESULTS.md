@@ -4990,3 +4990,90 @@ checkpoint already stores them (`cl2_facts`, `cl2_gap`, `cl2_alphabet`), so
 the ruler should read them from the checkpoint by default.** This is the same
 class of bug as the earlier lag-536 mistake: a tool default that does not
 match the trained model's regime.
+
+### 18. WHY THE MODEL PUT THE MEMORY IN THE HEAD: THE STATE IS TOO SMALL. (a capacity budget)
+
+§17 established that the payload is **not** in the recurrent state: the state
+carries the cue key and the key->payload association lives in the head's
+weights. Two explanations need different fixes — **(E1) the optimiser
+preferred the cheaper path** (the state route is possible but harder), or
+**(E2) the state is architecturally too small** (the head was the only
+option). `tools/state_capacity_budget.py` prices (E2).
+
+**The budget.** The memory head is a **linear** map (`state @ Wm + bm` ->
+4x256 logits), so ONE linear map must decode, for every fact it is to
+recall, an ADDRESS (which fact) and a PAYLOAD (what it is), in subspaces
+that are linearly separable:
+
+* the **address** needs >= 1 dim per slot (linearly independent codes);
+* each **payload byte** is decoded 256-way, so its 16 symbols must be
+  linearly separable: >= `log2(alphabet)` = 4 dims per byte with an optimal
+  (hypercube) coding, or 16 dims per byte with the natural one-hot coding;
+* the state has `layers x dim` = 16 x 512 = **8192 scalars**.
+
+**The numbers.**
+
+| facts to hold | coding | dims needed | have | short by |
+|---|---|---:|---:|---:|
+| 512 (one board) | optimal | 8 704 | 8 192 | **1.06x** |
+| 1024 (two boards) | optimal | 17 408 | 8 192 | **2.12x** |
+| 512 (one board) | one-hot | 33 280 | 8 192 | **4.06x** |
+| 1024 (two boards) | one-hot | 66 560 | 8 192 | **8.12x** |
+
+**Either way the state is too small — even for ONE board of 512 facts.**
+The size needed: `dim >= 544` (optimal) or `dim >= 2080` (one-hot) for one
+board; `dim >= 1088` or `dim >= 4160` for two. At dim 512 / 16 layers a
+linear-readable store holds about **481 facts**, and the arm's board was
+**512 per board** — 1.1x over budget for one board and 2.1x for two.
+
+**AND THIS EXPLAINS D5, WHICH WAS THE STRONGEST CLUE IN THE PROGRAMME.**
+D5 measured "the state holds an ADDRESSABLE, PERSISTENT ADDRESS, and a
+DECAYING BUT REAL CONTENT", and the programme read that as a write-
+selectivity problem. But look at the prices: **the address costs 1 dim per
+fact; the payload costs 4-16 dims per byte.** Under capacity pressure the
+expensive thing is dropped and the cheap thing survives. **"The address
+persists and the content decays" is EXACTLY what a capacity-limited linear
+store looks like — and the state IS capacity-limited.** D5 and CL-2 are the
+same phenomenon, and neither is about write selectivity.
+
+**WHAT THIS DOES TO THE EXPERIMENT QUEUE — and it reorders it.**
+
+1. **The cheapest decisive arm is NOT a bigger model. It is a SMALLER
+   BOARD.** `board_size` was an arbitrary choice in the arm's spec. At 64
+   facts per board, two boards are 128 facts = 2 176 dims, comfortably
+   inside the 8 192 the state has. **So: same model (dim 512, 16 layers),
+   same everything, `board_size 64` instead of 512 — a 20x cheaper change
+   than growing the model, and it puts the state route back INSIDE the
+   budget.** If RETAIN becomes non-zero there, the capacity hypothesis is
+   confirmed and the lever is the state's size (or the board's).
+2. **Growing the HEAD is not the fix** for the state route — the head was
+   never the constraint; the STATE was. (A bigger head would let the head
+   memorise MORE boards, which is the global-store route, not the state
+   route. It is worth ONE arm, because a global store that can hold 1024
+   facts would also make RETAIN non-zero — **and that is a scientifically
+   important distinction: a passing RETAIN does not by itself show the
+   state is doing the work.** The two must be told apart by the copy
+   control, which is now the programme's decisive measurement.)
+3. **The state's size becomes a first-class design variable** — and the
+   plan's §3 "16 layers and 512 dim" was chosen for other reasons and
+   happens to sit exactly at this boundary. That is a coincidence worth
+   recording, because it is the kind of coincidence that silently decides
+   an architecture's fate.
+
+**THE FALSIFIER, PRE-REGISTERED.** If `board_size 64` at dim 512 still
+gives RETAIN = 0.0000 exact-4 **and** the copy control still shows the
+payload is not in the state, then (E2) is refuted: the state was not the
+constraint, the optimiser simply preferred the head (E1), and the fix is a
+training/architecture change that makes the state path the only path (the
+zeroed-head eval from §17) rather than a size change.
+
+**What this does NOT claim.** It prices the LINEAR-readable store the
+architecture actually has. It does not prove that no nonlinear addressing
+scheme could hold more facts in the same state — a sparse content-addressed
+store with learned addressing is a different architecture, and it is the
+one a real solution would use. It also does not claim the head route is
+wrong: a global associative store that can hold 1024 facts would satisfy
+the criterion. **The programme should stop assuming the state is where the
+memory must live, and start MEASURING which store is doing the work** — the
+copy control now does that, and it is the measurement the whole programme
+should have been making all along.

@@ -103,11 +103,13 @@ def measure(m, seq, gate_scale, seed=0):
             for i, l in enumerate(layers):
                 x, st, a, _c = l.forward(enc, x, states[i])
                 states[i] = st
-                A[i].append(a.detach().cpu().numpy())
+                A[i].append(a.detach().cpu().numpy().astype(np.float64))
     out = []
     for i in range(len(layers)):
-        # (T, B, dim)
-        At = np.stack(A[i], axis=0)
+        # (T, B, dim) in float64: numpy's float32 std has a 1-ulp artefact
+        # (E[x^2]-E[x]^2 in float32), which would show up as a "spread" of
+        # exactly-identical values.
+        At = np.stack(A[i], axis=0).astype(np.float64)
         mu = At.mean(axis=2)                 # (T, B)  per-sample mean
         sd = At.std(axis=2)                  # (T, B)  per-sample std
         between = float(mu.mean(axis=0).std())      # across samples
