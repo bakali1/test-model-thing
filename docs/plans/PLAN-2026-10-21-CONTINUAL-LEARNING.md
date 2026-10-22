@@ -325,39 +325,69 @@ one per requirement):
 
 ### CL-2 — The first trained continual-learning run. (2 days, T4) — **RUN 2026-10-22; the arm TRAINS**
 
-**Status (verified from the MX150 logs, 2026-10-22).** After the
-detached-leaf / `requires_grad` fixes (see `RESULTS.md` §16), the arm
-trains for the first time: `ce_text` fell **6.0684 -> 1.5886**, the memory
-head's accuracy reached **0.975 (new) / 0.910 (old)**, and the behavioural
-recall reached **0.999 / 0.994**. The earlier "CE = ln 256 = uniform"
-no-op is gone. **The question "can the recurrent state be trained to hold
-a fact?" now has an affirmative answer at the level of the read-out.**
+**Status (verified from the MX150 logs, 2026-10-22; the raw files are in
+`docs/results/cl2/armA_ce.jsonl` and `docs/results/cl2/armA.log`).** After
+the detached-leaf / `requires_grad` fixes (see `RESULTS.md` §16), the arm
+trains for the first time:
+
+| phase | step | held-out CE | ce_text | ce_behav | head per-byte / exact-4 | behaviour per-byte / exact-4 |
+|---|---:|---:|---:|---:|---:|---:|
+| pre | 0 | 5.9863 | – | – | – | – |
+| pre | 100 | 3.1128 | 2.6062 | 0.0000 | 0.000 / 0.000 | 0.000 / 0.000 |
+| pre | 200 | 2.9856 | 2.4332 | 0.0000 | 0.000 / 0.000 | 0.000 / 0.000 |
+| f1 | 100 | 8.4117 | 2.2806 | 1.5517 | 0.760 / 0.385 | 0.486 / 0.043 |
+| f1 | 400 | 7.7234 | 1.8907 | 0.2247 | 0.902 / 0.709 | 0.947 / 0.816 |
+| f1 | 700 | 6.0694 | 1.8195 | 0.0761 | 0.945 / 0.809 | 0.985 / 0.947 |
+| f1 | 1000 | 4.9274 | 1.7640 | 0.0453 | 0.971 / 0.896 | 0.988 / 0.957 |
+| f2 | 100 | 5.7354 | 1.8434 | 0.5084 | 0.727 / 0.336 | 0.836 / 0.525 |
+| f2 | 500 | 4.1937 | 1.7256 | 0.0543 | 0.919 / 0.760 | 0.990 / 0.965 |
+| f2 | 700 | 4.0011 | 1.6384 | 0.0405 | 0.944 / 0.818 | 0.992 / 0.967 |
+| f2 | 1000 | 4.5938 | 1.5886 | 0.0181 | 0.975 / 0.910 | 0.999 / 0.994 |
+
+**The read-out is a memory measurement; the behaviour is probably a copy.**
+The memory head is a linear readout of the **state at the cue**
+(`state_cue @ wm` in `tools/cl2_train.py:train_step`), so it structurally
+cannot read anything outside the state; it reaches **0.975 per-byte and
+0.910 exact-4** on the training board, against chance 1.53e-05 and a byte
+prior of 0.1659. The model's own logits reach 0.999/0.994 at the payload
+slots, but the payload sits in the **input** 32 B earlier, so that number
+is most likely a **copy** and must be treated as the confound, not the
+result.
 
 **The new finding, and the next problem.** The general held-out CE
-**regressed**: 2.9856 at the end of the `pre` (text-only) phase, 8.4117 at
-f1 step 100, 4.5938 at the end of f2. Against the plan's threshold
-(dCE <= 0.02 nats/B) that is a large regression, and it is the **only**
-thing standing between the arm and a PASS on all three numbers. The
-mechanism candidate is **interference at the shared output head**: in
-`tools/cl2_train.py:train_step` the behavioural loss `ce_behav` is computed
-on the **same logits** as the text CE, so the model's one output path must
-model natural text *and* emit an arbitrary 4-symbol payload, and the
-behavioural CE opened at **8.78 nats** when the fact phase began. The
-recovery from 8.41 to ~4.0-4.6 is consistent with the text path re-learning
-while the fact loss persists.
+**regressed** — and the shape of the regression is the interesting part. In
+f2 the text CE **rises** 4.1937 (step 500) -> 4.5938 (step 1000) while
+`ce_behav` **falls** 0.0543 -> 0.0181 and the fact accuracies climb to
+0.999/0.994: **as the fact behaviour gets better, the text gets worse.**
+In f1 the same trade shows in reverse — the text recovers 8.4117 -> 4.9274
+while `ce_behav` falls 1.5517 -> 0.0453. That is an interference
+signature, and the mechanism candidate is specific: **the behavioural loss
+is computed on the SAME logits as the text CE** (both come from `flat` in
+`train_step`), so the model's one output path must model natural text *and*
+emit an arbitrary 4-symbol payload. The behavioural CE opened at **8.78
+nats** when the fact phase began.
 
-**The copy confound, stated before it is forgotten.** `behav 0.999/0.994`
-and `head 0.975/0.910` are **not yet** proof of recall: the payload sits in
-the *input* 32 B before the cue, so a copy circuit could supply it — to the
-logits directly, and to the head through the state. The CL-RULER's matched
-nulls exist to separate this, and the arm is only a PASS if it beats them.
+**And the NO REGRESSION cell is NOT WELL-POSED as measured.** The `pre`
+baseline of 2.9856 is **not a converged text model** — the text CE was
+still falling steeply (5.99 -> 3.11 -> 2.99 over 200 steps, ~0.015
+nats/step and still steep), so "held_ce went 2.99 -> 4.59" compares a
+model at step 200 with a model at step 2200 and the **text-only
+counterfactual is unknown**. It might have reached 1.5 (a huge regression)
+or 4.0 (a small one). **NO REGRESSION is therefore UNMEASURED until a
+text-only arm of the SAME budget exists.** That arm is the missing
+control, and it is also the **matched null** for the regression cell.
 
 **The next experiment is now CL-2b** (pre-registered, in
 `docs/design/CL2-INTERFERENCE-EXPERIMENT.md`): separate interference from
 fact-distribution-shift, with a matched control per candidate cause —
 `behaviour-weight` 1.0 vs 0.1, a fact-diluted batch, a **decoupled head**
-(the payload read by a separate readout instead of the shared logits), and
-`--memory-alpha 0` as the baseline.
+(the payload read by a separate readout instead of the shared logits), the
+**text-only counterfactual** (the null for the regression cell), and
+`--memory-alpha 0` (which answers a DIFFERENT question — does the *memory
+loss* cost text, not does the *fact training* cost text). The pre-registered
+test is a **shape**, not just an end point: the text CE should be
+flat-to-falling across f2 under the decoupled head, instead of rising 0.4
+nats.
 
 *Falsifier:* if the decoupled-head arm does **not** bring the held-out CE
 back within 0.05 nats/B of the matched control, then the regression is not

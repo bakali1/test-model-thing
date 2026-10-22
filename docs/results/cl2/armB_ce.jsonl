@@ -1,0 +1,6 @@
+{"phase": "pre", "step": 0, "global_step": 0, "held_out_ce": 5.986271381378174, "ce_text": null, "ce_behav": null, "mem": null, "head_per_byte": null, "head_exact4": null, "behav_per_byte": null, "behav_exact4": null}
+{"phase": "pre", "step": 100, "global_step": 100, "held_out_ce": 3.1127712726593018, "ce_text": 2.606234550476074, "ce_behav": 0.0, "mem": 0.0, "head_per_byte": 0.0, "head_exact4": 0.0, "behav_per_byte": 0.0, "behav_exact4": 0.0}
+{"phase": "pre", "step": 200, "global_step": 200, "held_out_ce": 2.985577344894409, "ce_text": 2.4331541061401367, "ce_behav": 0.0, "mem": 0.0, "head_per_byte": 0.0, "head_exact4": 0.0, "behav_per_byte": 0.0, "behav_exact4": 0.0}
+{"phase": "pre", "step": 200, "global_step": 200, "held_out_ce": 2.985577344894409, "ce_text": null, "ce_behav": null, "mem": null, "head_per_byte": null, "head_exact4": null, "behav_per_byte": null, "behav_exact4": null}
+{"phase": "f1", "step": 0, "global_step": 200, "held_out_ce": 2.985577344894409, "ce_text": null, "ce_behav": null, "mem": null, "head_per_byte": null, "head_exact4": null, "behav_per_byte": null, "behav_exact4": null}
+{"phase": "f1", "step": 100, "global_step": 300, "held_out_ce": 8.466720581054688, "ce_text": 2.2812581062316895, "ce_behav": 1.5562734603881836, "mem": 0.0, "head_per_byte": 0.0, "head_exact4": 0.0, "behav_per_byte": 0.484375, "behav_exact4": 0.04296875}
