@@ -122,40 +122,55 @@ def main():
             # the most recent fact carries the TARGET'S KEY and a different
             # payload: the maximally confusable distractor.
             k[:, -1] = cue_key
-            alt = pays[:, -1].copy()
-            alt[:, 0] = (alt[:, 0] + 1) % 16
-            p = np.concatenate([k, alt], axis=2)
+            p2 = pays.copy()
+            p2[:, -1, 0] = (p2[:, -1, 0] + 1) % 16
+            p = np.concatenate([k, p2], axis=2)
             s[:, lay["facts0"]:lay["gap0"]] = p.reshape(B, -1)
         elif cond == "random-key":
-            k[:, -1] = rng.integers(0, 16, size=B)
+            k[:, -1] = rng.integers(0, 16, size=(B, 4)).astype(keys.dtype)
             p = np.concatenate([k, pays], axis=2)
             s[:, lay["facts0"]:lay["gap0"]] = p.reshape(B, -1)
         s[:, lay["cue0"]:lay["cue1"]] = cue_key
         with torch.no_grad():
-            _logits, state_cue = cl2.engine_forward(m, s, lay["cue_last"])
+            logits, state_cue = cl2.engine_forward(m, s, lay["cue_last"])
+        # the READOUT: the model's OWN behaviour -- the next-byte prediction
+        # at the four slots after the cue, against the target's four payload
+        # bytes.  This is the path the arm was TRAINED to use ("after the cue,
+        # emit the addressed fact's payload"), and it is the only readout that
+        # can answer "does the OLD fact still answer to ITS OWN key": the
+        # trained memory HEAD is a linear map of the whole state and always
+        # predicts the NEWEST payload, so it cannot address an old fact.
+        b0, b1 = lay["cue1"] - 1, lay["tgt1"] - 1
+        pred = logits[:, b0:b1].argmax(-1).cpu().numpy()
+        behav_per_byte = float((pred == target).mean())
+        behav_exact4 = float((pred == target).all(axis=1).mean())
+        perm = np.random.default_rng(args.seed + 7919).permutation(B)
+        null_exact4 = float((pred == target[perm]).all(axis=1).mean())
         X = state_cue.detach().cpu().numpy().astype(np.float64)
         W = Wm.detach().cpu().numpy().astype(np.float64)
         bb = bm.detach().cpu().numpy().astype(np.float64)
         cell = ruler.make_head_cell(cond, X, target, W, bb, args.seed,
                                     16 if alpha is None else len(alpha))
-        out[cond] = cell
-        print(f"  {cond:<12} per_byte {cell['per_byte']:.4f}  exact4 "
-              f"{cell['exact4']:.4f}  null_exact4 {cell['null_exact4']:.4f}  "
-              f"verdict {cell['verdict']}")
-    nc = out["no-conflict"]["exact4"]
-    cf = out["confusable"]["exact4"]
-    print(f"  -> the CONFLICT COST (exact4): no-conflict {nc:.4f} - "
-          f"confusable {cf:.4f} = {nc - cf:+.4f}")
-    print(f"  -> per byte: {out['no-conflict']['per_byte']:.4f} - "
-          f"{out['confusable']['per_byte']:.4f} = "
-          f"{out['no-conflict']['per_byte'] - out['confusable']['per_byte']:+.4f}")
+        out[cond] = {"behav_per_byte": behav_per_byte,
+                     "behav_exact4": behav_exact4,
+                     "null_behav_exact4": null_exact4,
+                     "head_per_byte": cell["per_byte"],
+                     "head_exact4": cell["exact4"]}
+        print(f"  {cond:<12} BEHAVIOUR per_byte {behav_per_byte:.4f}  exact4 "
+              f"{behav_exact4:.4f}  (null {null_exact4:.4f}) | the trained "
+              f"head per_byte {cell['per_byte']:.4f} exact4 "
+              f"{cell['exact4']:.4f}")
+    nc = out["no-conflict"]["behav_exact4"]
+    cf = out["confusable"]["behav_exact4"]
+    print(f"  -> the CONFLICT COST (behavioural exact4): no-conflict "
+          f"{nc:.4f} - confusable {cf:.4f} = {nc - cf:+.4f}")
+    ncb = out["no-conflict"]["behav_per_byte"]
+    cfb = out["confusable"]["behav_per_byte"]
+    print(f"  -> per byte: {ncb:.4f} - {cfb:.4f} = {ncb - cfb:+.4f}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"label": label, "ckpt": args.ckpt, "gated": gated,
-                       "cells": {k: {kk: vv for kk, vv in v.items()
-                                     if kk in ("per_byte", "exact4",
-                                               "null_exact4", "verdict")}
-                                 for k, v in out.items()}}, f, indent=1)
+                       "cells": out}, f, indent=1)
         print(f"  wrote {args.out}")
 
 

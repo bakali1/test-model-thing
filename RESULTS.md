@@ -5153,3 +5153,92 @@ interpretation. D5 had the copy control, and its payload result is sound.
 CL-2 did not have it, and its head number was about to be misread as a
 statement about the state. **The copy control is now mandatory in every
 cell, and it has already changed the programme's conclusion once tonight.**
+
+### 20. THE CL-RULER'S FIRST FULL VERDICT ON A TRAINED ARM: PASS / FAIL / FAIL.
+
+The ruler was run on `armA_f2_end.npz` in the arm's **exact** regime
+(`ruler_setting`: facts 4, gaps 8/32/64, alphabet 16, n 512, board_size
+512, seeds A=101 B=202 C=303), so the RETAIN lag is `8*(facts-1)+d` =
+32/56/88 — **inside** the ~128 B horizon. The raw output is committed at
+`docs/results/cl2/armA_ruler.json`.
+
+**ACQUIRE — PASS on the facts the stream taught; FAIL on the facts it never
+taught.** The model's own trained head, board B (the stream's facts):
+
+| gap | head per-byte / exact-4 | null |
+|---:|---:|---:|
+| 8 | 0.9658 / 0.8730 | 0.0605 / 0.0039 |
+| 32 | 0.9697 / 0.8906 | 0.0747 / 0.0020 |
+| 64 | 0.9268 / 0.7559 | 0.0781 / 0.0059 |
+
+Board C (never trained on): the head gets 0.125/0.0, 0.1011/0.0,
+0.0742/0.0 — **at chance**. The ruler's **headline** verdict is FAIL
+because it is wired to board C, and its own note says why ("the
+trained-board cell is the 'did it memorise the stream' number").
+
+**RETAIN — FAIL, and this is the verdict that counts.** The head is the
+model's **own parameter** and is **not refitted**, so it is an honest
+measure of what the model learned. Pre-stream → post-stream, board A:
+
+| gap | pre per-byte / exact-4 | post per-byte / exact-4 |
+|---:|---:|---:|
+| 8 | 0.9663 / 0.8828 | 0.2139 / 0.0039 |
+| 32 | 0.9644 / 0.8691 | 0.1978 / 0.0020 |
+| 64 | 0.9390 / 0.8008 | 0.1504 / 0.0000 |
+
+**Ratio 0.2051 (per-byte) and 0.0022 (exact-4)** against a pre-registered
+threshold of 0.90. **The pre-stream facts are gone.**
+
+**NO REGRESSION — FAIL, and by a lot.** The ruler's held-out CE:
+
+| checkpoint | held-out CE (nats/B) |
+|---|---:|
+| base (end of the text-only phase) | **3.0695** |
+| pre (end of the pre-stream phase) | 4.8854 |
+| post (end of the stream phase) | **5.2037** |
+
+against a threshold of +0.02 nats/B. **The post-stream model is 5.2037 —
+within 0.34 nats of the UNIGRAM baseline of 5.5452.** The model is nearly
+as good as predicting a constant byte. (The trainer's own eval said 4.5938
+on a 1000-byte slice; the ruler's 120 000 bytes over 6 slices is the better
+estimate. Both are bad; the ruler's is worse.)
+
+**THE NUISANCE CONTROLS BEHAVE.** Every cell built from `stream_nuis2` (the
+target fact's KEY *and* PAYLOAD both replaced) is **NULL** for both
+readouts, in all three gaps and on both boards. The readout is not inventing
+signal.
+
+**WHAT THE RIDGE READOUT IS — and what it is not.** The ridge readout is
+**refitted on each measurement**, so it measures the state's
+**COPYABILITY**, not the model's memory. Its RETAIN cells (pre
+0.4004/0.2070 → post 0.3945/0.2188, ratio 0.985/1.057) are therefore
+**not** retention: the post-stream model still copies board A's payload
+into its state when board A's fact is in the **input**, and the refitted
+readout re-learns the mapping from that copy. The **head's** RETAIN
+(0.0022) is the honest number, because the head is a parameter, not a
+refit. The ruler already uses the head for the verdict — that wiring is
+right and it should stay.
+
+**THE CRITERION'S WIRING IS THE SAME CLASS OF BUG AS THE `--facts` DEFAULT.**
+The criterion says "**ACQUIRE: recall the NEW facts**". The new facts are
+**board B** — that is what a stream is. The ruler's headline verdict is
+wired to **board C**, which asks a different and much harder question
+("recall a fact you were never taught") and **turns a PASS into a FAIL**.
+Both cells must be reported, but the criterion's ACQUIRE is board B, with
+board C as a separate and stronger claim (the in-state route, M1) reported
+beside it, not as the headline.
+
+**WHAT THIS CHANGES.** It confirms §17 (the head forgets board A; the head's
+answer survives replacing the input's payload, so it reads the weights) and
+it adds the calibration the verdict needed: **the post-stream model is
+within 0.34 nats of the unigram baseline**, so the text regression is not a
+drift — the fact training very nearly destroyed the language model.
+
+**AND THE NO REGRESSION FAILURE IS NO LONGER BLOCKED ON THE COUNTERFACTUAL.**
+The text-only arm (A5) would have to reach 5.20 nats/B for the regression
+to be zero, and the base was 3.07 while the model was still improving
+steeply — so the counterfactual can only make the regression **larger**,
+never smaller. **The failure is certain; A5 now only quantifies it.** That
+frees the GPU for the arms that decide the *next* question, and the next
+question is no longer "is the text regression real" but **"what makes the
+head forget board A"**.
