@@ -21,6 +21,48 @@ the goal was never a criterion and was not even expressible in the engine.
 
 ---
 
+> ## THE CURRENT STATE (2026-10-22, after one night of experiments)
+>
+> **Read this box before anything else in this plan. It is the summary; the
+> sections below are the reasoning, and several of them are older than the
+> results and have been amended in place.**
+>
+> **The goal is unchanged:** continual learning, judged by three numbers
+> (§1). **The instrument exists and works** (`tools/cl_ruler.py`; 35
+> gates). **The first trained continual-learning arm has been run, and it
+> is a FAIL on two of the three numbers** (`RESULTS.md` §20):
+>
+> | | result | threshold | verdict |
+> |---|---|---|---|
+> | **ACQUIRE** | 0.8906 exact-4 on the stream's facts | ≥ 0.50 | **PASS** |
+> | **RETAIN** | ratio 0.0022 | ≥ 0.90 | **FAIL** |
+> | **NO REGRESSION** | 3.0695 → 5.2037 nats/B | ≤ +0.02 | **FAIL** |
+>
+> **And the programme now knows WHY** — which is the night's real product
+> (`RESULTS.md` §17–§23, in four steps):
+>
+> 1. **The recurrent state carries the ADDRESS; the weights carry the
+>    CONTENT** (§22). A fresh readout on the state, split over *board
+>    facts* rather than rows, scores **exact-4 = 0.0000 in every cell**.
+> 2. **The cause is the TRAINING SIGNAL, not the architecture** (§23).
+>    With the head's table removed (`--head-frozen`) the memory loss **does
+>    not fall at all** over 19 steps, where the trainable-head arm fell
+>    4.5 nats in 25. The state was never asked.
+> 3. **P3 — write selectivity in the recurrent state — is CLOSED as a
+>    lever** (§23, M1/M6). The gate engages but is not selective (its
+>    between-sample spread is **2.4e-05** of its within-sample spread), and
+>    a selective *state* write could not have fixed a failure that was a
+>    *table* being overwritten.
+> 4. **The plan's own §4/M2 — an explicit keyed store alongside the state
+>    — is the answer**, and a D5-era update talked the programme out of it
+>    and into P3. **§4 has been restored.**
+>
+> **The next three things** (`docs/NIGHT-LOG-2026-10-21.md`): a longer H1
+> (500 steps, ~45 min) to make the negative conclusive; a **D5-style copy
+> circuit trained explicitly** inside the CL-2 arm (D5 proves the state
+> *can* carry a payload, so it is **untrained for the job, not
+> incapable**); and the **keyed store** (M2).
+
 ## 0. What is already true (evidence, not plans)
 
 All numbers are in `RESULTS.md` (append-only) with their ruler settings. This
@@ -29,7 +71,8 @@ section exists so a new reader does not re-derive them.
 **Assets that exist and work.**
 - A bit-identical CPU/CUDA engine with a parity gate (`numpy_port.py` ≡
   `gpu_port.py`, `tests/check_parity.py`).
-- 25 executable gates in `tests/`.
+- **35** executable gates in `tests/` (25 at the time this section was
+  written; ten more were added tonight, six of them for the tools below).
 - A training-time credit apparatus (ring / tail / trace) with **zero inference
   parameters** — it is plumbing, not weights.
 - Colab + private-HF durability that survives runtime recycling, with
@@ -38,6 +81,15 @@ section exists so a new reader does not re-derive them.
   suite (`tools/membench/`).
 - A speed result: the fused `nvrtc` ring credit is **1.26× end to end, bit
   identical** (loss `7.58001`, `max|Δ| = 0`; 26.72 vs 33.68 ms/step).
+  **AMENDED 2026-10-22: this 1.26× was NEVER REALISED by any default run
+  until tonight.** The `nvrtc` default was **inert** — `GpuModel.__init__`
+  eagerly rewrote `"auto"` to `"compiled"`, so the branch that selects the
+  fused path was dead code (the eager rewrite dated from 2026-09-24, when
+  `compiled` *was* the fastest, so it was correct then and **silently became
+  wrong** when `nvrtc` shipped). The default is now resolved lazily
+  (`tests/check_ring_credit_default.py`). **The speedup that is actually
+  bit-identical and in force is the fused AdamW: 1.09× on the whole step**
+  (151.26 → 138.83 ms/step, `max|Δ| = 0` on CPU and MX150).
 - A capacity result: **P4 + P6 give 15× the incumbent's retention** — 37.5 /
   17.1 / 5.3 / 0.78 % of the control floor at 8 / 32 / 128 / 512 B against
   the incumbent's 4.8 / 1.7 / 0.36 / 0.0007 %, with a half-life of 95.4 B
@@ -67,13 +119,36 @@ section exists so a new reader does not re-derive them.
   bytes" were both artifacts of broken instruments (D1, D4). The Δh
   capacity curve and the decodable-payload curve **are the same curve**, so
   there is no capacity-vs-usable-content paradox (D5).
+  **AMENDED 2026-10-22 (§19, §22, §23).** D5 **survives its own copy
+  control** (its nuisance collapses the decode to 0.56 %/0.32 % against a
+  0.39 % chance), so **this model's state really does hold a decodable
+  payload** — the measurement is sound. **But it is a DIFFERENT MODEL**: D5
+  is a delayed-copy model whose objective asked the state to carry the
+  payload, and the CL-2 arm's objective never did (§23). Two consequences,
+  and the second one has been routinely misread:
+  * **D5 says the state is CAPABLE of holding a payload.** So the CL-2
+    failure is **untrained, not incapable** — which is why the next arm is
+    a *D5-style copy circuit trained explicitly*, not a bigger state.
+  * **D5's "the address persists, the content decays" is NOT evidence that
+    write selectivity is the lever** (§23). The address costs ~1 dim per
+    fact and the payload 4–16 dims per byte, so under capacity pressure
+    the *cheap* thing survives and the *expensive* thing is dropped —
+    "the address persists and the content decays" is what a
+    **capacity-limited linear store** looks like
+    (`tools/state_capacity_budget.py`: the state is 1.06×–4.06× short for
+    ONE board of 512 facts). **P3 was aimed at the wrong object.**
 - ~~The n-gram deficit.~~ **SETTLED 2026-10-21, reproducibly and
   byte-matched** (D2): the order-8 byte n-gram scores **0.6512** nats/byte
   on the ruler's own held-out bytes against the model's **1.2094** — the
   model is **0.56 nats/byte worse than a zero-parameter table lookup**. The
   deficit is real, larger than the 0.40 the old (unmatched) comparison
   suggested, and now has a script.
-- Anything about continual learning. `grep -c forgetting RESULTS.md` → **0**.
+- ~~Anything about continual learning. `grep -c forgetting RESULTS.md` → **0**.~~
+  **SUPERSEDED 2026-10-22 — this line was the most misleading in the
+  plan.** It is now the opposite: `RESULTS.md` has 23 sections, §17–§23
+  are entirely about continual learning, and there is a **full verdict
+  from a trained arm** (§20): **ACQUIRE PASS / RETAIN FAIL / NO REGRESSION
+  FAIL**. See the CURRENT STATE box at the top.
 
 ---
 
@@ -82,12 +157,37 @@ section exists so a new reader does not re-derive them.
 The goal becomes three numbers, measured on one ruler, with a control.
 
 > **CL-RULER.** For a model M and a stream of new facts F:
-> 1. **ACQUIRE** — after the stream, M recalls the new facts
->    (exact-match accuracy on a held-out set of the same shape).
+> 1. **ACQUIRE** — after the stream, M recalls the new facts: **the facts
+>    in the stream, on FRESH streams of them** (new layouts, new
+>    distractors, new gap content — never the training sequences).
 > 2. **RETAIN** — M still recalls the facts it knew before the stream
 >    (the same metric on the pre-stream set, and the pre/post gap).
 > 3. **NO REGRESSION** — M's held-out CE on the general corpus has not
->    degraded (ΔCE ≤ 0.02 nats/B).
+>    degraded (ΔCE ≤ 0.02 nats/B), **measured against a TEXT-ONLY arm
+>    with the same model, corpus and budget** — not against the same
+>    model's own earlier checkpoint.
+>
+> **AMENDED 2026-10-22 (§20, §22).** Three of these were ambiguous, and
+> the ambiguity was resolved in the wrong direction twice:
+> * **ACQUIRE's board.** The original wording said "a held-out set of the
+>   same shape", which reads as *facts the model was never taught*. The
+>   ruler's headline was therefore wired to board C, and that **turned a
+>   PASS into a FAIL**: the head scores 0.8906 exact-4 on the stream's
+>   facts (board B) and 0.0000 on board C. **The new facts ARE board B** —
+>   that is what a stream is. **Board C is a separate and stronger claim**
+>   ("recall a fact you were never taught"), and it is reported **beside**
+>   the criterion, never as it. Both cells must be stated, and neither may
+>   be mistaken for the other.
+> * **RETAIN's readout.** A refitted probe and the model's own parameter
+>   give **0.857 and 0.0022** for the same checkpoint. **The criterion uses
+>   the model's own readout** (the trained head), because a refitted probe
+>   measures the state's *copyability*, not what the model learned. This
+>   must be stated in the criterion, not discovered later.
+> * **NO REGRESSION's baseline.** The pre-phase checkpoint is not a valid
+>   baseline: the model was still improving steeply when it was taken
+>   (5.99 → 3.11 → 2.99 over 200 steps), so "held-out CE went 2.99 → 5.20"
+>   compares a model at step 200 with a model at step 2200 and leaves the
+>   counterfactual **unknown**. The baseline must be the text-only arm.
 
 **Why these three and not one.** They are the minimum that makes "continual
 learning" a claim rather than a hope, and they map exactly onto the three
@@ -107,8 +207,11 @@ closed.
 
 **Pre-registered thresholds.** Chosen before any run, and fixed:
 - **ACQUIRE** passes at ≥ 0.50 exact recall of a 4-byte payload at d=32
-  (chance 2⁻³²) on a *trained* model; a probe on a frozen checkpoint is
-  diagnostic, not a pass.
+  (**chance 16⁻⁴ = 1.53e-05** at the matched alphabet — *AMENDED: the plan
+  previously wrote "chance 2⁻³²", which is the full-byte figure and is
+  wrong for a 16-symbol alphabet; the same error survives in §8*) on a
+  *trained* model; a probe on a frozen checkpoint is diagnostic, not a
+  pass.
   **ALPHABET CAVEAT (2026-10-21, measured):** this threshold is only
   *measurable* with a **matched alphabet**, and the plan must say so. At the
   full 256-symbol alphabet the D5 measurement gives a payload per-byte
@@ -129,6 +232,30 @@ closed.
   *permuted* labels. If the readout cannot beat its own veto, the cell is
   UNMEASURED, never PASS. (The repo already has this discipline in
   `tools/p0_verdict.py`: "UNMEASURED is never PASS".)
+
+**THE MANDATORY CONTROLS (added 2026-10-22, §17, §19, §22).** Tonight the
+programme produced four wrong conclusions in a row, each because a
+control was *absent* and its absence silently became the interpretation.
+**A cell without these is not a result.**
+
+1. **THE PERMUTED-LABEL VETO** (above) — unchanged.
+2. **THE COPY CONTROL.** Replace the payload bytes **in the input** with
+   fresh random bytes, leaving the cue and the target unchanged. A readout
+   that still answers has learned the *key*, not the *payload*, and is
+   reading a table rather than the state. **This is the control that
+   separated "the state holds a copy" from "the head holds a table"** — and
+   it changed the programme's conclusion.
+3. **THE FACT-LEVEL SPLIT, for every FITTED readout.** A readout fitted on
+   rows can memorise a **table over the board**, because the rows share
+   board facts. **Split over the things the readout could memorise** — here
+   over the board facts, not over the rows. A cell fitted on a row split is
+   UNMEASURED until it is re-run.
+4. **THE NUISANCE CONTROL** (the target's key AND payload both replaced) —
+   the readout must collapse to its null. It does, in every cell.
+
+**A REFIT PROBE IS NOT A RETENTION MEASURE.** A readout that is refitted at
+each measurement measures the state's *copyability*. Retention is measured
+with the model's **own parameters**.
 
 ---
 
@@ -262,13 +389,53 @@ month: the lever is the write's **selectivity** (the P3 gate), because the
 address survives where the content decays, which is the signature of an
 order-losing weighted average.
 
+> ### UPDATE 2026-10-22 (§22, §23): THE D5 UPDATE WAS WRONG, AND M2 WAS RIGHT.
+>
+> **The paragraph above is superseded. It is left in place because its
+> error is instructive, not because it is true.**
+>
+> **What the D5 update got right:** the state holds an addressable,
+> persistent address; the readout is not key-blind. That survives, and
+> §22 confirms it more sharply: the state carries the **address** (the
+> key), durably and generically, even for facts the model was never
+> taught.
+>
+> **What it got wrong, in two ways.**
+> 1. **"The lever is the write's selectivity" is falsified.** The gate
+>    *engages* (it reaches 0.110 max) but it is **not selective**: its
+>    between-sample spread is **2.4e-05** of its within-sample spread
+>    (M1) — it is a global per-dimension re-scaling. And M6 shows the
+>    conflict cost is not reduced specifically by the gate. **Worse, a
+>    selective *state* write could not have fixed the failure at all**,
+>    because the failure was **a table in the weights being overwritten**,
+>    not a state being overwritten. **P3 was aimed at the wrong object.**
+> 2. **"The content decays" was read as a write problem; it is a
+>    CAPACITY result.** The address costs ~1 dim per fact and the payload
+>    4–16 dims per byte, so under capacity pressure the cheap thing
+>    survives and the expensive thing is dropped. "The address persists and
+>    the content decays" is what a **capacity-limited linear store** looks
+>    like: the state is **1.06×–4.06× short** for ONE board of 512 facts
+>    (`tools/state_capacity_budget.py`).
+>
+> **And the D5 update talked the programme OUT of M2, which §23 lands back
+> on.** §23's conclusion is that the goal needs a store that is **neither a
+> copy nor a table** — one that is written once at a key and read many
+> times without evicting its neighbours. **That is M2.** The plan had it
+> at the top of this section all along, and it was correct; the D5 update
+> was not. **M2 is now the primary mechanism and M1 is closed as a lever**
+> — not because an addressable write is impossible, but because (a) the
+> state is **untrained** for it (D5 proves the state *can* carry a payload
+> when its objective asks it to), and (b) the failure that is actually
+> costing the criterion was a **table** being overwritten, which a state
+> write cannot reach.
+
 **The four project ideas map onto these mechanisms:**
 
 | idea | where it lives | first test |
 |---|---|---|
-| **1. Experts for new domains** | a decay set (8,192) + optional rank-r readout LoRA (1,024r/layer) per expert, selected by a learned router. No router exists in the code today (`grep expert\|router\|topk` → 0 hits) | CL-3 arm (c) |
-| **2. Short-term / long-term memory** | **already ~80 % built**: the per-channel decay logit *is* a lifetime; P4's log-spaced init creates the spectrum; P6 stops training eroding it; the P3 gate makes retention input-dependent. Missing: a **promotion/demotion policy** and a ruler that measures lifetime-vs-usefulness | CL-3 arm (b) |
-| **3. Prevent harmful self-learning** | the risk is currently **dormant**: `numpy_port.Runtime.ingest` (866-912) does update weights on user bytes, but generated bytes are **never re-ingested** (only upstream's `legacy/main.py:415` trains on its own output). The three missing safeguards are all missing: **no replay buffer or knowledge store exists**; `grep -c forgetting RESULTS.md` → **0**; and `verify_saved` (`train_gpu.py:517`) checks *transport* identity, never quality — **no checkpoint is ever accepted or rejected on quality** anywhere. The 25 gates validate *code*, not *capabilities* | CL-3 arm (d) + the CL-RULER |
+| **1. Experts for new domains** | a decay set (8,192) + optional rank-r readout LoRA (1,024r/layer) per expert, selected by a learned router. No router exists in the code today (`grep expert\|router\|topk` → 0 hits) | **deferred** — a router is a way to make M2's keyed store bigger, and the store is the prerequisite |
+| **2. Short-term / long-term memory** | **already ~80 % built**: the per-channel decay logit *is* a lifetime; P4's log-spaced init creates the spectrum; P6 stops training eroding it. **AMENDED 2026-10-22: "the P3 gate makes retention input-dependent" is FALSIFIED** — the gate's between-sample spread is 2.4e-05 (§23, M1). Missing: a **promotion/demotion policy** and a ruler that measures lifetime-vs-usefulness | superseded by the M2 keyed store |
+| **3. Prevent harmful self-learning** | the risk is currently **dormant**: `numpy_port.Runtime.ingest` (866-912) does update weights on user bytes, but generated bytes are **never re-ingested** (only upstream's `legacy/main.py:415` trains on its own output). The three missing safeguards are all missing: **no replay buffer or knowledge store exists**; `grep -c forgetting RESULTS.md` → **0** *(AMENDED 2026-10-22: now 1, and §17–§23 are all about forgetting — this cell is obsolete)*; and `verify_saved` (`train_gpu.py:517`) checks *transport* identity, never quality — **no checkpoint is ever accepted or rejected on quality** anywhere. The 35 gates validate *code*, not *capabilities* | superseded by the M2 keyed store + the CL-RULER |
 | **4. Cross-depth self-distillation** | architecturally available today (depth = 16 stacked nonlinear readouts of one bank, so a later stage is a function of an earlier one), and **untested**. It depends on depth producing *better* representations, which is what an addressable write (M1) would enable | CL-4, after the ruler exists |
 
 ---
@@ -278,7 +445,7 @@ order-losing weighted average.
 Each step is independently gated, states its falsifier in advance, and ends
 in a written verdict in `RESULTS.md`.
 
-### CL-0 — Build the ruler. (1 h, CPU)
+### CL-0 — Build the ruler. (1 h, CPU) — **DONE 2026-10-21**
 Build the three-number CL-RULER on the existing harness (`tools/ruler.py` +
 `tools/membench/generators.py` + `train_gpu.py`'s corpus machinery): a fact
 stream generator, a replay set, a recall cell with a permuted-label veto, and
@@ -286,7 +453,7 @@ a CE-regression cell. **Nothing below CL-0 counts as a result.**
 *Falsifier:* if the ruler cannot reproduce the model's own CE on a known
 checkpoint, it is broken — fix it before use.
 
-### CL-1 — Re-measure the read path with a working instrument. (1 day, CPU)
+### CL-1 — Re-measure the read path with a working instrument. (1 day, CPU) — **DONE 2026-10-21**
 **DONE 2026-10-21. The verdict changed, and it changed in the programme's
 favour.** The `λ` swap, the test-half leak and the payload ravel are fixed
 (`tools/membench/model_backend.py`), the cell is gated by
@@ -524,7 +691,19 @@ RETAIN failure are **two different failures with two different causes**
 table is overwritten) and the design must keep them apart.
 
 
-### CL-3 — The four ideas, on the ruler. (1 week, T4)
+### CL-3 — The four ideas, on the ruler. (1 week, T4) — **SUPERSEDED 2026-10-22; do not run**
+
+> **Why it is superseded.** CL-3 was four arms of *architectural* ideas
+> judged on the three numbers. §22–§23 showed that the thing standing
+> between the programme and a PASS was **not an architecture the four ideas
+> could reach**: the state carries the address, the weights carry a table,
+> and the table is overwritten. The four ideas (experts, lifetime
+> promotion, quarantine, distillation) all act on the **state or the
+> decay**, and the state is not where the content is. **The replacement is
+> CL-6: the keyed store (M2), plus the training-signal arms.**
+>
+> The text below is kept for the record. **Do not run it.**
+
 Four arms, same seed / corpus / byte budget, judged **only** on the three
 CL-RULER numbers:
  (a) plain CE control, (b) + per-channel lifetime promotion/demotion
@@ -533,16 +712,76 @@ CL-RULER numbers:
 *Falsifier:* an arm that does not beat the control on ACQUIRE and does not
 lose it on RETAIN and NO REGRESSION is a null, and is closed.
 
-### CL-4 — Cross-depth self-distillation. (later)
+### CL-4 — Cross-depth self-distillation. (later) — **DEFERRED**: §22–§23 show the blocker is the store, not the representation; a better representation of a state that holds only the address does not help.
 Only after the ruler exists. Add a loss pulling an earlier stage toward a
 later one, keeping the CE objective intact, and judge it on the same three
 numbers plus compute cost.
 
-### CL-5 — M1 (addressable write), if and only if CL-2 and CL-3 justify it.
+### CL-5 — M1 (addressable write), if and only if CL-2 and CL-3 justify it. — **CLOSED as a lever (§23)**: the gate engages but is not selective (between/within 2.4e-05), and a selective *state* write cannot fix a table that was overwritten. **The addressable write survives only as the D5-style copy circuit, which is a training-signal question, not a write-selectivity one.**
 
 ---
 
-## 6. Two defects to fix before anything is measured (found 2026-10-21)
+### CL-6 — THE STACK: a training-signal arm, then a keyed store. (the current step)
+
+> **This replaces CL-3/CL-4/CL-5.** Three arms, in this order, because each
+> one is cheap and each one changes what the next one means. The full
+> reasoning and the pre-registered thresholds are in §CL-2b and in
+> `docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md` §CL-2b's arm list.
+
+**CL-6a — THE LONGER H1 (500 steps, ~45 min).** Make tonight's negative
+conclusive: with the head frozen, does the memory loss fall *at all* over
+500 steps rather than 19? §23's 19-step probe showed **no downward trend
+whatsoever** where the trainable-head arm fell 4.5 nats in 25, but 19 steps
+is a strong signal, not a proof. **If the loss falls, the state CAN be
+taught to carry the payload and the whole programme is a training-signal
+problem.** If it does not, the state cannot be taught to carry the payload
+under this objective and the keyed store is the only way forward.
+
+**CL-6b — THE D5-STYLE COPY CIRCUIT, TRAINED EXPLICITLY (~2 h).** Add a
+loss that asks the *state* to carry the payload, with the head's table
+removed (`--head-frozen`) so the table cannot take the job. **D5 proves
+the state CAN carry a payload when its objective asks it to** (its copy
+control collapses to chance, so it is not a copy of the input), so the
+state is **untrained for the job, not incapable.** This is the arm that
+distinguishes "the state cannot" from "the state was not asked".
+
+**CL-6c — THE KEYED STORE (M2).** A small associative memory (key → value)
+alongside the state, which the model learns to write to and read from,
+with the recurrent state unchanged. **This is the architecture the goal
+needs** (§23): a fact is written **once** at a key and read **many** times
+without evicting its neighbours. Neither a copy (overwritten by the next
+write) nor a table (overwritten by the next stream) has that property,
+and that is why ACQUIRE passes and RETAIN is 0.0022 in the same run.
+**Its cost is honest and must be reported: the knowledge is not in the
+weights.** The ruler already has the readout to score it.
+
+**ALSO OUTSTANDING, AND CHEAP.** The **text-only counterfactual (A5)** for
+NO REGRESSION's magnitude (the failure itself is certain, §20); the
+`--memory-alpha 0` control arm, **stopped at f2 step 100 and resumable**
+from `~/tmt-work/runs/cl2/armB_f2_t000100.npz`; and the **replay
+baseline**, which the programme still does not have and without which
+"continual learning is hard" is a claim without a reference point.
+
+---
+
+## 6. Two defects to fix before anything is measured (found 2026-10-21) — **BOTH FIXED 2026-10-22**
+
+> **Status: both fixed and gated.** D1 (the ridge readout's swapped lambda
+> selection, and the multi-byte payload read once instead of per byte) and
+> D4 (the copy probe reading `final_states` after zero-padding rather than
+> at the cue) are fixed, with `tests/check_ridge_readout.py` failing on the
+> old code. **Three more defects were found tonight, and they are the same
+> KIND of defect — an instrument that silently measures something else:**
+>
+> | defect | what it did | gate |
+> |---|---|---|
+> | **the `nvrtc` default was inert** | `GpuModel.__init__` eagerly rewrote `"auto"` → `"compiled"`, so the branch that selects the fused path was **dead code** and the 1.26× speedup was **never realised** by any default run | `tests/check_ring_credit_default.py` |
+> | **the ruler's ACQUIRE headline was wired to the wrong board** | board C (never trained) instead of board B (the stream's facts) — **turning a PASS into a FAIL** | `tests/check_ruler_criterion.py` |
+> | **the ruler's ridge split was over rows** | the rows share board facts, so a fitted readout could **memorise a table over the board** and report a "generalisation" that was not one — the single most consequential error of the night | `tests/check_ruler_criterion.py` |
+>
+> **The lesson, which is now a governance rule (§9): a measurement's
+> meaning is set by its controls, and a control that is ABSENT silently
+> becomes the interpretation.**
 
 **D1 — the read-path instrument is broken.** `tools/membench/model_backend.py:130`,
 `_ridge_score`:
@@ -700,6 +939,22 @@ P4 ring already pays, since `ring_k` saturates at 256 under the P4 init.
 
 ## 7. Why the last 14 plans did not converge, and what changes
 
+> **AMENDED 2026-10-22 — the deeper answer.** The plan's original answer
+> was *proxies*: the programme optimised stand-ins for the goal instead of
+> the goal, so 14 plans produced 13 measurable verdicts and 0 end-to-end
+> wins. **Tonight added a second, harder answer: the INSTRUMENT was wrong
+> more often than the hypothesis was.** Four times in one night a
+> measurement's meaning was set by a control that was absent —
+> a missing copy control (§17), a missing nuisance control (§19), a
+> missing criterion wiring (§20), and a **split that let a readout
+> memorise the board** (§22) — and twice that produced a *wrong
+> conclusion that had to be corrected in the append-only log* (§16, §22).
+>
+> **So the programme has two failure modes, and they compound:** a proxy
+> goal lets you succeed at the wrong thing, and an un-controlled
+> measurement lets you believe it. **The governance change in §9 is the
+> response to the second.**
+
 The programme ran a **proxy-substitution loop**:
 
 1. the goal was not expressible in the engine and was not a criterion in any
@@ -731,19 +986,47 @@ The programme ran a **proxy-substitution loop**:
 
 ## 8. The kill criterion
 
-**The programme is closed if, after CL-2 and CL-3:**
-- the trained model does not reach ≥ 0.50 exact recall at d=32 (chance
-  2⁻³²) on the fact task, **and**
-- the M2 (external keyed store) arm also fails to beat 0.90 recall at d=32
-  while keeping ΔCE ≤ 0.02 nats/B, **and**
-- the T-axis re-test at the corrected 1.26× speed still favours T=1 by
-  > 2σ at matched bytes.
+> **REWRITTEN 2026-10-22.** The old criterion had three problems, all of
+> them now fixed: it was **conditioned on CL-3**, which §22–§23 superseded;
+> it used **"chance 2⁻³²"**, which is the full-byte figure and is wrong
+> for the matched 16-symbol alphabet (the chance is **16⁻⁴ = 1.53e-05**);
+> and it made the programme's closure depend on **the T-axis speed
+> question**, which is a different claim from "this architecture does not
+> do continual learning". A kill criterion that can be triggered by an
+> unrelated result is not a kill criterion.
 
-In that case the honest conclusion is: *this architecture, at this scale,
-with these objectives, does not do continual learning* — and the programme
-switches to (a) packaging the findings for upstream and the community, and
-(b) scale and data on the upstream configuration, which is where the evidence
-says the remaining headroom is.
+**The programme is closed if, after CL-6a, CL-6b and CL-6c:**
+- the trained model does not reach **≥ 0.50 exact recall at d=32** (chance
+  **16⁻⁴ = 1.53e-05**) on the fact task, **and**
+- the **keyed store (M2)** arm also fails to beat **0.90** of the
+  pre-stream recall while keeping **ΔCE ≤ 0.02 nats/B** against the
+  text-only baseline, **and**
+- the **text-only counterfactual** shows the regression is not recoverable
+  by any training-signal change — i.e. the NO REGRESSION failure survives
+  the decoupled head.
+
+**AND the programme is closed EARLIER, by a different route, if the
+training-signal question comes out negative:**
+
+- **CL-6a's H1 shows the memory loss does not fall over 500 steps with the
+  head's table removed, AND CL-6b's explicit copy circuit also fails to
+  make the state carry the payload.** Then the state **cannot** be made to
+  carry the payload under any objective this project has tried, the
+  content **must** live outside the recurrent state, and the only
+  remaining route is a **store that is neither a copy nor a table** — and
+  if CL-6c's keyed store has already failed, there is nowhere left to put
+  it that is not the weights, and **the honest conclusion is that this
+  architecture, at this scale, with these objectives, does not do
+  continual learning.**
+
+In either case the programme switches to (a) packaging the findings for
+upstream and the community, and (b) scale and data on the upstream
+configuration, which is where the evidence says the remaining headroom is.
+
+**AND THE T-AXIS IS NOT A KILL CRITERION.** It is a speed question about
+a different axis of the design. It may be reported alongside, and it may
+inform what to build, but **it must not be able to close a
+continual-learning programme, and it must not be able to keep one open.**
 
 **Intermediate kill (per arm):** any arm that fails its pre-registered
 threshold is closed and is not re-run with different knobs. That rule is
@@ -764,4 +1047,38 @@ what the T-axis A/B needed and did not have.
   a bug. `UNMEASURED` is never `PASS`.
 - The measurement apparatus is treated as code with gates: **any number that
   decides a decision needs a test** (this is how D1 will be prevented from
-  recurring).
+  recurring). **A gate that has never failed is not known to test
+  anything** — every new gate is run against the pre-change code and the
+  failure is recorded.
+
+> ### THE CONTROLS RULE (added 2026-10-22 — the night's main product)
+>
+> **A measurement's meaning is set by its controls, and a control that is
+> ABSENT silently becomes the interpretation.** Tonight produced four wrong
+> conclusions in a row for exactly this reason, and twice had to be
+> corrected in the append-only log. **So:**
+>
+> - **Every recall cell carries a MATCHED NULL** (permuted labels, the
+>   same fixed readout) and a **NUISANCE CONTROL** (the target's key AND
+>   payload both replaced) and a **COPY CONTROL** (the payload in the
+>   input replaced, the key kept). A cell without them is **UNMEASURED**,
+>   never PASS.
+> - **Every FITTED readout is split over the things it could MEMORISE** —
+>   over the board facts, not over the rows. A row-level split on a finite
+>   board is **not** safe, and it is how a table came to be mistaken for a
+>   mechanism.
+> - **A REFIT PROBE IS NOT A RETENTION MEASURE.** Retention is measured
+>   with the model's own parameters; a refitted probe measures copyability.
+> - **The instrument's defaults must match the question.** A default that
+>   silently does not (the `--facts` 64 vs 4, the ACQUIRE board, the
+>   inert `nvrtc` branch) is a defect, and it is gated.
+> - **The verdict names the readout.** "ACQUIRE = 0.89" means nothing
+>   without saying whether the 0.89 came from a trained parameter or a
+>   probe fitted for the occasion.
+
+- **The programme's record is append-only, INCLUDING its own errors.** A
+  correction is a new section that supersedes the old one, and it must say
+  **which** claim it supersedes — §16 withdrew §14, and §22 withdrew part
+  of §20 and §21. **A reader who stops at the last section would be
+  misled by the earlier ones, so every superseding section carries a
+  pointer back.**
