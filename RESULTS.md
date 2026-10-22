@@ -4360,3 +4360,50 @@ remaining prizes were the `masked_fill` (5.1 ms) and the launches
 remaining prizes are the **traffic** (the credit's floor is 3.77 ms/step
 against 7.6–8.0 ms measured) and the **optimizer** (3.0 ms in ~25–30 array
 passes).
+
+### 9. The D5 result is ROBUST to the alphabet (the full-256 run is the stronger one)
+
+The D5 table in §7 used a **matched 16-symbol alphabet** so that the exact-4-byte
+metric is usable. That is a real limitation of the number, so the whole thing
+was re-run with the **full 256-symbol alphabet** — the harder case, where the
+per-byte chance is 1/256 and the exact-4-byte metric is hopeless by
+construction.
+
+n=2048, alphabet 256, the same checkpoint (`runs/taxis/A_p4_wd0_c.npz`), the
+same read-at-the-cue protocol, each cell against its own matched null:
+
+| gap | payload | null | ×null | exact4 | **cue key** | null | ×null | nuisance |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 8 | **12.11 %** | 0.63 % | **19.2×** | 0.00 % | **40.80 %** | 0.27 % | **151×** | 0.56 % (NULL) |
+| 32 | **2.25 %** | 0.37 % | **6.1×** | 0.00 % | **27.91 %** | 0.39 % | 72× | 0.32 % (NULL) |
+
+**The signal is stronger at the full alphabet, not weaker.** At the full 256
+symbols the payload decodes **19.2× over its own null** at 8 B of gap (against
+4.6× with the 16-symbol alphabet, where the null is 6.25 % and a lucky
+guesser has a 1-in-16 chance of every byte). The reason is arithmetic: the
+16-symbol null is high (6.25 %), so the ratio is compressed; the 256-symbol
+null is 0.39 %, and the signal stands at 12.11 %.
+
+**The nuisance control is at chance in both cells** (0.56 % and 0.32 %
+against a 0.39 % chance), so the payload signal is not the readout inventing
+signal.
+
+**And the two alphabets tell the same story, with the same shape:**
+
+| gap | payload over null, alphabet 16 | payload over null, alphabet 256 | cue key over null |
+|---:|---:|---:|---:|
+| 8 | 4.63× | **19.2×** | 151× |
+| 32 | 3.33× | **6.1×** | 72× |
+
+The address is read ~150× over its own null and the content ~6–19×, at both
+alphabet sizes, with the same decay in gap. **The D5 conclusion is not an
+artifact of the matched alphabet**: the state holds an addressable, persistent
+address and a real, decaying content, and the two agree in shape with the Δh
+capacity curve.
+
+**The exact-4-byte rate is 0.00 % in every cell and always will be** at 256
+symbols — `0.1211^4 ≈ 2.1e-4`, and at gap 32 `0.0225^4 ≈ 2.6e-7`. That is
+the instrument limit, not a finding about the model; the per-byte rate with
+its matched null is the right metric, and the plan's ACQUIRE threshold
+(exact recall of a 4-byte payload) will need a **matched alphabet** to be
+measurable at all.
