@@ -399,6 +399,87 @@ reach >= 0.50 exact recall at d=32 the recurrent state cannot be trained to
 hold a fact" — the head's 0.975 is at the **read-out**, not yet at the
 **behaviour**, and the ruler's verdict governs.
 
+### CL-2b — THE REAL BOTTLENECK: the memory is in the WEIGHTS, not in the state. (2026-10-22)
+
+**What CL-2 actually measured** (`RESULTS.md` §17; the script is
+`tools/cl2_memorization_test.py`; the three boards scored on fresh streams):
+
+| board | head (a read-out of the state at the cue) | behaviour (the model's logits) |
+|---|---|---:|
+| A — the pre-stream facts, no replay | **0.2031 / 0.0000** | 0.3828 / 0.0312 |
+| B — the stream facts | **0.9609 / 0.8438** | 0.9922 / 0.9688 |
+| C — never trained | 0.1016 / 0.0000 | 0.1094 / 0.0000 |
+
+* **ACQUIRE: PASS.** 0.8438 exact-4 on fresh streams (~5.8x the byte
+  prior; threshold >= 0.50).
+* **RETAIN: FAIL.** 0.0000 exact-4 — with no replay, 100% of the
+  pre-stream facts are gone.
+* **NO REGRESSION: FAIL in direction, UNMEASURED in magnitude** (the
+  text-only counterfactual does not exist).
+
+**The copy control re-targets the programme.** Replace the payload bytes
+**in the input** with fresh random bytes (cue and target unchanged): the
+head moves only 0.9609/0.8438 -> 0.8672/0.5938, and with the target tail
+also replaced the behaviour collapses 0.9922/0.9688 -> 0.0742/0.0000. So:
+
+1. **The behaviour number is a COPY** — the target bytes are literally in
+   the input at the next position. The 0.999/0.994 in the training log is
+   a copy of the input, not evidence of memory.
+2. **The payload is NOT in the recurrent state.** If it were, the head's
+   answer would have had to change when the input's payload changed. It
+   barely did. The state carries the **cue key** (trivially — the cue is
+   the last input byte) and the key->payload association lives in the
+   **head's weights**.
+
+**Therefore: the model never learned to hold a fact in its recurrent
+state. It learned a 512-entry key->payload lookup table in the head's
+weights.** That explains both numbers at once — it generalises across
+stream layouts (so board B is high on fresh streams) and it forgets board
+A completely (a global store has one slot per fact, and board B's 512
+entries overwrote board A's).
+
+**THE LEVER MOVES.** The D5 result said "the address persists, the content
+decays"; the truth is sharper — **the content was never in the state**.
+**P3 (write selectivity in the recurrent state) is aimed at the wrong
+place:** a more selective state write cannot fix a head whose weights were
+overwritten. The bottleneck is the **capacity and the stability of the
+associative store**, or moving the content out of the global weights into
+the per-sample state.
+
+**The three candidates, in priority order:**
+
+1. **CAPACITY.** One linear head (8192 -> 1024) holds 512 facts and must
+   hold 1024. Give it room and RETAIN may become non-zero. Cheapest arm;
+   separates "capacity" from "interference"; a pure head change.
+2. **THE STATE MUST CARRY THE PAYLOAD.** Today the gradient has a
+   **cheaper** path (the head's weights) than the expensive one (writing
+   the payload into the state, where a new fact can evict an old one), and
+   nothing in the loss or the architecture rewards the expensive path.
+   This is an architecture/training choice, not a tuning problem.
+3. **REPLAY.** The standard baseline, which the no-replay premise
+   currently forbids. **The honest reference point is missing: until a
+   replay baseline is measured on the same three numbers, "continual
+   learning is hard" is a claim without a control.**
+
+**The falsifier for (2), pre-registered:** if a state-forced variant still
+scores 0.0000 exact-4 on board B when the head is **zeroed or randomised**
+at eval, then the state does not carry the payload, the M1 / addressable-
+write line is dead, and the programme must fall back to (1) and (3) — which
+is a different programme.
+
+**The text regression is a SEPARATE failure with a separate cause** (the
+behavioural loss rides on the same logits as the text CE), and it needs its
+own arms — see `docs/design/CL2-INTERFERENCE-EXPERIMENT.md`. Do not merge
+the two stories: one is about *what the memory is*, the other about *what
+the fact training costs the language model*.
+
+**Also fix before the next ruler run:** the ruler's `--facts` default (64)
+does not match the trainer's (4), so a ruler run without `--facts` probes a
+stream the arm never saw and puts the RETAIN lag at 504+d, far past the
+~128 B horizon. The checkpoint already stores `cl2_facts`, `cl2_gap`,
+`cl2_alphabet` — **the ruler must read the arm's regime from the
+checkpoint by default.**
+
 ### CL-3 — The four ideas, on the ruler. (1 week, T4)
 Four arms, same seed / corpus / byte budget, judged **only** on the three
 CL-RULER numbers:
