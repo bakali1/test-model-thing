@@ -767,6 +767,18 @@ def main():
                          "Triton cannot run at all; triton = fused-kernel "
                          "fallback; nvrtc = NVRTC fused decay+credit+scatter, "
                          "the only fused path on pre-Volta GPUs (+33%% there)")
+    ap.add_argument("--fused-tail",
+                    choices=("auto", "on", "off"),
+                    default="off",
+                    help="the fused tail decay+credit (ONE pass over the "
+                         "accumulator instead of two). OFF BY DEFAULT: the "
+                         "NUMPY side is bit-identical to the unfused "
+                         "reference (tests/check_fused_tail.py pins max|dE| = "
+                         "0) but the TORCH side is not yet, and "
+                         "tests/check_parity.py catches it -- so turning this "
+                         "on trades the numpy==torch parity invariant for "
+                         "the speed. The switch is set on BOTH sides so an "
+                         "A/B is coherent.")
     ap.add_argument("--fused-adam",
                     choices=("auto", "on", "off"),
                     default="auto",
@@ -1008,6 +1020,7 @@ def main():
                 decay_init=args.decay_init,
                 ring_credit=args.ring_credit,
                 fused_adam=args.fused_adam,
+                fused_tail=args.fused_tail,
                 grad_assembly=args.grad_assembly,
                 sync_metrics=not args.async_metrics,
                 from_scratch=args.from_scratch, seed=args.seed,
@@ -1050,6 +1063,14 @@ def main():
         print(f"  [wd] the '.decay'/'.gate' groups get weight decay "
               f"{args.wd_decay} (default 0.01 = the incumbent's uniform "
               f"weight decay)")
+    if args.fused_tail != "off":
+        # The numpy reference resolves the same switch from the env var, so
+        # set it here: an A/B where only the torch side moved would be
+        # incoherent (and the parity gate would fail for the wrong reason).
+        os.environ["TMT_FUSED_TAIL"] = ("1" if args.fused_tail == "on"
+                                        else "auto")
+        print(f"  [tail] fused-tail={args.fused_tail} (OPT-IN: the torch "
+              f"side is not yet bit-identical to the numpy reference)")
     if args.fused_adam != "auto":
         print(f"  [adam] fused-adam={args.fused_adam} (auto = fused NVRTC "
               f"kernel on CUDA when it compiles, else the bit-identical "

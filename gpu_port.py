@@ -960,7 +960,7 @@ class GpuModel:
                  grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0,
                  ce_only=False, seqlen=1, gated=False, trace_mode="ring",
                  grad_clip=0.0, nan_guard=True, wd_decay=0.01,
-                 fused_adam="auto",
+                 fused_adam="auto", fused_tail="off",
                  fsp_alpha=0.0, fsp_r=16, fsp_tau=64, fsp_pos_weight=50.0,
                  fsp_layer=-1):
         # trace_mode: how per-byte embedding credit is accumulated.
@@ -1156,8 +1156,20 @@ class GpuModel:
         # same documented switch as numpy_port: TMT_TAIL=0 disables the exact
         # long-lag credit entirely (ring-only embed credit, as pre-tail).
         self.tail_enabled = os.environ.get("TMT_TAIL", "1") != "0"
-        self.tail_fused = _tc.tail_fused_resolve(
-            os.environ.get("TMT_FUSED_TAIL", "off"), self.device)
+        # The fused tail (ONE pass over E: decay in place AND accumulate the
+        # credit) is implemented on BOTH sides and the NUMPY side is
+        # bit-identical to the unfused reference (the gate
+        # tests/check_fused_tail.py pins max|dE| = 0 and max|dacc| = 0, and
+        # it touches the accumulator once instead of twice).  The TORCH side
+        # is NOT yet bit-identical to the numpy reference -- the parity gate
+        # (tests/check_parity.py) catches it -- so the default is `off` and
+        # the fused path is OPT-IN until that is fixed.  Turning it on
+        # deliberately trades the parity invariant for the speed; the flag
+        # says so, and the trainer sets the same switch on the numpy
+        # reference so an A/B is coherent.
+        _tail_val = os.environ.get("TMT_FUSED_TAIL", "off") \
+            if fused_tail is None else fused_tail
+        self.tail_fused = _tc.tail_fused_resolve(_tail_val, self.device)
         if self.tail_fused:
             print("  [tail] FUSED decay+credit enabled: 3 tail passes -> 2 "
                   "(one read of E per step). bit-identical on CPU (numba); "
@@ -2165,7 +2177,7 @@ class GpuModel:
                     if self.tail_fused:
                         # FUSED: decay+credit in one pass over E (1 read).
                         with rf("dense_decay_credit"):
-                            dembed += self._fused_credit(E, dlds, dec)
+                            dembed += self.tail._fused_credit(E, dlds, dec)
                     else:
                         with rf("dense_decay"):
                             E.mul_(dec[None, None, :])

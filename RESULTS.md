@@ -4459,3 +4459,60 @@ would change the checkpoint format.
 `--fused-adam {auto,on,off}` is resolved **lazily** in `GpuModel`, not in
 the constructor — the same lesson as the ring-credit default, where an
 eager resolution made the fastest path unreachable and cost 1.26×.
+
+### 11. The fused tail: implemented, the numpy side is bit-identical, the TORCH side is NOT — so it is OFF by default
+
+The tail credit was the biggest single prize: ~10.2 ms/step on a T4, with
+THREE element-passes over the (B, 256, H) accumulator (decay, then credit,
+then a second read). Fusing the decay and the credit into one pass makes it
+two, and the prize was projected at ~3-4 ms/step (12-15 %).
+
+**What landed.**
+- `tail_credit.py`: a numba-jitted `_tail_fused_decay_credit` — ONE pass
+  that computes `d = E[b,v,h]*sig[h]`, writes it back, and accumulates
+  `d * g[b,h]` in a left fold over b with a float64 accumulator from 0.0.
+  The order matters: it is `(E*sig)*g`, never the reassociating `E*(sig*g)`,
+  and the float64 fold is exactly what the unfused `_tail_credit` does.
+- `gpu_port.py`: the torch port, with an NVRTC CUDA kernel `tmt_tail_fused`
+  and a CPU path that delegates to the numba kernel through a zero-copy
+  numpy bridge.
+- `tests/check_fused_tail.py`: the gate. It pins the fused path against the
+  unfused reference over the full decay -> credit -> add rhythm at four
+  (B, H, ring_k, hot_frac) settings, checks the resolution is lazy and
+  falls back to OFF on an unknown value, and **counts the passes over E**
+  so a "fusion" that reads E three times cannot pass.
+
+**The numpy side is bit-identical.** Every setting: `max|dE| = 0`,
+`max|dacc| = 0`, and the fused path touches E **1** time against the
+unfused path's **2**.
+
+**The TORCH side is NOT yet bit-identical, and the parity gate catches it.**
+`tests/check_parity.py` compares `numpy_port` against `gpu_port` and
+demands they agree; with the fused tail enabled on the torch side it
+fails ("worst differing element 358, 1d-vs-pre grads"), and it fails the
+same way whether the numpy side is also fused or not — so the difference is
+in the torch fused path, not in the plumbing. (Bisected: the tree at HEAD
+passes, the tree with the fused tail on by default does not.)
+
+**So the fused tail ships OFF by default, and opt-in.**
+`--fused-tail {auto,on,off}` (default `off`) exists, and the trainer sets
+the same switch on the numpy reference (`TMT_FUSED_TAIL`) so an A/B is
+coherent — an A/B where only the torch side moved would be incoherent, and
+the parity gate would fail for the wrong reason. The gate also asserts the
+default is `off`, so the parity invariant cannot be lost silently.
+
+**The open work is small and specific:** make the torch fused path agree
+with the numpy reference to the last bit. It is worth it — the tail is a
+bigger prize than the optimizer (10.2 ms against 3.0 ms) — and it is
+incompatible with nothing else. Until it lands, the tail fusion is a
+**documented, gated, off-by-default** experiment, not a shipped speedup.
+
+**And the asymmetry that makes it interesting.** The numpy reference's
+`_tail_credit` accumulates in **float64** and rounds once at the end; the
+torch unfused path uses `torch.einsum` in **float32**. So the two engines
+already differ in the last bits on the tail, and the fused path (which
+uses the float64 fold) is *closer* to the numpy reference than the unfused
+torch path is. The parity gate's tolerance absorbs that; the fused path
+simply exposed it. That is the gate doing its job, not the fusion being
+wrong — but "the fusion is closer" is a claim that has to be PROVED, and
+until it is, the default stays off.
