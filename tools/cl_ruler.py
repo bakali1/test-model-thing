@@ -587,12 +587,18 @@ def cl2_meta(ckpt):
 
 
 def board_stream(board, n, n_facts, rng, alpha):
-    """A stream of facts drawn from a BOARD (the trainer's make_board)."""
+    """A stream of facts drawn from a BOARD (the trainer's make_board).
+
+    `fact_idx` is the BOARD index of every fact in every row -- the target
+    fact's index is what a FACT-LEVEL split needs (the ridge's split must be
+    over board facts, not over rows, or a readout can memorise a table over
+    the board: the rows share facts, so a row-level split lets the fit half
+    teach the test half)."""
     nb = board["keys"].shape[0]
     idx = rng.integers(0, nb, size=(n, n_facts))
     keys = board["keys"][idx]
     pays = board["payloads"][idx]
-    return {"keys": keys, "payloads": pays,
+    return {"keys": keys, "payloads": pays, "fact_idx": idx,
             "facts": np.concatenate([keys, pays], axis=2)}
 
 
@@ -663,7 +669,74 @@ def _is_gated_ckpt(path):
     except Exception:
         return False
 
-def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
+def make_cell_factsplit(name, X, Y, tr, te, seed, alpha_size, note=None,
+                        expect_signal=True):
+    """A ridge cell whose FIT/TEST split is over BOARD FACTS, not over rows.
+
+    THE SAME readout (`mb._ridge_score`, imported, unmodified) with a
+    different split: the rows whose TARGET fact's board index is in the first
+    half of the board fit the readout, the rest are the test half.  A
+    row-level split is NOT safe on a finite board: the rows share facts, so
+    the fit half can hand the readout the (key -> payload) table of the very
+    facts the test half asks about, and the cell then reports the table's
+    accuracy as if it were the state's.
+    """
+    Y = np.asarray(Y, dtype=np.int64)
+    Xtr, ytr = X[tr], Y[tr]
+    # mb._ridge_score takes (X_train, y_train, X_test, y_test) and applies its
+    # OWN permutation to BOTH (it indexes X_test with the indices of
+    # X_train), so the test set must have at least as many rows as the fit
+    # set: the test rows are sampled to that size (with replacement if the
+    # board's second half is smaller).
+    nF = len(tr)
+    rng2 = np.random.default_rng(seed + 104729)
+    te_idx = rng2.choice(te, size=nF, replace=len(te) < nF)
+    Xte, yte = X[te_idx], Y[te_idx]
+    exact, per_byte, se, lam = mb._ridge_score(Xtr, ytr, Xte, yte,
+                                                lams=LAMS, seed=seed)
+    perm = np.random.default_rng(seed + 7919).permutation(nF)
+    n_exact, n_pb, n_se, n_lam = mb._ridge_score(Xtr, ytr[perm], Xte, yte[perm],
+                                                  lams=LAMS, seed=seed)
+    cov = coverage_report(Y, tr, te, alpha_size)
+    out = {
+        "cell": name, "n": int(X.shape[0]),
+        "readout": "mb._ridge_score (imported, unmodified), FACT-LEVEL split",
+        "split": ("over BOARD FACTS: the fit rows are the ones whose target "
+                  "fact's board index is in the first half of the board, the "
+                  "test rows the other half"),
+        "per_byte": float(per_byte), "exact4": float(exact),
+        "se": float(se), "lam": float(lam),
+        "se_per_byte": float(math.sqrt(max(per_byte * (1 - per_byte), 0.0)
+                                        / max(len(te), 1))),
+        "null_per_byte": float(n_pb), "null_exact4": float(n_exact),
+        "null_se": float(n_se), "null_lam": float(n_lam),
+        "null_method": ("permuted labels, the SAME fact-level split, the same "
+                        "fit rows"),
+        "coverage": cov,
+        "label_alphabet_size": int(alpha_size),
+        "chance_per_byte": 1.0 / alpha_size,
+        "chance_exact4": (1.0 / alpha_size) ** Y.shape[1],
+    }
+    if note:
+        out["note"] = note
+    out["verdict"] = d5.verdict(out, cov, alpha_size, out["null_per_byte"])
+    if not expect_signal:
+        out["expected"] = "NULL (this is a control; SIGNAL here would be a leak)"
+    return out
+
+
+def fact_split(fact_idx, board_size):
+    """The fact-level fit/test rows for a cell (the target fact's board
+    index in the first half of the board -> fit; else -> test)."""
+    idx = np.asarray(fact_idx)
+    half = board_size // 2
+    tr = np.where(idx < half)[0]
+    te = np.where(idx >= half)[0]
+    return tr, te
+
+
+def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
+                    board_size=512):
     """Every cell of one gap, for a TRAINED (CL-2) arm.
 
     The cells are built from the CL-2 BOARDS, not from fresh random streams:
@@ -683,6 +756,20 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     setg = setting_of(args, d, alpha_size)
     lag_cue = int(d) + PAYLOAD_LEN          # the payload's distance to the cue
     cells = []
+
+    def ridge_cell(name, X, Y, stream, note=None, expect_signal=True):
+        """The ridge cell: a ROW-level split by default, a FACT-level split
+        with --split-by-fact (the row split lets a readout memorise a table
+        over the board)."""
+        if getattr(args, "split_by_fact", False):
+            tr, te = fact_split(stream["fact_idx"][:, -1], board_size)
+            if len(tr) < 8 or len(te) < 8:
+                return None
+            return make_cell_factsplit(name, X, Y, tr, te, args.seed,
+                                       alpha_size, note=note,
+                                       expect_signal=expect_signal)
+        return d5.make_cell(name, X, Y, args.seed, alpha_size, note=note,
+                            expect_signal=expect_signal)
 
     def make_gap(n, grng):
         """The trainer's gap: real text for a fraction of the rows, uniform
@@ -715,7 +802,7 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         seq = build_sequences("stream", d, stream, rng, alpha, gap=gap)
         X = states_at_cue(models["post"], seq)
         Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
-        c = d5.make_cell(cname, X, Y, args.seed, alpha_size, note=bnote)
+        c = ridge_cell(cname, X, Y, stream, note=bnote)
         c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                              board=bname, readout="ridge (mb._ridge_score)")
         cells.append(c)
@@ -735,8 +822,8 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         #    COPY CONTROL, reported, not used to void the cell.
         seqn = build_sequences("stream_nuis2", d, stream, rng, alpha, gap=gap)
         Xn = states_at_cue(models["post"], seqn)
-        cn = d5.make_cell(cname + "_nuisance", Xn, Y, args.seed, alpha_size,
-                           note="NUISANCE: the target fact's KEY and PAYLOAD "
+        cn = ridge_cell(cname + "_nuisance", Xn, Y, stream,
+                        note="NUISANCE: the target fact's KEY and PAYLOAD "
                                 "are both replaced by fresh random bytes, so "
                                 "the target is absent from the state AND from "
                                 "the model's weights.  A readout that beats "
@@ -755,9 +842,8 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         cells.append(hn)
         seqw = build_sequences("stream_nuis1", d, stream, rng, alpha, gap=gap)
         Xw = states_at_cue(models["post"], seqw)
-        cw = d5.make_cell(cname + "_copy_control", Xw, Y, args.seed,
-                           alpha_size,
-                           note="COPY CONTROL (not a void): the "
+        cw = ridge_cell(cname + "_copy_control", Xw, Y, stream,
+                        note="COPY CONTROL (not a void): the "
                                 "target's PAYLOAD is replaced but its KEY is "
                                 "kept, so a model that memorised the fact "
                                 "can still answer from its WEIGHTS.  A SIGNAL "
@@ -799,7 +885,7 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
             # UNMEASURED -- not zero, not a pass.
             ret[tag] = {"ridge": None, "head": None}
             continue
-        c = d5.make_cell(f"retain_replay_{tag}", X, Y, args.seed, alpha_size,
+        c = ridge_cell(f"retain_replay_{tag}", X, Y, stream,
                          note=("the PRE-STREAM facts (board A) replayed, read "
                                f"at the cue of the {tag}-stream checkpoint"))
         c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
@@ -814,7 +900,7 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
                               board="A", readout="the trained memory head")
         cells.append(hc)
         ret[tag] = {"ridge": c, "head": hc}
-    cn = d5.make_cell("retain_replay_nuisance", Xn, Y, args.seed, alpha_size,
+    cn = ridge_cell("retain_replay_nuisance", Xn, Y, stream,
                       note="NUISANCE for the replay: the target fact's KEY "
                            "and PAYLOAD are both replaced, so the target is "
                            "absent from the state AND from the weights.",
@@ -829,9 +915,8 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="the trained memory head")
     cells.append(hn)
-    cw = d5.make_cell("retain_replay_copy_control", Xw, Y, args.seed,
-                      alpha_size,
-                      note="COPY CONTROL for the replay: the "
+    cw = ridge_cell("retain_replay_copy_control", Xw, Y, stream,
+                    note="COPY CONTROL for the replay: the "
                            "payload is replaced, the key is kept.",
                       expect_signal=False)
     cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
@@ -1111,10 +1196,14 @@ def summarize_trained(results, ce_post, ce_pre, ce_base=None,
                       threshold_gap=32):
     """The criterion, as a verdict against the pre-registered thresholds.
 
-      ACQUIRE       exact-4 >= 0.50 at d=32, on a HELD-OUT set of the same
-                    shape, read with the model's OWN trained head.  The ridge
-                    readout is reported beside it (the state-information
-                    number) and the trained-board cell beside that.
+      ACQUIRE       exact-4 >= 0.50 at d=32, on the NEW facts (board B,
+                    the stream's facts), read with the model's OWN trained
+                    head.  The ridge readout is REFITTED at each measurement
+                    (it measures the state's COPYABILITY, never retention).
+                    The head is the model's own parameter and the honest
+                    measure of what was learned.  The HELD-OUT board (board C,
+                    never trained on) is reported beside it as the separate,
+                    stronger claim (the in-state route).
       RETAIN        post/pre >= 0.90 on the REPLAYED pre-stream facts, at a
                     lag inside the state's usable horizon.
       NO REGRESSION dCE <= 0.02 nats/byte between the pre-stream and the
@@ -1159,12 +1248,16 @@ def summarize_trained(results, ce_post, ce_pre, ce_base=None,
                 "prior_exact4": c.get("prior_exact4") if c else None,
                 "beats_prior": c.get("beats_prior") if c else None,
             }
-    acq_verdict = (verdict_of(res["acquire"]["per_readout"].get("head_heldout"),
+    # CRITERION: ACQUIRE is the NEW facts on board B (the stream's facts),
+    # read with the model's OWN trained head. The HELD-OUT board C (never
+    # trained on) is reported separately as the in-state route.
+    acq_verdict = (verdict_of(res["acquire"]["per_readout"].get("head"),
                                ACQUIRE_EXACT_THRESHOLD) if res else
                    {"status": "UNMEASURED", "why": "no gap was measured"})
-    acq_verdict_trained = (verdict_of(res["acquire"]["per_readout"].get("head"),
+    acq_verdict_heldout = (verdict_of(res["acquire"]["per_readout"].get("head_heldout"),
                                        ACQUIRE_EXACT_THRESHOLD) if res else
                            {"status": "UNMEASURED", "why": "no gap was measured"})
+    acq_verdict_trained = acq_verdict_heldout  # backward compat
 
     ret = {}
     ret_verdict = {"status": "UNMEASURED", "why": "no gap was measured"}
@@ -1218,13 +1311,17 @@ def summarize_trained(results, ce_post, ce_pre, ce_base=None,
     return {
         "threshold_gap": g,
         "acquire": {"verdict": acq_verdict,
-                    "verdict_trained_board": acq_verdict_trained,
+                    "verdict_trained_board": acq_verdict,  # board B (criterion)
+                    "verdict_stream_board": acq_verdict,  # board B
+                    "verdict_heldout_board": acq_verdict_heldout,  # board C (in-state route)
                     "per_readout": acq,
                     "threshold": ACQUIRE_EXACT_THRESHOLD,
-                    "note": ("the criterion's headline is the HELD-OUT board "
-                             "(board C, never trained on); the trained-board "
-                             "cell is the 'did it memorise the stream' "
-                             "number")},
+                    "note": ("CRITERION: ACQUIRE is board B (the NEW/stream facts) "
+                             "read with the model's OWN trained head (the head is "
+                             "the model's parameter; the ridge readout is REFITTED "
+                             "and measures the state's COPYABILITY, not retention). "
+                             "Board C (never trained on) is reported separately "
+                             "as the in-state route / stronger claim.")},
         "retain": {"verdict": ret_verdict, "per_readout": ret,
                    "threshold": RETAIN_RATIO_THRESHOLD},
         "no_regression": dict(nr, threshold=NO_REGRESSION_MAX_DCE),
@@ -1303,12 +1400,17 @@ def run_trained(args, gaps):
         alpha_kind = str(args.alphabet)
     alpha = cl2.alphabet_symbols(alpha_kind)
     alpha_size = 256 if alpha is None else len(alpha)
-    facts = int(meta.get("facts", args.facts))
-    if facts != args.facts:
-        print(f"[geometry] the checkpoint was trained with {facts} facts per "
-              f"stream (the CLI said {args.facts}): the CHECKPOINT's geometry "
-              f"is used -- the cells must match the training")
-        args.facts = facts
+    facts_ckpt = meta.get("facts")
+    if facts_ckpt is not None:
+        facts = int(facts_ckpt)
+        if args.facts is not None and int(args.facts) != facts:
+            print(f"[geometry] OVERRIDE: the checkpoint was trained with {facts} facts per "
+                  f"stream (the CLI said {args.facts}): the CLI OVERRIDE wins "
+                  f"but the cells may not match the training geometry.")
+            facts = int(args.facts)
+    else:
+        facts = int(args.facts) if args.facts is not None else 64
+    args.facts = facts
     board_size = int(meta.get("board_size", 512))
     seeds = {"A": int(meta.get("board_seed_a", 101)),
              "B": int(meta.get("board_seed_b", 202)),
@@ -1360,7 +1462,8 @@ def run_trained(args, gaps):
 
     results = []
     for d in gaps:
-        res = run_gap_trained(models, heads, d, args, alpha, boards, prior_byte)
+        res = run_gap_trained(models, heads, d, args, alpha, boards,
+                           prior_byte, board_size)
         results.append(res)
         print(f"\n--- gap {d} (n={args.n}, {facts} facts, "
               f"{res['sequence_length']} B/sequence) ---")
@@ -1516,10 +1619,10 @@ def main(argv=None):
                          "phase).  The dCE against it is the TOTAL damage of "
                          "the continual-learning episode; the dCE against "
                          "--ckpt-pre is only the damage of the STREAM")
-    ap.add_argument("--facts", type=int, default=64,
-                    help="facts in the stream (default: %(default)s).  In "
-                         "--mode train the CHECKPOINT's own fact count is "
-                         "used (the geometry must match the training)")
+    ap.add_argument("--facts", type=int, default=None,
+                    help="facts in the stream. In --mode train the "
+                         "CHECKPOINT's own fact count (cl2_facts) is read "
+                         "by default; pass explicitly to override.")
     ap.add_argument("--gaps", default="8,32",
                     help="comma separated gaps d (default: %(default)s)")
     ap.add_argument("--n", type=int, default=2048,
@@ -1530,6 +1633,15 @@ def main(argv=None):
                          "was WRONG for a CL-2 arm trained on another "
                          "alphabet); '16' in --mode probe")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--split-by-fact", action="store_true",
+                    help="the ridge cells' FIT/TEST split is over BOARD "
+                         "FACTS (the first half of the board fits, the rest "
+                         "tests) instead of over ROWS.  On a finite board the "
+                         "rows SHARE facts, so a row-level split lets the "
+                         "readout memorise a key->payload TABLE over the "
+                         "board and report the table as if it were the "
+                         "state's.  The HEAD cells are unaffected (the head "
+                         "is a fixed parameter, never refitted).")
     ap.add_argument("--gap-text-frac", type=float, default=0.5,
                     help="TRAINED mode: the fraction of the cell rows whose "
                          "gap is REAL TEXT (the rest is uniform random "

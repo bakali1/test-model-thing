@@ -428,6 +428,14 @@ def eval_memory(model, heads, board, alpha, args, rng, prior, tag):
     batch = build_fact_batch(args.eval_batch, board, alpha, text_pool,
                              args.text_frac, args.gap, rng, n_facts=args.facts)
     lay = batch["lay"]
+    # the EVAL-TIME SWITCH: a fresh random head for the measurement, the
+    # trained head restored afterwards (the training is untouched).
+    saved = None
+    if getattr(args, "head_eval_fresh", False) and heads[0] is not None:
+        saved = (heads[0].detach().clone(), heads[1].detach().clone())
+        with torch.no_grad():
+            torch.nn.init.xavier_normal_(heads[0], gain=1.0)
+            heads[1].zero_()
     with torch.no_grad():
         logits, state_cue = engine_forward(model, batch["seq"], lay["cue_last"],
                                            use_checkpoint=False)
@@ -447,6 +455,10 @@ def eval_memory(model, heads, board, alpha, args, rng, prior, tag):
                 batch["seq"][:, b0 + 1:b1 + 1].astype(np.int64)).to(logits.device)
             out["behav_per_byte"] = float((bp == bt).float().mean())
             out["behav_exact4"] = float((bp == bt).all(dim=1).float().mean())
+    if saved is not None:
+        with torch.no_grad():
+            heads[0].copy_(saved[0])
+            heads[1].copy_(saved[1])
     # the prior baselines on the SAME targets
     tgt = batch["pay_new"]
     for name, byte in (("prior", prior["argmax_alpha"]),
@@ -753,6 +765,15 @@ def build_argparser():
                     help="the real-text background (NOT data/eval)")
     ap.add_argument("--memory-alpha", type=float, default=0.25,
                     help="the weight of the memory loss (the NEW thing)")
+    ap.add_argument("--head-frozen", action="store_true",
+                    help="ARM H1: FREEZE the memory head's weights (and bias) "
+                         "at their random initialisation.  The head is then a "
+                         "FIXED random readout of the state at the cue: it "
+                         "cannot accumulate a key->payload TABLE, so the ONLY "
+                         "way to reduce the memory loss is to make the STATE "
+                         "carry the payload.  (The model's own weights could "
+                         "still carry a table -- the RETAIN cell and the copy "
+                         "control are the instruments that expose that.)")
     ap.add_argument("--memory-alpha-old", type=float, default=0.0,
                     help="the weight of the oldest-fact memory head (the "
                          "ruler's RETAIN cell target)")
@@ -772,6 +793,14 @@ def build_argparser():
                          "ONLY (0 by default: a decay on the decay logits is a "
                          "systematic pull toward a ONE-BYTE half-life, i.e. "
                          "toward no memory at all)")
+    ap.add_argument("--head-eval-fresh", action="store_true",
+                    help="EVAL-TIME SWITCH: at every memory evaluation, use a "
+                         "FRESHLY re-initialised (random) head instead of the "
+                         "trained one, and restore it afterwards.  This is the "
+                         "FALSIFIER for a table: if the head's accuracy "
+                         "collapses to the prior with a fresh head, the "
+                         "answer was in the head's WEIGHTS, not in the state. "
+                         "The default path is untouched.")
     ap.add_argument("--eval-batch", type=int, default=256,
                     help="streams per evaluation batch (the memory head's "
                          "accuracy, the behavioural recall and the prior)")
@@ -978,6 +1007,14 @@ def main(argv=None):
     # the memory head: [Wm, bm] for the newest fact, [Wm_old, bm_old] for the
     # oldest fact (the ruler's RETAIN cell target).
     heads = list(build_head(model)) + list(build_head(model))
+    if args.head_frozen:
+        # ARM H1: the head is a FIXED random readout of the state.  It cannot
+        # learn, so it cannot carry the key->payload table; the memory loss
+        # can then only be reduced by writing the payload into the STATE.
+        for h in heads:
+            h.requires_grad_(False)
+        print("[head] FROZEN at the random init (ARM H1): the memory loss "
+              "can now only be reduced through the STATE.", flush=True)
     # P6: the decay mask -- the DECAY LOGITS only, and only if --wd-decay is
     # not 0.  The mask is a bool vector over theta, aligned with model.shapes.
     decay_mask = None
@@ -1015,6 +1052,7 @@ def main(argv=None):
                          "board_seed_a": args.board_seed_a,
                          "board_seed_b": args.board_seed_b,
                          "board_seed_c": args.board_seed_c,
+                         "head_frozen": bool(args.head_frozen),
                          "prior": json.dumps(prior)})
         print(f"[init] from scratch, seed={args.seed}, P4 half-life "
               f"{args.half_min}-{args.half_max} B, dim={args.dim}, "
@@ -1152,6 +1190,7 @@ def main(argv=None):
                                        "board_seed_a": args.board_seed_a,
                                        "board_seed_b": args.board_seed_b,
                                        "board_seed_c": args.board_seed_c,
+                                       "head_frozen": bool(args.head_frozen),
                                        "prior": json.dumps(prior),
                                        "memory_eval": json.dumps(evals)})
                 print(f"    [save] {path}", flush=True)
