@@ -24,6 +24,33 @@ random bytes, leaving the cue and the target unchanged.  A memoriser of the
 training streams still outputs the OLD payload (it memorised the whole
 stream) and so keeps its score; a genuine state-held fact must COLLAPSE to
 chance, because the state now holds the NEW random payload.
+
+THE NUMBERS IT PRINTS (2026-10-22, the MX150, armA_f2_end.npz, --batch 64,
+one board per run --board-seed 101/202/303, alphabet 16, facts 4, gap 32):
+
+  board                                   head per-byte / exact-4   behav per-byte / exact-4
+  A (the PRE-STREAM facts, no replay)      0.2031 / 0.0000            0.3828 / 0.0312
+  B (the STREAM's facts)                    0.9609 / 0.8438            0.9922 / 0.9688
+  C (never trained on)                      0.1016 / 0.0000            0.1094 / 0.0000
+  chance                                   0.0625 / 1.53e-05          0.0625 / 1.53e-05
+  the global byte prior                    0.1659 /byte
+
+  the COPY CONTROL: the payload bytes IN THE INPUT replaced by fresh random
+  bytes (the cue and the target unchanged):  head 0.9609/0.8438 ->
+  0.8672/0.5938  (the head barely moves: the answer is in the WEIGHTS, not
+  in the state);  and with the TARGET TAIL also replaced:  behav
+  0.9922/0.9688 -> 0.0742/0.0000  (the behavioural number is a COPY of the
+  input).
+
+  THE READING: the model did not learn to hold a fact in its recurrent
+  state.  It learned a 512-entry key->payload TABLE in the head's weights:
+  a table has one slot per fact, so the stream's 512 facts overwrite the
+  pre-stream's 512 (RETAIN's exact-4 ratio 0.0022).
+
+USAGE
+-----
+    .venv/bin/python tools/cl2_memorization_test.py --ckpt runs/cl2/armA_f2_end.npz
+    .venv/bin/python tools/cl2_memorization_test.py --help
 """
 import argparse
 import glob
@@ -33,7 +60,10 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# the REPO ROOT on the path, so `import tools.cl2_train` works from any
+# cwd (the old line put tools/ itself on the path, so the import only
+# worked when the repo root happened to be on sys.path already).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tools.cl2_train as C  # noqa: E402
 
 
@@ -54,8 +84,12 @@ class A:
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ckpt", required=True,
+                    help="the CL-2 checkpoint to probe (a numpy_port-compatible "
+                         ".npz written by tools/cl2_train.py)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--board-seed", type=int, default=202)
     ap.add_argument("--board-size", type=int, default=512)

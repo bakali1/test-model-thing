@@ -5300,3 +5300,78 @@ capacity, and not write selectivity: **it is that the only two stores the
 architecture has are a copy and a table, and neither is written once and
 read many times.** The next experiment is to build the third kind and
 measure it on the same three numbers.
+
+### 22. THE ARM'S OWN CE TRAJECTORY (the interference signature is a SHAPE), THE TOOL FIXES, AND THE QUEUE.
+
+**A. THE HELD-OUT CE TRAJECTORY OF armA, and what its SHAPE says.** The
+trainer's own cell (1 slice x 1000 B; the ruler's 120 000 B cell is a
+DIFFERENT measurement and the two are not interchangeable):
+
+```
+pre   0 5.9863 |  100 3.1128 |  200 2.9856
+f1  100 8.4117 |  200 7.0351 |  300 7.6295 |  400 7.7234 |  500 7.4451 |
+    600 6.6848 |  700 6.0694 |  800 5.9299 |  900 5.3815 | 1000 4.9274
+f2  100 5.7354 |  200 5.1423 |  300 4.7095 |  400 4.3354 |  500 4.1937 |
+    600 4.2113 |  700 4.0011 |  800 4.2896 |  900 4.3778 | 1000 4.5938
+```
+
+In **f1** the CE SPIKES to 8.41 (the fact loss takes the output path) and
+then RECOVERS to 4.93 while `ce_behav` falls 1.55 -> 0.045.  In **f2** the CE
+falls to 4.19 at step 500 and then **RISES** to 4.59 while `ce_behav` falls
+0.054 -> 0.018 and the head's fact accuracy climbs to 0.975/0.910.  **As the
+fact behaviour improves, the text gets worse.**  That is a sharper statement
+than "the CE went up": it is a **capacity/interference signature for one
+output path doing two jobs**, and the mechanism is specific — in
+`tools/cl2_train.py:train_step` the behavioural loss and the text CE are
+computed on the **SAME logits** (`flat`), so the payload slots' loss and the
+text's loss share one output path.
+
+**B. THE BEHAVIOURAL NUMBER IS A COPY.**  The trainer's layout puts the
+target bytes *in the input* right after the cue (`seq[:, tgt0:tgt1] =
+pays[:, -1]`), so the model can emit them by copying: with the target tail
+also replaced, the behavioural accuracy collapses from 0.9922/0.9688 to
+**0.0742/0.0000**, while the head only falls from 0.9609/0.8438 to
+0.8672/0.5938 (`tools/cl2_memorization_test.py`).  The 0.999/0.994 in the
+training log is a copy of the input, not evidence of memory.  The head is
+the copy-free readout, and the copy control is now a **first-class cell** in
+the ruler (`*_copy_control`: the payload IN THE INPUT replaced, the cue and
+the target unchanged) beside every recall cell.
+
+**C. TWO MORE FIXES TO THE RULER, both of the same class as the `--facts`
+default.**  (i) **The arm's geometry is read from the CHECKPOINT by
+default** (`cl2_facts`, `cl2_gap`, `cl2_alphabet`, all stored by the
+trainer), overridable with `--facts`/`--alphabet`; the old default
+`--facts 64` probed a shape the arm never saw and put the RETAIN lag at
+8*(facts-1)+d = 504+d, four times the 128 B horizon.  (ii) **The RETAIN
+cell's lag is inside the horizon**: the pre-stream board is replayed in the
+SAME geometry as the ACQUIRE cell (lag d+4 = 12/36/68 B), so pre and post
+are the same rows and the same read, and a cell whose target is beyond
+`HORIZON_B = 128` (D5) is UNMEASURED, never a PASS.
+
+**D. THE THREE NUMBERS, ONCE MORE, IN ONE PLACE** (the ruler, the arm's
+regime, n=512, gap 32; the full table and the JSON in
+`docs/results/CL2-REAL-ARM-2026-10-22.md` §2):
+
+| cell | per-byte | exact-4 | matched null | verdict |
+|---|---:|---:|---:|---|
+| ACQUIRE board B (the stream's facts), the trained head | 0.9697 | 0.8906 | 0.0747 / 0.0020 | **PASS** (threshold 0.50) |
+| ... the same, the COPY CONTROL (the payload in the input replaced) | 0.8940 | 0.6758 | 0.0747 / 0.0020 | the head barely moves -> the answer is in the WEIGHTS |
+| ACQUIRE board C (never trained) | 0.1011 | 0.0000 | 0.0586 / 0.0000 | **NULL** on exact-4 |
+| RETAIN board A, pre -> post (the head) | 0.9644 -> 0.1978 | 0.8691 -> 0.0020 | ratio **0.2051 / 0.0022** | **FAIL** (threshold 0.90) |
+| the global byte prior (the FSP arm's comparison) | 0.0596 | 0.0000 | — | the head is 16x the prior per byte, 44000x on exact-4 |
+| NO REGRESSION, ruler CE (120 000 B, 6 slices) | base 3.0695 | pre 4.8854 | post **5.2037** | **FAIL** (dCE +0.3183; base->post +2.1342) |
+
+**E. THE QUEUE (the MX150 is serial; the runs survive the agent).**
+`runs/cl2/queue.sh` waits for armB and then runs, in order: **(1) the STORE
+ARM** (`--board-size 64`, the capacity theory's direct test), **(2) A5** (the
+text-only counterfactual, 2200 text-only steps), **(3) the store arm's
+matched control** (`--board-size 64 --memory-alpha 0`).
+`runs/cl2/ruler_watch.sh` scores every arm the moment its `*_f2_end.npz`
+appears (`--gaps 8,32,64 --n 512`, the arm's own regime), on the CPU, in
+parallel with the GPU queue.  **Pre-registered for the store arm**: the
+head's exact-4 on board A (post) must rise by **>= 0.05 absolute** over the
+board-512 arm's 0.0020, ACQUIRE (board B) must not drop by more than 0.05,
+and the held-out CE must be within 0.05 nats/B of the board-512 arm's.
+**armB answers a DIFFERENT question from A5** and the two must be reported
+separately: armB is "does the **MEMORY loss** cost text" (it also spends
+2000 steps on fact streams); A5 is "does the **FACT TRAINING** cost text".
