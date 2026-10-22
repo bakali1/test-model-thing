@@ -57,7 +57,7 @@ The default engine is untouched: `theta`'s layout, the numerics and
 | `tests/check_optimizations.py` | **PASS** |
 | `tests/check_safety.py` | **PASS** |
 
-(the whole `tests/` suite passes: 33 files, `.venv/bin/python`, CPU.)
+(the whole `tests/` suite passes: 32 files, `.venv/bin/python`, CPU.)
 
 ### 2.1 The credit's deviation from autograd — the number, not just the PASS
 
@@ -92,6 +92,11 @@ Other pinned facts, all in the same file:
   recurrence reduces exactly to `sigmoid(decay)`) but its derivative is not.
 * the dense credit vs the ring incumbent: `dembed` rel dev 0.000e+00 (the
   ring is exact at `T < ring_k`).
+* a **gated checkpoint round-trips**: the gate's parameters, the gate's
+  cross-time trace, the dense credit trace and the parameters themselves all
+  come back bit-exactly, and the resumed run continues **bit-identically**
+  (the same gradient on the next step, from the checkpoint) -- in the numpy
+  reference too.
 * the design's §2 measurement, now permanent: with no truncation, ring ==
   dense == the explicitly enumerated survival products at **0.000e+00** under
   a per-sample, time-varying retention; with truncation, the ring drops

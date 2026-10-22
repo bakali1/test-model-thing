@@ -250,6 +250,48 @@ def build_text_batch(B, L, text_pool, rng):
 # ---------------------------------------------------------------------------
 # the model
 # ---------------------------------------------------------------------------
+def rebind_views(model):
+    """REBIND the parameter views so that autograd can reach theta.
+
+    BUG (found 2026-10-22, and it is the reason the first CL-2 arm was "at
+    UNIFORM"):  GpuModel builds its parameter VIEWS (model.views) while
+    theta does NOT require grad, and build_model then calls
+    theta.requires_grad_(True).  A view of a tensor that did not require
+    grad is a DETACHED leaf: after the base is switched it reports
+    requires_grad=True, but it has no grad_fn, so the autograd engine
+    accumulates NOTHING into it -- and because the base's own .grad stays
+    None, the gradient is SILENTLY LOST.  loss.backward() raises no error,
+    the optimizer sees p.grad is None and skips the parameter, and the arm
+    trains NOTHING: the weights stay at their initialisation and the
+    held-out CE stays at ln(256) = 5.5452 forever.
+
+    The fix is to create the views AFTER theta requires grad: then they are
+    ordinary differentiable views (grad_fn=ViewBackward0) and the gradient
+    lands in theta.grad, which the optimizer actually uses.
+    """
+    off = 0
+    views = {}
+    for name, shape in model.shapes:
+        size = int(np.prod(shape))
+        views[name] = model.theta[off:off + size].view(shape)
+        off += size
+    model.views = views
+    model.embed = views["embed"]
+    model.Wd, model.bd = views["Wd"], views["bd"]
+    model.Ws, model.bs = views["Ws"], views["bs"]
+    if "fsp.W" in views:
+        model.fsp_W, model.fsp_b = views["fsp.W"], views["fsp.b"]
+        model.fsp_g, model.fsp_b0 = views["fsp.g"], views["fsp.b0"]
+    for i, l in enumerate(model.layers):
+        l.W = views[f"layer{i}.W"]
+        l.g = views[f"layer{i}.g"]
+        l.b = views[f"layer{i}.b"]
+        l.decay = views[f"layer{i}.decay"]
+        if getattr(l, "gated", False) and f"layer{i}.gate" in views:
+            l.gate = views[f"layer{i}.gate"]
+    return model
+
+
 def build_model(args):
     """The engine, from scratch, with the P4 multi-scale half-life init.
 
@@ -268,17 +310,151 @@ def build_model(args):
                               half_life_init=(args.half_min, args.half_max),
                               ring_k=8, ring_credit="full")
     model.theta.requires_grad_(True)
+    # THE FIX: the views must be re-made AFTER theta requires grad, or the
+    # gradient is silently dropped (see rebind_views).
+    rebind_views(model)
     return model
 
 
 def build_head(model, n_out=PAYLOAD_LEN * 256):
     """The MEMORY HEAD: a linear map from the concatenated state (layers*dim)
-    to 4*256 logits (a 256-way head per payload byte, as the plan asks)."""
+    to 4*256 logits (a 256-way head per payload byte, as the plan asks).
+
+    NOTE: the head's parameters must REQUIRE GRAD.  A freshly allocated
+    torch tensor does not, and a parameter that does not require grad gets
+    no gradient -- so the head would stay at its random initialisation and
+    the "memory loss" would be a no-op (the same silent failure as the
+    views, and it is checked by the selftest's "the weights move" gate).
+    """
     n_state = model.layercount * model.dim
     Wm = torch.empty(n_state, n_out, dtype=torch.float32, device=model.device)
     torch.nn.init.xavier_normal_(Wm, gain=1.0)
     bm = torch.zeros(n_out, dtype=torch.float32, device=model.device)
+    Wm.requires_grad_(True)
+    bm.requires_grad_(True)
     return Wm, bm
+
+
+# ---------------------------------------------------------------------------
+# the GLOBAL BYTE PRIOR -- the comparison the FSP arm was judged on
+# ---------------------------------------------------------------------------
+def byte_prior(text_pool, alpha):
+    """The GLOBAL BYTE PRIOR of the training corpus.
+
+    This is the baseline the memory head has to beat: a CONSTANT predictor
+    ("always predict the most frequent byte").  The FSP arm of PLAN §0 was
+    declared a null because its head scored F1 0.685 against a prior of
+    0.817 -- the objective was satisfied without the state.  The same
+    comparison is reported here, per byte and exact-4.
+
+    Two constants are reported:
+      argmax        the most frequent byte of the corpus over all 256
+      argmax_alpha  the most frequent byte of the corpus WITHIN the payload
+                    alphabet -- the only constant that can be scored on the
+                    payload targets at all
+    """
+    counts = np.bincount(text_pool.data, minlength=256).astype(np.float64)
+    total = float(counts.sum())
+    p = counts / max(total, 1.0)
+    out = {"argmax": int(counts.argmax()),
+           "p_argmax": float(p[counts.argmax()]),
+           "top5": [[int(i), float(p[i])] for i in np.argsort(-p)[:5]],
+           "corpus_bytes": int(total)}
+    if alpha is not None:
+        sub = counts[alpha]
+        out["argmax_alpha"] = int(alpha[int(sub.argmax())])
+        out["p_argmax_alpha"] = float(p[out["argmax_alpha"]])
+    else:
+        out["argmax_alpha"] = out["argmax"]
+        out["p_argmax_alpha"] = out["p_argmax"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the held-out CE (the trajectory the arm must be watched on)
+# ---------------------------------------------------------------------------
+def eval_slices(files, n_slices, n_bytes):
+    """n_slices disjoint windows per file -- the same slicing as
+    tools/membench/model_backend.py `_slices` (the CE cell of the ruler)."""
+    out = []
+    for f in files:
+        with open(f, "rb") as fh:
+            raw = np.frombuffer(fh.read(), np.uint8)
+        if len(raw) <= n_bytes + 1:
+            continue
+        stride = (len(raw) - n_bytes) // n_slices
+        for i in range(n_slices):
+            out.append(raw[i * stride:i * stride + n_bytes + 1])
+    return out
+
+
+def held_out_ce(model, slices):
+    """The next-byte CE on held-out bytes, with the TORCH engine.
+
+    Same bytes and same estimator as the ruler's CE cell (mb._eval_corpus ->
+    eval_npz.cross_entropy), but computed on the GPU so it can be run DURING
+    training: this is the trajectory that says whether the arm is learning
+    anything at all (a model at UNIFORM sits at ln(256) = 5.5452)."""
+    if not slices:
+        return None
+    ces = []
+    with torch.no_grad():
+        for s in slices:
+            x = s.astype(np.int64)[None, :]
+            logits, _ = engine_forward(model, x, x.shape[1] - 1,
+                                        use_checkpoint=False)
+            tgt = torch.from_numpy(x[:, 1:]).to(logits.device)
+            ce = F.cross_entropy(logits[:, :-1].reshape(-1, 256),
+                                 tgt.reshape(-1))
+            ces.append(float(ce))
+    return float(np.mean(ces))
+
+
+# ---------------------------------------------------------------------------
+# the memory evaluation: the head, the behaviour, and the prior
+# ---------------------------------------------------------------------------
+def eval_memory(model, heads, board, alpha, args, rng, prior, tag):
+    """Evaluate the MEMORY HEAD and the BEHAVIOURAL recall on a board.
+
+    No gradients and no weight update: this is a measurement, not a step.
+    The head is scored on the state AT THE CUE (the same read the training
+    loss uses) and the prior baselines are reported next to it, so "the head
+    learned something" is never confused with "the head is at the prior".
+    """
+    alpha_size = 256 if alpha is None else len(alpha)
+    text_pool = args._text_pool
+    batch = build_fact_batch(args.eval_batch, board, alpha, text_pool,
+                             args.text_frac, args.gap, rng, n_facts=args.facts)
+    lay = batch["lay"]
+    with torch.no_grad():
+        logits, state_cue = engine_forward(model, batch["seq"], lay["cue_last"],
+                                           use_checkpoint=False)
+        pay = torch.from_numpy(batch["pay_new"]).to(logits.device)
+        out = {"tag": tag, "n": int(args.eval_batch)}
+        if heads[0] is not None:
+            ml = state_cue @ heads[0] + heads[1]
+            hp = ml.reshape(-1, 256).argmax(-1).reshape(pay.shape)
+            out["head_per_byte"] = float((hp == pay).float().mean())
+            out["head_exact4"] = float((hp == pay).all(dim=1).float().mean())
+            out["head_ce"] = float(F.cross_entropy(ml.reshape(-1, 256),
+                                                   pay.reshape(-1)))
+        b0, b1 = batch["behav_slice"]
+        if b1 > b0:
+            bp = logits[:, b0:b1].argmax(-1)
+            bt = torch.from_numpy(
+                batch["seq"][:, b0 + 1:b1 + 1].astype(np.int64)).to(logits.device)
+            out["behav_per_byte"] = float((bp == bt).float().mean())
+            out["behav_exact4"] = float((bp == bt).all(dim=1).float().mean())
+    # the prior baselines on the SAME targets
+    tgt = batch["pay_new"]
+    for name, byte in (("prior", prior["argmax_alpha"]),
+                       ("prior_global", prior["argmax"])):
+        hit = (tgt == byte)
+        out[f"{name}_per_byte"] = float(hit.mean())
+        out[f"{name}_exact4"] = float(hit.all(axis=1).mean())
+    out["chance_per_byte"] = 1.0 / alpha_size
+    out["chance_exact4"] = (1.0 / alpha_size) ** PAYLOAD_LEN
+    return out
 
 
 class AdamW:
@@ -289,10 +465,19 @@ class AdamW:
     half-lives -- the one thing a memory run cannot afford (PLAN §0, P4/P6).
     """
 
-    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8, wd=0.0):
+    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8, wd=0.0,
+                 wd_decay=0.0, decay_masks=None):
         self.params = list(params)
         self.lr = float(lr)
         self.b1, self.b2, self.eps, self.wd = betas[0], betas[1], eps, wd
+        # P6: the decoupled decay on the DECAY LOGITS only.  The engine's
+        # finding is that a weight decay on the decay logits is a systematic
+        # pull toward sigma = 0.5, i.e. toward a ONE-BYTE half-life, which
+        # destroys exactly the multi-scale memory a fact run needs.  So the
+        # decay is selectable and OFF by default, and it can be aimed at the
+        # decay logits alone (decay_masks: one bool tensor per param, or None).
+        self.wd_decay = float(wd_decay)
+        self.decay_masks = decay_masks
         self.m = [torch.zeros_like(p) for p in self.params]
         self.v = [torch.zeros_like(p) for p in self.params]
         self.t = 0
@@ -303,7 +488,7 @@ class AdamW:
         bc1 = 1.0 - self.b1 ** self.t
         bc2 = 1.0 - self.b2 ** self.t
         with torch.no_grad():
-            for p, m, v in zip(self.params, self.m, self.v):
+            for i, (p, m, v) in enumerate(zip(self.params, self.m, self.v)):
                 if p.grad is None:
                     continue
                 g = p.grad
@@ -312,6 +497,10 @@ class AdamW:
                 upd = (m / bc1) / ((v / bc2).sqrt() + self.eps)
                 if self.wd:
                     upd = upd + self.wd * p
+                if self.wd_decay:
+                    mask = (self.decay_masks[i] if self.decay_masks else None)
+                    if mask is not None:
+                        upd = upd + self.wd_decay * p * mask
                 p.add_(upd, alpha=-lr)
         return self.t
 
@@ -405,14 +594,37 @@ def train_step(model, opt, heads, batch, args, wm=None, wm_old=None):
 
     pay_new = torch.from_numpy(batch["pay_new"]).to(logits.device)
     mem = torch.zeros((), device=logits.device)
+    head_per_byte = 0.0
+    head_exact4 = 0.0
     if wm is not None:
         ml = state_cue @ wm + heads[1]
         mem = F.cross_entropy(ml.reshape(-1, 256), pay_new.reshape(-1))
+        # the head's ACCURACY on the training batch (the board the phase is
+        # training on).  The CE alone does not say whether the head is at the
+        # prior; the accuracy does.
+        with torch.no_grad():
+            hp = ml.detach().reshape(-1, 256).argmax(-1).reshape(pay_new.shape)
+            head_per_byte = float((hp == pay_new).float().mean())
+            head_exact4 = float((hp == pay_new).all(dim=1).float().mean())
     mem_old = torch.zeros((), device=logits.device)
     if wm_old is not None:
         pay_old = torch.from_numpy(batch["pay_old"]).to(logits.device)
         ml = state_cue @ wm_old + heads[3]
         mem_old = F.cross_entropy(ml.reshape(-1, 256), pay_old.reshape(-1))
+
+    # the BEHAVIOURAL recall: the model's OWN output at the four slots after
+    # the cue, against the payload it was asked to emit.  This is the plan's
+    # notion of "recalling" (a behaviour), and it is free here -- the logits
+    # are already computed.
+    behav_per_byte = 0.0
+    behav_exact4 = 0.0
+    if b1 > b0:
+        with torch.no_grad():
+            bp = logits[:, b0:b1].detach().argmax(-1)
+            bt = torch.from_numpy(seq[:, b0 + 1:b1 + 1].astype(np.int64)).to(
+                logits.device)
+            behav_per_byte = float((bp == bt).float().mean())
+            behav_exact4 = float((bp == bt).all(dim=1).float().mean())
 
     loss = (ce_text + args.behaviour_weight * ce_behav
             + args.memory_alpha * mem + args.memory_alpha_old * mem_old)
@@ -423,7 +635,11 @@ def train_step(model, opt, heads, batch, args, wm=None, wm_old=None):
             "ce_text": float(ce_text.detach()),
             "ce_behav": float(ce_behav.detach()),
             "mem": float(mem.detach()),
-            "mem_old": float(mem_old.detach())}
+            "mem_old": float(mem_old.detach()),
+            "head_per_byte": head_per_byte,
+            "head_exact4": head_exact4,
+            "behav_per_byte": behav_per_byte,
+            "behav_exact4": behav_exact4}
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +651,12 @@ def save_checkpoint(model, opt, heads, path, meta):
     memory head, the optimizer moments, the phase and the corpus position."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = {}
-    for name, view in model.gviews.items():
+    # BUG FIX (2026-10-22): this used to save model.GVIEWS -- the views into
+    # the GRADIENT buffer (model.grads) -- under the PARAMETER names.  So
+    # every "checkpoint" written by the CL-2 trainer held the GRADIENTS, not
+    # the WEIGHTS, and loading one installed gradients as weights.  The
+    # parameter views (model.views) are the ones that share theta's storage.
+    for name, view in model.views.items():
         data[name] = view.detach().cpu().numpy()
     data["m"] = model.m.detach().cpu().numpy()
     data["v"] = model.v.detach().cpu().numpy()
@@ -462,7 +683,7 @@ def save_checkpoint(model, opt, heads, path, meta):
 
 def load_checkpoint(model, opt, heads, path):
     d = np.load(path, allow_pickle=False)
-    for name, view in model.gviews.items():
+    for name, view in model.views.items():
         if name in d.files:
             with torch.no_grad():
                 view.copy_(torch.from_numpy(d[name]))
@@ -503,6 +724,11 @@ def build_argparser():
                     help="the seed of board A (the pre-stream facts)")
     ap.add_argument("--board-seed-b", type=int, default=202,
                     help="the seed of board B (the stream facts)")
+    ap.add_argument("--board-seed-c", type=int, default=303,
+                    help="the seed of board C -- the HELD-OUT board, never "
+                         "trained on; the ruler scores the acquire cell on it "
+                         "so that a memorisation of board B cannot pass as a "
+                         "memory")
     ap.add_argument("--text-frac", type=float, default=0.5,
                     help="fraction of the samples whose gap is real text")
     ap.add_argument("--text-files", default="data/*.txt",
@@ -521,8 +747,32 @@ def build_argparser():
     ap.add_argument("--layers", type=int, default=16)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--wd", type=float, default=0.0,
-                    help="weight decay (0: the P4/P6 finding is that decay "
-                         "erodes the decay logits)")
+                    help="weight decay on EVERY parameter (0: the P4/P6 "
+                         "finding is that decay erodes the decay logits)")
+    ap.add_argument("--wd-decay", type=float, default=0.0,
+                    help="P6: the decoupled weight decay on the DECAY LOGITS "
+                         "ONLY (0 by default: a decay on the decay logits is a "
+                         "systematic pull toward a ONE-BYTE half-life, i.e. "
+                         "toward no memory at all)")
+    ap.add_argument("--eval-batch", type=int, default=256,
+                    help="streams per evaluation batch (the memory head's "
+                         "accuracy, the behavioural recall and the prior)")
+    ap.add_argument("--ce-eval-every", type=int, default=0,
+                    help="every N steps, measure the HELD-OUT CE on "
+                         "data/eval (0: only at the phase boundaries).  This is "
+                         "the trajectory that says whether the arm is learning "
+                         "anything at all: a model at UNIFORM sits at "
+                         "ln(256) = 5.5452")
+    ap.add_argument("--ce-eval-bytes", type=int, default=2000,
+                    help="bytes per held-out slice for the CE trajectory")
+    ap.add_argument("--ce-eval-slices", type=int, default=2,
+                    help="held-out slices per file for the CE trajectory")
+    ap.add_argument("--ce-eval-files", default="data/eval/*.txt",
+                    help="the held-out corpus of the CE trajectory (the same "
+                         "corpus the ruler's CE cell scores)")
+    ap.add_argument("--ce-log", default=None,
+                    help="a JSONL file for the CE trajectory "
+                         "(default: <ckpt-dir>/<tag>_ce.jsonl)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
     ap.add_argument("--ckpt-dir", default="runs/cl2")
@@ -563,7 +813,8 @@ def selftest(args):
     # (i) the autograd forward's CE vs the engine's own step_batch CE
     logits, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
     ce_auto = float(F.cross_entropy(logits[:, :-1].reshape(-1, 256),
-                                    torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)))
+                                    torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)
+                                    ).detach())
     with torch.no_grad():
         logits2, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
     ce_auto2 = float(F.cross_entropy(logits2[:, :-1].reshape(-1, 256),
@@ -588,26 +839,73 @@ def selftest(args):
                           torch.from_numpy(batch["pay_new"]).reshape(-1))
     opt.zero_grad()
     mem.backward()
-    g = model.embed.grad
+    # the gradient lands on THETA (the flat parameter vector); the embedding
+    # table is a VIEW into it, so the view's own .grad is None -- the old
+    # selftest read model.embed.grad and crashed (the selftest had never
+    # been run).  The embed's slice of theta's gradient is what carries the
+    # cross-time path.
+    off = 0
+    for name, shape in model.shapes:
+        if name == "embed":
+            break
+        off += int(np.prod(shape))
+    g = model.theta.grad[off:off + 256 * model.dim].reshape(model.dim, 256)
     pay_pos = lay["gap0"] - PAYLOAD_LEN        # the payload of the newest fact
-    gpay = float(g[batch["seq"][0, pay_pos]].abs().sum())
-    gcue = float(g[batch["seq"][0, lay["cue0"]]].abs().sum())
+    # the embed table is (dim, 256): emb[b] is a COLUMN, so the gradient of
+    # the byte b is the column b.
+    gpay = float(g[:, batch["seq"][0, pay_pos]].abs().sum())
+    gcue = float(g[:, batch["seq"][0, lay["cue0"]]].abs().sum())
     print(f"  (ii) |d mem_loss / d embed| at the payload byte {gpay:.3e}, "
           f"at the cue byte {gcue:.3e} -> "
           f"{'OK (the gradient reaches the payload)' if gpay > 0 else 'FAIL'}")
     ok &= gpay > 0
 
-    # (iii) the state at the cue does not depend on the bytes AFTER it
+    # (iii) the state at the cue does not depend on the bytes AFTER it.
+    # The capture index is L-4: the state AFTER byte L-4, i.e. BEFORE the
+    # three bytes that differ.  (The old check captured at L-1, i.e. AFTER
+    # the changed bytes, so it compared two different states and could only
+    # ever report a difference -- it had never been run.)
     s1 = np.random.default_rng(1).integers(0, 256, size=(B, L)).astype(np.uint8)
     s2 = s1.copy()
     s2[:, L - 3:] = np.random.default_rng(2).integers(0, 256, size=(B, 3))
     with torch.no_grad():
-        _, st1 = engine_forward(model, s1, L - 1, use_checkpoint=False)
-        _, st2 = engine_forward(model, s2, L - 1, use_checkpoint=False)
+        _, st1 = engine_forward(model, s1, L - 4, use_checkpoint=False)
+        _, st2 = engine_forward(model, s2, L - 4, use_checkpoint=False)
     d = float((st1 - st2).abs().max())
     print(f"  (iii) bytes after the cue changed the cue state by {d:.3e} "
           f"-> {'OK' if d == 0.0 else 'FAIL'}")
     ok &= d == 0.0
+
+    # (iv) THE GATE THAT WAS MISSING: after ONE optimizer step the WEIGHTS
+    # must MOVE.  The first CL-2 arm scored ln(256) -- "the model never
+    # learned anything" -- and the reason was not the budget: the parameter
+    # views were DETACHED leaves (GpuModel builds them before theta requires
+    # grad), so the gradient was silently dropped and the optimizer updated
+    # nothing.  This gate fails on that code and passes on the fixed code.
+    th0 = model.theta.detach().clone()
+    wm0 = wm.detach().clone()
+    opt2 = AdamW([model.theta, wm, bm], args.lr, wd=args.wd)
+    st = train_step(model, opt2, [wm, bm, wm, bm], batch, args, wm=wm)
+    dth = float((model.theta.detach() - th0).abs().max())
+    dhd = float((wm.detach() - wm0).abs().max())
+    print(f"  (iv) after ONE step: |d theta| = {dth:.3e}, |d head| = {dhd:.3e} "
+          f"-> {'OK (the weights move)' if dth > 0 and dhd > 0 else 'FAIL (the '
+             'gradient is being dropped -- the arm cannot train)'}")
+    ok &= bool(dth > 0 and dhd > 0)
+
+    # (v) the checkpoint round-trip: what is written must be the WEIGHTS
+    tmp = os.path.join("/tmp", f"cl2_selftest_{os.getpid()}.npz")
+    save_checkpoint(model, opt2, [wm, bm, wm, bm], tmp,
+                    {"phase": "selftest", "step": 1})
+    d = np.load(tmp)
+    w_err = float(np.abs(d["embed"] - model.embed.detach().cpu().numpy()).max())
+    g_err = float(np.abs(d["embed"] - model.gviews["embed"].detach().cpu().numpy()).max())
+    os.remove(tmp)
+    print(f"  (v) the checkpoint holds the WEIGHTS (max|d| = {w_err:.3e}) and "
+          f"not the gradients (max|d| = {g_err:.3e}) -> "
+          f"{'OK' if w_err == 0.0 and g_err > 0 else 'FAIL'}")
+    ok &= bool(w_err == 0.0 and g_err > 0)
+
     print(f"== selftest {'PASS' if ok else 'FAIL'} ==")
     return 0 if ok else 1
 
@@ -630,14 +928,35 @@ def main(argv=None):
     alpha_size = 256 if alpha is None else len(alpha)
     board_a = make_board(args.board_seed_a, args.board_size, alpha)
     board_b = make_board(args.board_seed_b, args.board_size, alpha)
+    board_c = make_board(args.board_seed_c, args.board_size, alpha)
     text_files = sorted(glob.glob(os.path.join(_REPO, args.text_files)))
     text_pool = TextPool(text_files, seed=args.seed)
+    args._text_pool = text_pool
+    prior = byte_prior(text_pool, alpha)
+    print(f"[prior] the global byte prior of the training corpus: "
+          f"argmax {prior['argmax']} (p={prior['p_argmax']:.4f}) | "
+          f"within the payload alphabet: {prior['argmax_alpha']} "
+          f"(p={prior['p_argmax_alpha']:.4f})", flush=True)
 
     model = build_model(args)
     # the memory head: [Wm, bm] for the newest fact, [Wm_old, bm_old] for the
     # oldest fact (the ruler's RETAIN cell target).
     heads = list(build_head(model)) + list(build_head(model))
-    opt = AdamW([model.theta] + heads, args.lr, wd=args.wd)
+    # P6: the decay mask -- the DECAY LOGITS only, and only if --wd-decay is
+    # not 0.  The mask is a bool vector over theta, aligned with model.shapes.
+    decay_mask = None
+    if args.wd_decay:
+        decay_mask = torch.zeros_like(model.theta, dtype=torch.bool)
+        off = 0
+        for name, shape in model.shapes:
+            size = int(np.prod(shape))
+            if name.endswith(".decay"):
+                decay_mask[off:off + size] = True
+            off += size
+    opt = AdamW([model.theta] + heads, args.lr, wd=args.wd,
+                wd_decay=args.wd_decay,
+                decay_masks=[decay_mask] + [None] * len(heads) if decay_mask
+                is not None else None)
 
     # the resume
     start_phase = "pre"
@@ -656,7 +975,11 @@ def main(argv=None):
                         os.path.join(args.ckpt_dir, f"{args.tag}_t0.npz"),
                         {"phase": "init", "step": 0, "seed": args.seed,
                          "alphabet": args.alphabet, "facts": args.facts,
-                         "gap": args.gap, "board_size": args.board_size})
+                         "gap": args.gap, "board_size": args.board_size,
+                         "board_seed_a": args.board_seed_a,
+                         "board_seed_b": args.board_seed_b,
+                         "board_seed_c": args.board_seed_c,
+                         "prior": json.dumps(prior)})
         print(f"[init] from scratch, seed={args.seed}, P4 half-life "
               f"{args.half_min}-{args.half_max} B, dim={args.dim}, "
               f"layers={args.layers}, device={args.device}", flush=True)
@@ -675,11 +998,59 @@ def main(argv=None):
     for i, (p, _n, _b) in enumerate(phases):
         if p == start_phase:
             start_idx = i
+
+    # -- the held-out CE trajectory -----------------------------------------
+    ce_log_path = (args.ce_log or
+                   os.path.join(args.ckpt_dir, f"{args.tag}_ce.jsonl"))
+    ce_files = sorted(glob.glob(os.path.join(_REPO, args.ce_eval_files)))
+    ce_slices = eval_slices(ce_files, args.ce_eval_slices,
+                            args.ce_eval_bytes)
+    print(f"[ce] the held-out CE trajectory: {len(ce_slices)} slices x "
+          f"{args.ce_eval_bytes} B from {len(ce_files)} files -> "
+          f"{ce_log_path}", flush=True)
+    ce_fh = open(ce_log_path, "a")
+
+    def log_row(phase, step, stats, held_ce):
+        row = {"phase": phase, "step": int(step),
+               "global_step": int(model.t), "held_out_ce": held_ce,
+               "ce_text": stats.get("ce_text"),
+               "ce_behav": stats.get("ce_behav"), "mem": stats.get("mem"),
+               "head_per_byte": stats.get("head_per_byte"),
+               "head_exact4": stats.get("head_exact4"),
+               "behav_per_byte": stats.get("behav_per_byte"),
+               "behav_exact4": stats.get("behav_exact4")}
+        ce_fh.write(json.dumps(row) + "\n")
+        ce_fh.flush()
+        return row
+
     t_wall = time.time()
     for pi, (phase, n_steps, board) in enumerate(phases):
         if n_steps <= 0 or pi < start_idx:
             continue
         step0 = start_step if pi == start_idx else 0
+        # the phase's own memory evaluation (on the board it trains on) and the
+        # HELD-OUT board C (never trained on): the difference between the two
+        # is memorisation vs a mechanism.
+        eval_rng = np.random.default_rng(
+            (args.seed * 7_919 + phase_id[phase] * 104_729) % (2 ** 32))
+        evals = {}
+        for bname, brd in (("train_board", board), ("heldout_board", board_c)):
+            if brd is None:
+                continue
+            evals[bname] = eval_memory(model, heads, brd, alpha, args,
+                                       eval_rng, prior, f"{phase}/{bname}")
+            e = evals[bname]
+            print(f"  [eval {phase}/{bname}] head {e.get('head_per_byte', 0):.4f}"
+                  f"/byte, exact4 {e.get('head_exact4', 0):.4f} | behaviour "
+                  f"{e.get('behav_per_byte', 0):.4f}/byte, exact4 "
+                  f"{e.get('behav_exact4', 0):.4f} | prior "
+                  f"{e['prior_per_byte']:.4f}/byte, exact4 "
+                  f"{e['prior_exact4']:.4f} | chance "
+                  f"{e['chance_per_byte']:.4f}/{e['chance_exact4']:.2e}",
+                  flush=True)
+        held_ce0 = held_out_ce(model, ce_slices)
+        log_row(phase, 0, {}, held_ce0)
+        print(f"  [ce {phase} 0/{n_steps}] held-out CE {held_ce0}", flush=True)
         for step in range(step0, n_steps):
             # the corpus is a deterministic function of (seed, phase, step):
             # the step counter IS the data position.
@@ -693,17 +1064,33 @@ def main(argv=None):
                                          args.text_frac, args.gap, rng,
                                          n_facts=args.facts)
             stats = train_step(model, opt, heads, batch, args,
-                               wm=heads[0] if args.memory_alpha > 0 else None,
+                               # the memory loss is a FACT loss: it must not
+                               # run in the text-only 'pre' phase, where the
+                               # "target" is a constant zero and the head
+                               # would be trained to always predict it.
+                               wm=(heads[0]
+                                   if (args.memory_alpha > 0 and board is not None)
+                                   else None),
                                wm_old=heads[2] if args.memory_alpha_old > 0 else None)
             model.t += 1
             model.bytes_seen += args.batch * L
+            do_ce = (args.ce_eval_every and
+                     ((step + 1) % args.ce_eval_every == 0 or step == n_steps - 1))
+            held_ce = held_out_ce(model, ce_slices) if do_ce else None
             if (step + 1) % args.log_every == 0 or step == 0:
                 el = time.time() - t_wall
                 print(f"  [{phase} {step + 1}/{n_steps}] loss {stats['loss']:.4f} "
                       f"| ce_text {stats['ce_text']:.4f} "
                       f"| ce_behav {stats['ce_behav']:.4f} "
                       f"| mem {stats['mem']:.4f} | mem_old {stats['mem_old']:.4f} "
+                      f"| head {stats['head_per_byte']:.3f}/"
+                      f"{stats['head_exact4']:.3f} "
+                      f"| behav {stats['behav_per_byte']:.3f}/"
+                      f"{stats['behav_exact4']:.3f} "
+                      f"| held_ce {held_ce if held_ce is None else round(held_ce, 4)} "
                       f"| {el:.0f}s", flush=True)
+            if do_ce:
+                log_row(phase, step + 1, stats, held_ce)
             if (not args.no_checkpoint) and \
                     ((step + 1) % args.save_every == 0 or step == n_steps - 1):
                 path = os.path.join(args.ckpt_dir,
@@ -713,19 +1100,31 @@ def main(argv=None):
                                        "facts": args.facts, "gap": args.gap,
                                        "board_size": args.board_size,
                                        "board_seed_a": args.board_seed_a,
-                                       "board_seed_b": args.board_seed_b})
+                                       "board_seed_b": args.board_seed_b,
+                                       "board_seed_c": args.board_seed_c,
+                                       "prior": json.dumps(prior),
+                                       "memory_eval": json.dumps(evals)})
                 print(f"    [save] {path}", flush=True)
         # the phase boundary
+        held_ce_end = held_out_ce(model, ce_slices)
+        log_row(phase, n_steps, {}, held_ce_end)
+        print(f"  [ce {phase} {n_steps}/{n_steps}] held-out CE {held_ce_end}",
+              flush=True)
         if not args.no_checkpoint:
             path = os.path.join(args.ckpt_dir, f"{args.tag}_{phase}_end.npz")
             save_checkpoint(model, opt, heads, path, {"phase": phase, "step": n_steps, "seed": args.seed,
                                    "alphabet": args.alphabet, "facts": args.facts,
                                    "gap": args.gap, "board_size": args.board_size,
                                    "board_seed_a": args.board_seed_a,
-                                   "board_seed_b": args.board_seed_b})
+                                   "board_seed_b": args.board_seed_b,
+                                   "board_seed_c": args.board_seed_c,
+                                   "prior": json.dumps(prior),
+                                   "memory_eval": json.dumps(evals),
+                                   "held_out_ce": float(held_ce_end or 0.0)})
             print(f"    [phase end] {path}", flush=True)
         start_phase = ""
         start_step = 0
+    ce_fh.close()
     print(f"[done] {time.time() - t_wall:.0f}s", flush=True)
     return 0
 

@@ -135,6 +135,16 @@ ACQUIRE_EXACT_THRESHOLD = 0.50       # exact 4-byte recall at d=32, trained mode
 RETAIN_RATIO_THRESHOLD = 0.90        # post-stream / pre-stream recall
 NO_REGRESSION_MAX_DCE = 0.02         # nats/byte
 
+# The state's USABLE HORIZON (D5, PLAN §0): the payload decodes to ~128 B and
+# is gone by ~132 B.  A cell whose target sits further back than this
+# measures NOTHING -- it is not a weak signal, it is no signal at all.  The
+# RETAIN cell is the one that gets this wrong by construction: with the
+# ruler's default --facts 64 the oldest fact of the stream sits
+# 8*(64-1)+d = 512+d bytes behind the cue, i.e. FOUR TIMES the horizon, and
+# the ratio is then a ratio of two noises.  Every lag is checked against
+# this constant and a cell beyond it is UNMEASURED, never a PASS.
+HORIZON_B = 128
+
 
 # ---------------------------------------------------------------------------
 # the fact stream
@@ -180,6 +190,12 @@ def build_sequences(kind, d, stream, rng, alpha):
                       RETAIN target payload (PAY_1) replaced by fresh random
                       bytes OF THE SAME ALPHABET
       "prestream_nuis" P with PAY_1 replaced the same way
+      "stream_nuis1"   S with ONLY the ACQUIRE target payload (PAY_N)
+                       replaced (the newest fact).  This is the nuisance
+                       control for a cell whose target is the NEWEST fact:
+                       the target is then provably absent from the state,
+                       while the older facts -- and therefore the state's
+                       content -- are untouched.
 
     The tail of the "stream" cell is produced by the FIXED-GAP GENERATOR
     (generators.delayed_copy(d, gap_mode="fixed")): [KEY][PAYLOAD][gap][KEY],
@@ -195,11 +211,13 @@ def build_sequences(kind, d, stream, rng, alpha):
     n, n_facts = facts.shape[0], facts.shape[1]
     L = FACT_LEN * n_facts + d + KEY_LEN
 
-    if kind in ("stream_nuis", "prestream_nuis"):
+    if kind in ("stream_nuis", "prestream_nuis", "stream_nuis1"):
         pay = payloads.copy()
         if kind == "stream_nuis":
             pay[:, n_facts - 1] = _draw(rng, alpha, (n, PAYLOAD_LEN))
             pay[:, 0] = _draw(rng, alpha, (n, PAYLOAD_LEN))
+        elif kind == "stream_nuis1":
+            pay[:, n_facts - 1] = _draw(rng, alpha, (n, PAYLOAD_LEN))
         else:
             pay[:, 0] = _draw(rng, alpha, (n, PAYLOAD_LEN))
         facts = np.concatenate([keys, pay], axis=2)
@@ -522,62 +540,322 @@ def run_ce_cell(m, args):
 
 
 # ---------------------------------------------------------------------------
+# the TRAINED mode: the CL-2 arm, scored with the plan's three numbers
+# ---------------------------------------------------------------------------
+def cl2_meta(ckpt):
+    """The CL-2 metadata a CL-2 checkpoint carries (tools/cl2_train.py)."""
+    d = np.load(ckpt, allow_pickle=False)
+    meta = {}
+    for k in d.files:
+        if k.startswith("cl2_"):
+            v = d[k]
+            meta[k[4:]] = v.item() if v.shape == () else v
+    return meta, d
+
+
+def board_stream(board, n, n_facts, rng, alpha):
+    """A stream of facts drawn from a BOARD (the trainer's make_board)."""
+    nb = board["keys"].shape[0]
+    idx = rng.integers(0, nb, size=(n, n_facts))
+    keys = board["keys"][idx]
+    pays = board["payloads"][idx]
+    return {"keys": keys, "payloads": pays,
+            "facts": np.concatenate([keys, pays], axis=2)}
+
+
+def make_head_cell(name, X, Y, W, b, seed, alpha_size, prior_byte=None,
+                   note=None):
+    """A cell read out by the TRAINED MEMORY HEAD -- the model's OWN trained
+    read path (a 256-way head per payload byte on the state at the cue).
+
+    The same discipline as d5.make_cell: a MATCHED NULL (the SAME readout on
+    PERMUTED labels, same rows), the class COVERAGE, and the same verdict
+    rule (SIGNAL / NULL / UNPOWERED, 2 SE over the null).  The head is NOT
+    refit here -- it is the model's own parameter -- so the null is the
+    readout's agreement with a permuted labelling rather than a refit on
+    permuted labels; that is the honest null for a FIXED readout.
+
+    The GLOBAL BYTE PRIOR is reported next to it: the accuracy of the
+    constant predictor "always the most frequent byte of the corpus".  The
+    FSP arm was declared a null because its head scored 0.685 against a
+    prior of 0.817 -- the objective was satisfied without the state.  A head
+    that does not beat the prior is not a memory.
+    """
+    n = X.shape[0]
+    Y = np.asarray(Y, dtype=np.int64)
+    logits = X @ W + b
+    pred = logits.reshape(n, Y.shape[1], 256).argmax(-1)
+    per_byte = float((pred == Y).mean())
+    exact4 = float((pred == Y).all(axis=1).mean())
+    perm = np.random.default_rng(seed + 7919).permutation(n)
+    null_per_byte = float((pred == Y[perm]).mean())
+    null_exact4 = float((pred == Y[perm]).all(axis=1).mean())
+    tr, te = d5._split(n, seed)
+    cov = coverage_report(Y, tr, te, alpha_size)
+    se = float(math.sqrt(max(exact4 * (1 - exact4), 0.0) / max(len(te), 1)))
+    out = {
+        "cell": name, "n": int(n),
+        "readout": ("the TRAINED memory head (the CL-2 checkpoint's Wm/bm) "
+                    "applied to the state at the cue"),
+        "per_byte": per_byte, "exact4": exact4, "se": se,
+        "se_per_byte": d5._se_per_byte(per_byte, n),
+        "null_per_byte": null_per_byte, "null_exact4": null_exact4,
+        "null_method": ("permuted labels, same rows, the SAME fixed readout "
+                        "(a fixed readout is not refit on the null)"),
+        "coverage": cov,
+        "label_alphabet_size": int(alpha_size),
+        "chance_per_byte": 1.0 / alpha_size,
+        "chance_exact4": (1.0 / alpha_size) ** Y.shape[1],
+    }
+    if prior_byte is not None:
+        hit = (Y == int(prior_byte))
+        out["prior_byte"] = int(prior_byte)
+        out["prior_per_byte"] = float(hit.mean())
+        out["prior_exact4"] = float(hit.all(axis=1).mean())
+        out["beats_prior"] = bool(per_byte > out["prior_per_byte"])
+    if note:
+        out["note"] = note
+    out["verdict"] = d5.verdict(out, cov, alpha_size, null_per_byte)
+    return out
+
+
+def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
+    """Every cell of one gap, for a TRAINED (CL-2) arm.
+
+    The cells are built from the CL-2 BOARDS, not from fresh random streams:
+      board B  the facts of the STREAM (the ones the phase-2 loss saw)
+      board C  a HELD-OUT board, never trained on
+      board A  the PRE-STREAM facts, replayed (the RETAIN set)
+    """
+    t_start = time.time()
+    alpha_size = 256 if alpha is None else len(alpha)
+    rng = np.random.default_rng((args.seed * 1_000_003 + d) % (2 ** 32))
+    setg = setting_of(args, d, alpha_size)
+    lag_cue = int(d) + PAYLOAD_LEN          # the payload's distance to the cue
+    cells = []
+
+    # -- the ACQUIRE cells ------------------------------------------------
+    for cname, bname, bnote in (
+            ("acquire", "B",
+             "the NEW facts of the stream (board B), read at the cue"),
+            ("acquire_heldout", "C",
+             "a HELD-OUT board (board C) that was NEVER trained on: the same "
+             "geometry, the same readout, facts the model has never seen.  A "
+             "memorisation of board B cannot pass this cell.")):
+        board = boards[bname]
+        stream = board_stream(board, args.n, args.facts, rng, alpha)
+        seq = build_sequences("stream", d, stream, rng, alpha)
+        X = states_at_cue(models["post"], seq)
+        Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
+        c = d5.make_cell(cname, X, Y, args.seed, alpha_size, note=bnote)
+        c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                             board=bname, readout="ridge (mb._ridge_score)")
+        cells.append(c)
+        hc = make_head_cell(cname + "_head", X, Y, heads["post"][0],
+                            heads["post"][1], args.seed, alpha_size,
+                            prior_byte=prior_byte, note=bnote)
+        hc["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board=bname, readout="the trained memory head")
+        cells.append(hc)
+        # the NUISANCE control: the target payload is replaced by fresh
+        # random bytes of the same alphabet, so it is PROVABLY ABSENT.
+        seqn = build_sequences("stream_nuis1", d, stream, rng, alpha)
+        Xn = states_at_cue(models["post"], seqn)
+        cn = d5.make_cell(cname + "_nuisance", Xn, Y, args.seed, alpha_size,
+                           note="NUISANCE: the target payload is replaced by "
+                                "fresh random bytes of the same alphabet, so "
+                                "it is provably absent from the state.",
+                           expect_signal=False)
+        cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board=bname, readout="ridge (mb._ridge_score)")
+        cells.append(cn)
+        hn = make_head_cell(cname + "_nuisance_head", Xn, Y, heads["post"][0],
+                            heads["post"][1], args.seed, alpha_size,
+                            prior_byte=prior_byte,
+                            note="NUISANCE (head): the target payload is "
+                                 "provably absent from the state.")
+        hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board=bname, readout="the trained memory head")
+        cells.append(hn)
+
+    # -- the RETAIN replay (board A) at BOTH checkpoints --------------------
+    board = boards["A"]
+    stream = board_stream(board, args.n, args.facts, rng, alpha)
+    seq = build_sequences("stream", d, stream, rng, alpha)
+    Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
+    Xpre = states_at_cue(models["pre"], seq)
+    Xpost = states_at_cue(models["post"], seq)
+    seqn = build_sequences("stream_nuis1", d, stream, rng, alpha)
+    Xn = states_at_cue(models["post"], seqn)
+    ret = {"lag_bytes": int(d), "lag_bytes_cue": lag_cue,
+           "board": "A (the pre-stream facts, replayed)",
+           "in_horizon": bool(lag_cue <= HORIZON_B)}
+    for tag, X, mdl, hd in (("pre", Xpre, models["pre"], heads["pre"]),
+                            ("post", Xpost, models["post"], heads["post"])):
+        c = d5.make_cell(f"retain_replay_{tag}", X, Y, args.seed, alpha_size,
+                         note=("the PRE-STREAM facts (board A) replayed, read "
+                               f"at the cue of the {tag}-stream checkpoint"))
+        c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                            board="A", readout="ridge (mb._ridge_score)")
+        cells.append(c)
+        hc = make_head_cell(f"retain_replay_{tag}_head", X, Y, hd[0], hd[1],
+                            args.seed, alpha_size, prior_byte=prior_byte,
+                            note=("the PRE-STREAM facts (board A) replayed, "
+                                  f"read with the {tag}-stream model's own "
+                                  "head"))
+        hc["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board="A", readout="the trained memory head")
+        cells.append(hc)
+        ret[tag] = {"ridge": c, "head": hc}
+    cn = d5.make_cell("retain_replay_nuisance", Xn, Y, args.seed, alpha_size,
+                      note="NUISANCE for the replay: the target payload is "
+                           "provably absent from the state.",
+                      expect_signal=False)
+    cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                          board="A", readout="ridge (mb._ridge_score)")
+    cells.append(cn)
+    hn = make_head_cell("retain_replay_nuisance_head", Xn, Y, heads["post"][0],
+                        heads["post"][1], args.seed, alpha_size,
+                        prior_byte=prior_byte,
+                        note="NUISANCE (head) for the replay.")
+    hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                          board="A", readout="the trained memory head")
+    cells.append(hn)
+
+    # -- the RETAIN ratio (post / pre, the same rows, the same readout) ---
+    ratios = {}
+    for readout in ("ridge", "head"):
+        pre = ret["pre"][readout]
+        post = ret["post"][readout]
+        r = {"pre_per_byte": pre["per_byte"], "post_per_byte": post["per_byte"],
+             "pre_exact4": pre["exact4"], "post_exact4": post["exact4"],
+             "pre_verdict": pre["verdict"], "post_verdict": post["verdict"],
+             "pre_null_per_byte": pre["null_per_byte"],
+             "post_null_per_byte": post["null_per_byte"],
+             "pre_coverage": pre["coverage"], "post_coverage": post["coverage"]}
+        r["ratio_per_byte"] = (post["per_byte"] / pre["per_byte"]
+                               if pre["per_byte"] > 0 else None)
+        r["ratio_exact4"] = (post["exact4"] / pre["exact4"]
+                             if pre["exact4"] > 0 else None)
+        if not ret["in_horizon"]:
+            r["status"] = "UNMEASURED"
+            r["why"] = (f"the target sits {lag_cue} bytes behind the cue, "
+                        f"beyond the state's usable horizon ({HORIZON_B} B, "
+                        "D5): the cell measures nothing")
+        elif pre["verdict"] != "SIGNAL" or post["verdict"] != "SIGNAL":
+            r["status"] = "UNMEASURED"
+            r["why"] = (f"one side does not beat its own matched null "
+                        f"(pre={pre['verdict']}, post={post['verdict']}): the "
+                        "ratio would be a ratio of two nulls")
+        elif r["ratio_per_byte"] is None:
+            r["status"] = "UNMEASURED"
+            r["why"] = "the pre-stream recall is zero; the ratio is undefined"
+        else:
+            r["status"] = "MEASURED"
+            r["why"] = ""
+        ratios[readout] = r
+
+    by = {c["cell"]: c for c in cells}
+    # -- the ACQUIRE verdict (the pre-registered threshold is at d=32) ----
+    acq = {"per_readout": {}}
+    for readout, cname in (("ridge", "acquire"),
+                            ("head", "acquire_head")):
+        c = by[cname]
+        nu = by[cname.replace("acquire", "acquire_nuisance")] if readout == "ridge" \
+            else by["acquire_nuisance_head"]
+        if c["verdict"] != "SIGNAL":
+            status = "UNMEASURED"
+            why = (f"the {readout} cell does not beat its own matched null "
+                   f"(verdict {c['verdict']})")
+        elif nu["verdict"] == "SIGNAL":
+            status = "UNMEASURED"
+            why = ("the NUISANCE control beats its own null: the readout "
+                   "invents signal, so the cell cannot be trusted")
+        else:
+            status = "MEASURED"
+            why = ""
+        acq["per_readout"][readout] = {
+            "status": status, "why": why,
+            "per_byte": c["per_byte"], "exact4": c["exact4"],
+            "se": c.get("se"), "se_per_byte": c.get("se_per_byte"),
+            "null_per_byte": c["null_per_byte"],
+            "null_exact4": c["null_exact4"],
+            "coverage": c["coverage"], "verdict": c["verdict"],
+            "prior_per_byte": c.get("prior_per_byte"),
+            "prior_exact4": c.get("prior_exact4"),
+            "beats_prior": c.get("beats_prior"),
+            "threshold": ACQUIRE_EXACT_THRESHOLD,
+            "setting": c["setting"],
+        }
+    # the HELD-OUT acquire cell (the criterion's own wording: "a held-out set
+    # of the same shape")
+    for readout, cname in (("ridge", "acquire_heldout"),
+                            ("head", "acquire_heldout_head")):
+        c = by[cname]
+        nu = by["acquire_heldout_nuisance"] if readout == "ridge" \
+            else by["acquire_heldout_nuisance_head"]
+        if c["verdict"] != "SIGNAL":
+            status = "UNMEASURED"
+            why = (f"the {readout} cell does not beat its own matched null "
+                   f"(verdict {c['verdict']})")
+        elif nu["verdict"] == "SIGNAL":
+            status = "UNMEASURED"
+            why = "the NUISANCE control beats its own null"
+        else:
+            status = "MEASURED"
+            why = ""
+        acq["per_readout"][readout + "_heldout"] = {
+            "status": status, "why": why,
+            "per_byte": c["per_byte"], "exact4": c["exact4"],
+            "se": c.get("se"), "se_per_byte": c.get("se_per_byte"),
+            "null_per_byte": c["null_per_byte"],
+            "null_exact4": c["null_exact4"],
+            "coverage": c["coverage"], "verdict": c["verdict"],
+            "prior_per_byte": c.get("prior_per_byte"),
+            "prior_exact4": c.get("prior_exact4"),
+            "beats_prior": c.get("beats_prior"),
+            "threshold": ACQUIRE_EXACT_THRESHOLD,
+            "setting": c["setting"],
+        }
+    return {
+        "gap": int(d), "n": int(args.n), "facts": int(args.facts),
+        "sequence_length": int(seq.shape[1]), "fixed_length": True,
+        "cells": cells, "acquire": acq, "retain": ratios,
+        "retain_lag": {"lag_bytes": int(d), "lag_bytes_cue": lag_cue,
+                       "horizon_B": HORIZON_B, "in_horizon": ret["in_horizon"]},
+        "timing": {"total_s": time.time() - t_start},
+    }
+
+
+# ---------------------------------------------------------------------------
 # the train mode -- REFUSES
 # ---------------------------------------------------------------------------
 TRAIN_REFUSAL = """
-[REFUSED] --mode train: the CL-RULER's TRAIN path cannot be run in this repo
-yet.  The repo's rule is to refuse rather than emit a plausible wrong number
-(RESULTS.md: the D1 probe, the D4 padding read and the 14 plans that
-measured a proxy instead of the goal).  EXACTLY what is missing:
+[REFUSED] --mode train: this checkpoint is not a CL-2 checkpoint.
 
-1. THE FACT IN THE LOSS (a per-position loss MASK / WEIGHT).
-   The trainer's only objective is next-byte CE: `numpy_port.Model.step_batch`
-   (numpy_port.py:433) computes ONE mean CE per stream over consecutive byte
-   pairs; the torch twin is gpu_port.py:1701+.  There is no way to say "only
-   the 4 payload positions after the cue count, and weight them X".  A fact
-   stream needs the loss restricted (or up-weighted) to the
-   payload-after-the-cue positions; without that the stream is just text.
-   Code path to change: the loss assembly in step_batch (numpy_port.py:491+).
+The CL-RULER's TRAIN path scores a model whose facts were IN THE LOSS.  That
+is now the CL-2 trainer (tools/cl2_train.py), and the ruler's train mode
+needs its checkpoint: one that carries the cl2_* metadata (the boards, the
+alphabet, the fact geometry) and the trained memory head (Wm/bm).
 
-2. A BYTE-EXACT FACT-CORPUS LOADER.
-   `numpy_port.Runtime.train` (numpy_port.py:960) opens every training file
-   with `open(file, "r", encoding="utf-8", errors="ignore")`, so arbitrary
-   fact bytes (random 4-byte payloads) are silently DROPPED or mangled by the
-   UTF-8 decoder.  A fact stream cannot be fed to the trainer as bytes
-   today; it needs a binary path (or a reversible byte-safe encoding) in
-   Runtime.train / train_gpu.py's MiReader.
+The five things this mode used to name as missing, and where they live now:
+  1. THE FACT IN THE LOSS ............ tools/cl2_train.py: the memory loss
+     (a 256-way head on the state AT THE CUE) plus the behavioural CE.
+  2. A BYTE-EXACT FACT-CORPUS LOADER .. tools/cl2_train.py: the corpus is
+     built as raw uint8 (no UTF-8 decoder anywhere near it).
+  3. PHASES AND A REPLAY SET .......... tools/cl2_train.py --pre-steps /
+     --phase1-steps / --phase2-steps, board A (pre) and board B (stream),
+     with the optimizer state carried across the boundary.
+  4. A BEHAVIOURAL READOUT ............ tools/cl2_train.py: the model's own
+     output at the four slots after the cue.
+  5. A FACT-TRAINED CHECKPOINT ........ runs/cl2/<tag>_<phase>_end.npz.
 
-3. PHASES AND A REPLAY SET.
-   The trainer runs ONE corpus with ONE optimizer state and no phase
-   boundary.  The ruler needs phase 1 (the pre-stream facts) -> phase 2 (the
-   new facts + a replay set of the phase-1 facts), with the optimizer state
-   carried across the boundary and a checkpoint saved at the boundary.  Two
-   runs with a checkpoint handoff would give the boundary; the replay
-   INTERLEAVING does not exist.
-
-4. A BEHAVIOURAL READOUT (the model's OWN output after the cue).
-   Once the fact is in the loss, "recalling" it is a BEHAVIOUR: the model
-   must emit the payload bytes after the cue key.  Every read-path number in
-   RESULTS.md comes from an OFFLINE ridge over the frozen state
-   (mb._ridge_score), which measures the state, not the behaviour.  There is
-   no behavioural recall readout in the repo; --mode probe cannot stand in
-   for it, because the probe's readout is a lag decoder over the state.
-
-5. A FACT-TRAINED CHECKPOINT.
-   Nothing in runs/ has ever been trained on a fact stream, so the
-   pre-registered ACQUIRE threshold (>= 0.50 exact 4-byte recall at d=32)
-   has never been measured against anything.  Until one exists, ACQUIRE and
-   RETAIN are DIAGNOSTICS on a frozen model, and NO REGRESSION is degenerate
-   (dCE == 0 by construction).
-
-ALSO UNKNOWN (an experiment, not a missing file): the write path is an
-order-losing per-coordinate EMA (`state = states*a + enc`,
-numpy_port.py:142), so a key->payload association has to be learned by a
-GLOBAL linear head over a MIXTURE state.  D5 measured that the global
-readout is not key-blind (the cue key decodes 65-165x over its null) but
-that the CONTENT decays within ~12-32 B.  Whether byte-level CE can train
-that association at all is the open question of CL-2 -- and it is exactly
-what --mode train is for.
+WHAT IS STILL NOT MEASURED BY THIS TOOL (and is said so in the output):
+  * the READOUT of a fixed head is the model's own; the ridge readout is
+    reported beside it as the state-information number;
+  * a cell that does not beat its own matched null is UNMEASURED, never a
+    PASS;
+  * a target beyond the state's usable horizon (128 B, D5) is UNMEASURED.
 """
 
 
@@ -707,6 +985,121 @@ def summarize(results, ce, mode):
                            "delta_ce": ce.get("delta_ce"),
                            "threshold": NO_REGRESSION_MAX_DCE,
                            "setting": ce.get("setting", {})},
+    }
+
+
+# ---------------------------------------------------------------------------
+# the three numbers of a TRAINED arm: PASS / FAIL / UNMEASURED
+# ---------------------------------------------------------------------------
+def summarize_trained(results, ce_post, ce_pre, threshold_gap=32):
+    """The criterion, as a verdict against the pre-registered thresholds.
+
+      ACQUIRE       exact-4 >= 0.50 at d=32, on a HELD-OUT set of the same
+                    shape, read with the model's OWN trained head.  The ridge
+                    readout is reported beside it (the state-information
+                    number) and the trained-board cell beside that.
+      RETAIN        post/pre >= 0.90 on the REPLAYED pre-stream facts, at a
+                    lag inside the state's usable horizon.
+      NO REGRESSION dCE <= 0.02 nats/byte between the pre-stream and the
+                    post-stream checkpoint.
+
+    UNMEASURED is never PASS: a cell that does not beat its own matched
+    null, a cell whose nuisance control leaks, a cell beyond the horizon and
+    a missing pre-stream checkpoint are all UNMEASURED.
+    """
+    gaps = [r["gap"] for r in results]
+    g = threshold_gap if threshold_gap in gaps else (max(gaps) if gaps else None)
+    res = next((r for r in results if r["gap"] == g), None)
+
+    def verdict_of(cell, threshold, higher_is_better=True, key="exact4"):
+        if cell is None:
+            return {"status": "UNMEASURED", "why": "the cell was not measured"}
+        if cell.get("status") == "UNMEASURED":
+            return {"status": "UNMEASURED", "why": cell.get("why", "")}
+        v = cell.get(key)
+        if v is None:
+            return {"status": "UNMEASURED", "why": "the cell has no value"}
+        ok = (v >= threshold) if higher_is_better else (v <= threshold)
+        return {"status": "PASS" if ok else "FAIL",
+                "why": (f"{key} = {v:.4f} vs the pre-registered threshold "
+                        f"{threshold}")}
+
+    acq = {}
+    if res is not None:
+        pr = res["acquire"]["per_readout"]
+        for key in ("head", "head_heldout", "ridge", "ridge_heldout"):
+            c = pr.get(key)
+            acq[key] = {
+                "status": c["status"] if c else "UNMEASURED",
+                "why": c.get("why", "") if c else "",
+                "per_byte": c.get("per_byte") if c else None,
+                "exact4": c.get("exact4") if c else None,
+                "null_per_byte": c.get("null_per_byte") if c else None,
+                "null_exact4": c.get("null_exact4") if c else None,
+                "coverage": c.get("coverage") if c else None,
+                "verdict": c.get("verdict") if c else None,
+                "prior_per_byte": c.get("prior_per_byte") if c else None,
+                "prior_exact4": c.get("prior_exact4") if c else None,
+                "beats_prior": c.get("beats_prior") if c else None,
+            }
+    acq_verdict = (verdict_of(res["acquire"]["per_readout"].get("head_heldout"),
+                               ACQUIRE_EXACT_THRESHOLD) if res else
+                   {"status": "UNMEASURED", "why": "no gap was measured"})
+    acq_verdict_trained = (verdict_of(res["acquire"]["per_readout"].get("head"),
+                                       ACQUIRE_EXACT_THRESHOLD) if res else
+                           {"status": "UNMEASURED", "why": "no gap was measured"})
+
+    ret = {}
+    ret_verdict = {"status": "UNMEASURED", "why": "no gap was measured"}
+    if res is not None:
+        for readout in ("head", "ridge"):
+            r = res["retain"][readout]
+            ret[readout] = r
+        r = res["retain"]["head"]
+        if r["status"] == "UNMEASURED":
+            ret_verdict = {"status": "UNMEASURED", "why": r["why"]}
+        else:
+            v = r["ratio_per_byte"]
+            ret_verdict = {
+                "status": "PASS" if (v is not None and
+                                     v >= RETAIN_RATIO_THRESHOLD) else "FAIL",
+                "why": (f"post/pre = {v:.4f} vs the pre-registered threshold "
+                        f"{RETAIN_RATIO_THRESHOLD} (the head's own recall of "
+                        "the replayed pre-stream facts)")}
+
+    # NO REGRESSION
+    if ce_post.get("held_out_ce_nats_per_byte") is None:
+        nr = {"status": "UNMEASURED", "why": "the CE cell was skipped",
+              "delta_ce": None}
+    elif ce_pre.get("held_out_ce_nats_per_byte") is None:
+        nr = {"status": "UNMEASURED",
+              "why": ("no PRE-STREAM checkpoint was given, so the DELTA cannot "
+                      "be formed (dCE is a difference, not a level)"),
+              "held_out_ce_nats_per_byte":
+                  ce_post.get("held_out_ce_nats_per_byte"),
+              "delta_ce": None}
+    else:
+        dce = (ce_post["held_out_ce_nats_per_byte"]
+               - ce_pre["held_out_ce_nats_per_byte"])
+        nr = {"status": "PASS" if dce <= NO_REGRESSION_MAX_DCE else "FAIL",
+              "why": f"dCE = {dce:.4f} vs the pre-registered threshold "
+                     f"{NO_REGRESSION_MAX_DCE} nats/byte",
+              "held_out_ce_pre": ce_pre["held_out_ce_nats_per_byte"],
+              "held_out_ce_post": ce_post["held_out_ce_nats_per_byte"],
+              "delta_ce": dce}
+    return {
+        "threshold_gap": g,
+        "acquire": {"verdict": acq_verdict,
+                    "verdict_trained_board": acq_verdict_trained,
+                    "per_readout": acq,
+                    "threshold": ACQUIRE_EXACT_THRESHOLD,
+                    "note": ("the criterion's headline is the HELD-OUT board "
+                             "(board C, never trained on); the trained-board "
+                             "cell is the 'did it memorise the stream' "
+                             "number")},
+        "retain": {"verdict": ret_verdict, "per_readout": ret,
+                   "threshold": RETAIN_RATIO_THRESHOLD},
+        "no_regression": dict(nr, threshold=NO_REGRESSION_MAX_DCE),
     }
 
 

@@ -430,6 +430,52 @@ def main():
     d.step_batch(cs, ns, ends)
     check("the default engine still steps", d.t == 1)
 
+    # ---------------------------------------------------------------- (f)
+    print("\n(f) a GATED checkpoint round-trips (the traces are persisted)")
+    import tempfile
+    mg = gpu_port.GpuModel(device=DEV, dim=DIM, layers=LAYERS, seed=SEED,
+                           gated=True)
+    mg.new_states(B)
+    mg.step_batch(cs, ns, ends)
+    p = os.path.join(tempfile.mkdtemp(), "gated.npz")
+    mg.save(p)
+    mg2 = gpu_port.GpuModel(device=DEV, dim=DIM, layers=LAYERS, seed=SEED,
+                            gated=True)
+    mg2.new_states(B)
+    mg2.load(p)
+    check("the gate's parameters round-trip",
+          all(torch.equal(mg.layers[i].gate, mg2.layers[i].gate)
+              for i in range(LAYERS)))
+    check("the gate's cross-time trace round-trips bit-exactly",
+          all(torch.equal(mg.layers[i].gatetrace, mg2.layers[i].gatetrace)
+              for i in range(LAYERS)),
+          "a resumed gated run that started the trace at zero would silently "
+          "lose the chain across the resume")
+    check("the dense credit trace round-trips bit-exactly",
+          all(torch.equal(mg.dense_E[i], mg2.dense_E[i])
+              for i in range(LAYERS)))
+    mg.step_batch(cs, ns, ends)
+    mg2.step_batch(cs, ns, ends)
+    g1, g2 = grad_slices(mg), grad_slices(mg2)
+    check("and the resumed run continues BIT-IDENTICALLY",
+          all(np.array_equal(g1[n], g2[n]) for n, _ in mg.shapes),
+          "the same gradient on the next step, from the checkpoint")
+    # the numpy reference's gated checkpoint too
+    np_model.save(os.path.join(os.path.dirname(p), "gated_np.npz"))
+    np2 = numpy_port.Model(dim=DIM, layers=LAYERS, lr=5e-4, gated=True)
+    np2.new_states(B)
+    np2.load(os.path.join(os.path.dirname(p), "gated_np.npz"))
+    check("the numpy reference's gated checkpoint round-trips",
+          all(np.array_equal(np_model.views[n], np2.views[n])
+              for n, _ in np_model.shapes)
+          and all(np.array_equal(np_model.dense_E[i], np2.dense_E[i])
+                  for i in range(LAYERS))
+          and all(np.array_equal(np_model.layers[i].gatetrace,
+                                 np2.layers[i].gatetrace)
+                  for i in range(LAYERS)))
+    for f in os.listdir(os.path.dirname(p)):
+        os.remove(os.path.join(os.path.dirname(p), f))
+
     print("\n" + ("P3 GATE (credit): PASS" if PASS else "P3 GATE (credit): FAIL"))
     return 0 if PASS else 1
 
