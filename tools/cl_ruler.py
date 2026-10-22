@@ -770,7 +770,13 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         elif nu["verdict"] == "SIGNAL":
             status = "UNMEASURED"
             why = ("the NUISANCE control beats its own null: the readout "
-                   "invents signal, so the cell cannot be trusted")
+                   "invents signal, so the cell cannot be trusted.  NOTE: on "
+                   "a TRAINED board the nuisance (the key is kept, the payload "
+                   "is replaced) is not provably absent from the MODEL's "
+                   "knowledge -- the model may answer from its WEIGHTS, which "
+                   "is a memorisation signature and not a state read; on the "
+                   "HELD-OUT board no such association can exist, so a leak "
+                   "there would be a real leak.")
         else:
             status = "MEASURED"
             why = ""
@@ -784,6 +790,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
             "prior_per_byte": c.get("prior_per_byte"),
             "prior_exact4": c.get("prior_exact4"),
             "beats_prior": c.get("beats_prior"),
+            "nuisance_verdict": nu["verdict"],
+            "nuisance_per_byte": nu["per_byte"],
+            "nuisance_null_per_byte": nu["null_per_byte"],
             "threshold": ACQUIRE_EXACT_THRESHOLD,
             "setting": c["setting"],
         }
@@ -814,6 +823,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
             "prior_per_byte": c.get("prior_per_byte"),
             "prior_exact4": c.get("prior_exact4"),
             "beats_prior": c.get("beats_prior"),
+            "nuisance_verdict": nu["verdict"],
+            "nuisance_per_byte": nu["per_byte"],
+            "nuisance_null_per_byte": nu["null_per_byte"],
             "threshold": ACQUIRE_EXACT_THRESHOLD,
             "setting": c["setting"],
         }
@@ -1166,6 +1178,11 @@ def run_trained(args, gaps):
     alpha = cl2.alphabet_symbols(alpha_kind)
     alpha_size = 256 if alpha is None else len(alpha)
     facts = int(meta.get("facts", args.facts))
+    if facts != args.facts:
+        print(f"[geometry] the checkpoint was trained with {facts} facts per "
+              f"stream (the CLI said {args.facts}): the CHECKPOINT's geometry "
+              f"is used -- the cells must match the training")
+        args.facts = facts
     board_size = int(meta.get("board_size", 512))
     seeds = {"A": int(meta.get("board_seed_a", 101)),
              "B": int(meta.get("board_seed_b", 202)),
