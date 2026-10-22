@@ -355,6 +355,26 @@ it is what makes the "promotion" step in §1 meaningful (promotion promotes an
 
 ---
 
+
+> ### AMENDED 2026-10-22 — this size sits EXACTLY on a boundary nobody
+> checked (§22, `tools/state_capacity_budget.py`).
+>
+> The size decision here was made for other reasons (throughput, the
+> incumbent's cost, the 8 MB tail accumulator). **The capacity budget
+> computed after the fact says that 16 layers × 512 dims is within 6 % of
+> the point where a linear-readable store stops holding one board of 512
+> facts** — 8 704 dims needed against 8 192 available with the optimal
+> coding, and 33 280 with the natural one-hot. **The state is 1.06×–4.06×
+> short for ONE board, and 2.12×–8.12× short for two.**
+>
+> This is worth recording precisely because it is a **coincidence**: the
+> size was not chosen with the store's capacity in mind, and it landed on
+> the boundary. **The store that the goal needs (M2, a keyed store) must
+> be sized against that budget deliberately** — a keyed store of 1024
+> entries × 4 bytes over a 16-symbol alphabet needs 1024 × 16 bits of
+> content plus an address per entry, and its parameter count, not the
+> recurrent state's width, is the thing to choose.
+
 ## 4. Two candidate mechanisms for "learn a fact, keep it, recall it"
 
 CL-2 and CL-3 exist to choose between these. They are not interchangeable
