@@ -4659,3 +4659,86 @@ separately from the verdict:**
 - the CL-RULER correctly reports a **frozen** checkpoint's `dCE = 0` as
   **UNMEASURED by construction** rather than as a pass, and says so in its
   own output.
+
+### 15. The P3 gate is implemented, gated, and MEASURED — and the measurement says the credit path is 45× too slow
+
+`docs/design/P3-GATE-IMPLEMENTATION.md` (206 lines) is the companion to
+the design. The design's recommendation is built verbatim, the missing
+credit gate is written, and the design's one unmeasured number is measured.
+
+**The credit is pinned.** `tests/check_gated_credit.py` compares the gated
+`step_batch`'s FULL gradient (`dembed`, `ddecay`, `dgate`) against torch
+autograd over the same window, plus the dense-vs-ring equivalence under a
+per-sample `dec`, plus the numpy reference's gated arm. It measures the
+**float32 rounding floor** of the same computation, so the tolerance can
+only be loosened by a measurement:
+
+| slice | CPU fp32 | vs float64 | fp32 floor | MX150 |
+|---|---:|---:|---:|---:|
+| embed | 1.90e-07 | 2.70e-07 | 1.83e-07 | 3.49e-07 |
+| layer0.decay | 9.79e-08 | 2.86e-07 | 2.86e-07 | 1.31e-07 |
+| layer0.gate | 1.57e-07 | 2.84e-07 | 2.44e-07 | 1.96e-07 |
+| layer1.decay | 1.46e-07 | 4.94e-07 | 4.94e-07 | 1.46e-07 |
+| layer1.gate | 9.77e-07 | 6.19e-07 | 7.97e-07 | 6.74e-07 |
+
+**Max deviation 9.8e-07 relative (CPU), 6.7e-07 (MX150) — at the float32
+floor, not at a hand-set tolerance.** Also pinned: `gate = 0` is
+**bit-identical** to the incumbent (max rel dev 0.000e+00 on the loss, the
+CE, the states and every non-gate gradient slice); the dense credit vs the
+ring incumbent is 0.000e+00 on `dembed`; and the design's §2 measurement is
+now permanent — with **no truncation**, ring == dense == the explicitly
+enumerated survival products at **0.000e+00** under a per-sample,
+time-varying retention. **So the plan's and the code's stated reason for
+the refusal really was three-quarters wrong.**
+
+**The measurement that changes the plan.** The design projected the dense
+credit at 2–4 ms/step. On the MX150 (dim=512, layers=16):
+
+| B | path | ms/step | peak |
+|---:|---|---:|---:|
+| 64 | ring, default init (ring_k=14) | 22.2 | 0.222 GB |
+| 64 | **dense (the P3 credit path)** | **500.2** | 0.730 GB |
+| 256 | ring, default init | 44.1 | 0.368 GB |
+| 256 | **dense** | **2004.5** | 2.500 GB |
+| 256 | ring, P4 init + tail | 1430.2 | 3.926 GB |
+| 1024 | ring, default init | 139.1 | 0.967 GB — dense/gated/P4-ring **OOM** |
+
+**The dense credit is 45× the ring at B=256, and ~500× the projection.**
+And the cost is **not** the trace's memory — it is the **einsum's shape**:
+
+| op (per layer, B=256, E is 134 MB) | ms |
+|---|---:|
+| `E.mul_(dec[:, None, :])` (0.27 GB moved) | 6.45 |
+| `einsum("bvd,bd->vd", E, dlds)` (0.13 GB read) | **116.10** |
+| `E[ar, c_arr, :] += 1.0` | 0.13 |
+| **ALT:** `(E * dlds[:, None, :]).sum(0)` — the same contraction | **9.52** |
+
+torch turns that contraction into **131,072 batched 1×1×256 GEMVs** and
+pays **18× the cost of the memory traffic it implies**. The
+multiply-then-sum formulation is **12× faster** and would take the dense
+path from **1963 ms/step to 258 ms/step**. It is **not** bit-identical (a
+different summation order), so it is recorded here as a **measurement, not
+a change** — and the decision (does the 1e-7 break the dense-vs-ring
+bit-identity pin?) is named as a decision, not a measurement.
+
+**Two facts worth having separately from the verdict:**
+- at the **P4 init** the dense trace is the **cheaper of the two in
+  memory** (2.500 GB vs the P4 ring's 3.926 GB, which carries the tail's
+  1.33 GB accumulator) and 1.4× slower in step time — as the design
+  predicted;
+- the **gated arm's ceiling on a 4 GB card is B=256** (the dense trace
+  alone is 8.6 GB at B=1024, dim=512, 16 layers) — and neither can the P4
+  ring.
+
+**ALL 33 GATES PASS**, and the default engine is untouched: `theta`'s
+layout, the numerics and `check_parity` ("worst differing element 0") are
+exactly as they were; every change sits behind `self.gated` or
+`trace_mode == "dense"`.
+
+**What is still UNMEASURED, named rather than glossed:** the dense
+credit's cost on a **T4** (the free tier's quota is spent); whether the
+einsum's alternative is acceptable (a decision, not a measurement);
+**whether the gate's mechanism does anything at all** (the per-sample
+spread of `a` on a TRAINED model is unmeasured, and a null there would
+make the whole arm a no-op with a measured cause); and any trained gated
+run.

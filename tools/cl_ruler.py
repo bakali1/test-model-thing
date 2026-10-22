@@ -1146,6 +1146,199 @@ def print_gap(res):
 
 
 # ---------------------------------------------------------------------------
+# the TRAINED mode (--mode train): a CL-2 arm, scored
+# ---------------------------------------------------------------------------
+def run_trained(args, gaps):
+    """The three numbers of the criterion, on a CL-2 checkpoint.
+
+    The cells are built from the CL-2 BOARDS (the trainer's own make_board,
+    imported -- never re-implemented), so the geometry is the TRAINING
+    geometry, and the RETAIN replay is the pre-stream board A measured at
+    the pre-stream checkpoint and at the post-stream one.
+    """
+    t0 = time.time()
+    meta, dz = cl2_meta(args.ckpt)
+    if "alphabet" not in meta or "board_seed_a" not in meta:
+        print(TRAIN_REFUSAL, file=sys.stderr)
+        return 2
+    import tools.cl2_train as cl2          # the boards, imported
+    alpha_kind = str(meta["alphabet"])
+    alpha = cl2.alphabet_symbols(alpha_kind)
+    alpha_size = 256 if alpha is None else len(alpha)
+    facts = int(meta.get("facts", args.facts))
+    board_size = int(meta.get("board_size", 512))
+    seeds = {"A": int(meta.get("board_seed_a", 101)),
+             "B": int(meta.get("board_seed_b", 202)),
+             "C": int(meta.get("board_seed_c", 303))}
+    boards = {k: cl2.make_board(s, board_size, alpha) for k, s in seeds.items()}
+    try:
+        prior = json.loads(meta.get("prior", "{}"))
+    except Exception:
+        prior = {}
+    prior_byte = prior.get("argmax_alpha")
+
+    print("=" * 78)
+    print("CL-RULER -- TRAINED mode: the criterion of PLAN-2026-10-21 §1")
+    print("=" * 78)
+    print(f"checkpoint : {args.ckpt} (phase {meta.get('phase')}, "
+          f"step {meta.get('step')})")
+    if args.ckpt_pre:
+        print(f"pre-stream: {args.ckpt_pre}")
+    else:
+        print("pre-stream: NONE  -> the RETAIN ratio and the dCE are "
+              "UNMEASURED (they are differences, not levels)")
+    print(f"geometry  : {facts} facts/stream, alphabet {alpha_kind} "
+          f"({alpha_size} symbols), boards A/B/C = {board_size} facts each "
+          f"(seeds {seeds['A']}/{seeds['B']}/{seeds['C']})")
+    print(f"ruler     : n={args.n} seed={args.seed} gaps={gaps} | "
+          f"the ACQUIRE threshold is at d=32 (exact-4 >= "
+          f"{ACQUIRE_EXACT_THRESHOLD}), the RETAIN threshold is a ratio >= "
+          f"{RETAIN_RATIO_THRESHOLD}, the NO REGRESSION threshold is dCE <= "
+          f"{NO_REGRESSION_MAX_DCE} nats/B")
+    print(f"readouts  : the model's OWN trained head (primary) and "
+          f"mb._ridge_score (the state-information number); the global byte "
+          f"prior: byte {prior_byte}")
+
+    m_post, info = mb.load_frozen(args.ckpt)
+    models = {"post": m_post}
+    heads = {"post": (np.asarray(dz["Wm"], np.float32),
+                      np.asarray(dz["bm"], np.float32))}
+    if args.ckpt_pre:
+        m_pre, _i2 = mb.load_frozen(args.ckpt_pre)
+        dp = np.load(args.ckpt_pre)
+        models["pre"] = m_pre
+        heads["pre"] = (np.asarray(dp["Wm"], np.float32),
+                        np.asarray(dp["bm"], np.float32))
+    print("-" * 78)
+
+    results = []
+    for d in gaps:
+        res = run_gap_trained(models, heads, d, args, alpha, boards, prior_byte)
+        results.append(res)
+        print(f"\n--- gap {d} (n={args.n}, {facts} facts, "
+              f"{res['sequence_length']} B/sequence) ---")
+        print(f"    {'cell':<32} {'per_byte':>9} {'exact4':>9} {'null_pb':>9} "
+              f"{'null_ex4':>9} {'cov':>7}  verdict")
+        for c in res["cells"]:
+            cov = c.get("coverage", {})
+            print(f"    {c['cell']:<32} {pct(c.get('per_byte')):>9} "
+                  f"{pct(c.get('exact4')):>9} {pct(c.get('null_per_byte')):>9} "
+                  f"{pct(c.get('null_exact4')):>9} "
+                  f"{pct(cov.get('coverage')):>7}  {c.get('verdict')}")
+        for k, c in res["acquire"]["per_readout"].items():
+            print(f"    ACQUIRE[{k:<18}] per_byte {pct(c['per_byte'])} | "
+                  f"exact4 {pct(c['exact4'])} | null {pct(c['null_per_byte'])}"
+                  f"/{pct(c['null_exact4'])} | prior {pct(c.get('prior_per_byte'))}"
+                  f"/{pct(c.get('prior_exact4'))} | coverage "
+                  f"{pct(c['coverage'].get('coverage'))} | {c['status']}")
+        for ro in ("head", "ridge"):
+            r = res["retain"][ro]
+            print(f"    RETAIN[{ro:<6}] pre {pct(r['pre_per_byte'])} "
+                  f"({r['pre_verdict']}) | post {pct(r['post_per_byte'])} "
+                  f"({r['post_verdict']}) | ratio "
+                  f"{('%.3f' % r['ratio_per_byte']) if r['ratio_per_byte'] is not None else 'n/a'}"
+                  f" | {r['status']}")
+        print(f"    [retain lag] {res['retain_lag']['lag_bytes_cue']} B behind "
+              f"the cue (the horizon is {HORIZON_B} B): "
+              f"{'inside' if res['retain_lag']['in_horizon'] else 'OUTSIDE'}")
+
+    # -- the CE cells: the pre-stream and the post-stream checkpoint ------
+    def ce_cell(m, ckpt):
+        if args.no_ce:
+            return {"status": "SKIPPED", "why": "--no-ce was given",
+                    "held_out_ce_nats_per_byte": None, "held_out_ce_se": None,
+                    "delta_ce": None, "threshold": NO_REGRESSION_MAX_DCE}
+        r = mb.model_transfer_ce(m, ckpt=ckpt, seed=args.seed, verbose=True)
+        return {"status": "MEASURED", "why": "",
+                "held_out_ce_nats_per_byte": float(r["value"]),
+                "held_out_ce_se": float(r["se"]),
+                "n_slices": int(r["n_slices"]),
+                "scored_bytes": int(r["total_bytes"]),
+                "unigram_ce": float(r["unigram"]),
+                "bigram_ce": float(r["bigram"]),
+                "delta_ce": None, "threshold": NO_REGRESSION_MAX_DCE,
+                "estimator": r.get("estimator"),
+                "setting": {"corpus": "data/eval/**/* (tools/eval.py's own "
+                                      "slices)", "ckpt": ckpt}}
+
+    print("\n--- NO REGRESSION (the held-out CE, pre-stream and post-stream) ---")
+    ce_post = ce_cell(m_post, args.ckpt)
+    print(f"    post-stream CE {ce_post['held_out_ce_nats_per_byte']}")
+    if args.ckpt_pre:
+        ce_pre = ce_cell(models["pre"], args.ckpt_pre)
+        print(f"    pre-stream  CE {ce_pre['held_out_ce_nats_per_byte']}")
+    else:
+        ce_pre = {"status": "MISSING", "why": "no --ckpt-pre",
+                  "held_out_ce_nats_per_byte": None}
+
+    verdicts = summarize_trained(results, ce_post, ce_pre)
+    print("\n" + "=" * 78)
+    print("THE THREE NUMBERS")
+    print("=" * 78)
+    a = verdicts["acquire"]
+    print(f"  ACQUIRE       : {a['verdict']['status']}  ({a['verdict']['why']})")
+    print(f"                 held-out board, trained head: "
+          f"per_byte {pct(a['per_readout'].get('head_heldout', {}).get('per_byte'))}"
+          f" | exact4 {pct(a['per_readout'].get('head_heldout', {}).get('exact4'))}"
+          f" | null {pct(a['per_readout'].get('head_heldout', {}).get('null_per_byte'))}"
+          f" | prior {pct(a['per_readout'].get('head_heldout', {}).get('prior_per_byte'))}")
+    print(f"                 trained board, trained head: "
+          f"per_byte {pct(a['per_readout'].get('head', {}).get('per_byte'))}"
+          f" | exact4 {pct(a['per_readout'].get('head', {}).get('exact4'))}"
+          f" | null {pct(a['per_readout'].get('head', {}).get('null_per_byte'))}"
+          f" | prior {pct(a['per_readout'].get('head', {}).get('prior_per_byte'))}")
+    print(f"                 held-out board, ridge: per_byte "
+          f"{pct(a['per_readout'].get('ridge_heldout', {}).get('per_byte'))}"
+          f" | exact4 {pct(a['per_readout'].get('ridge_heldout', {}).get('exact4'))}"
+          f" | null {pct(a['per_readout'].get('ridge_heldout', {}).get('null_per_byte'))}")
+    r = verdicts["retain"]
+    print(f"  RETAIN        : {r['verdict']['status']}  ({r['verdict']['why']})")
+    nr = verdicts["no_regression"]
+    print(f"  NO REGRESSION : {nr['status']}  ({nr['why']})")
+
+    out = {
+        "tool": "tools/cl_ruler.py",
+        "criterion": "CL-RULER (PLAN-2026-10-21-CONTINUAL-LEARNING.md §1, CL-0)",
+        "mode": "train",
+        "mode_note": ("TRAINED: the facts were IN THE LOSS (tools/cl2_train.py "
+                      "CL-2).  The three numbers carry their pre-registered "
+                      "thresholds.  The primary readout is the model's OWN "
+                      "trained memory head; the ridge is the state-information "
+                      "number beside it."),
+        "checkpoint": args.ckpt,
+        "ckpt_pre": args.ckpt_pre,
+        "ckpt_info": info,
+        "cl2_meta": {k: (v if isinstance(v, (int, float, str)) else str(v))
+                     for k, v in meta.items()},
+        "ruler_setting": {
+            "n": int(args.n), "seed": int(args.seed),
+            "alphabet": alpha_kind, "alphabet_size": alpha_size,
+            "facts": facts, "gaps": gaps,
+            "board_size": board_size, "board_seeds": seeds,
+            "chance_per_byte": 1.0 / alpha_size,
+            "chance_exact4": (1.0 / alpha_size) ** PAYLOAD_LEN,
+            "readout": ("the trained memory head (primary) + "
+                        "tools/membench/model_backend.py:_ridge_score"),
+            "read_at_cue": True, "padding": "none (fixed-length, asserted)",
+            "horizon_B": HORIZON_B,
+        },
+        "thresholds": {"acquire_exact4": ACQUIRE_EXACT_THRESHOLD,
+                       "retain_ratio": RETAIN_RATIO_THRESHOLD,
+                       "no_regression_max_dce": NO_REGRESSION_MAX_DCE},
+        "results": results,
+        "no_regression": ce_post,
+        "no_regression_pre": ce_pre,
+        "verdicts": verdicts,
+        "runtime_s": time.time() - t0,
+    }
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(out, fh, indent=2, default=float)
+        print(f"wrote {args.out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main(argv=None):
@@ -1154,8 +1347,14 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", default="runs/taxis/A_p4_wd0_c.npz",
                     help="frozen checkpoint (default: %(default)s)")
+    ap.add_argument("--ckpt-pre", default=None,
+                    help="the PRE-STREAM checkpoint (the end of phase f1).  "
+                         "The RETAIN ratio and the dCE are differences, so "
+                         "without it they are UNMEASURED, not zero")
     ap.add_argument("--facts", type=int, default=64,
-                    help="facts in the stream (default: %(default)s)")
+                    help="facts in the stream (default: %(default)s).  In "
+                         "--mode train the CHECKPOINT's own fact count is "
+                         "used (the geometry must match the training)")
     ap.add_argument("--gaps", default="8,32",
                     help="comma separated gaps d (default: %(default)s)")
     ap.add_argument("--n", type=int, default=2048,
@@ -1166,9 +1365,9 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="write the full result as JSON")
     ap.add_argument("--mode", default="probe", choices=("probe", "train"),
                     help="'probe' = frozen checkpoint scored on a fact stream "
-                         "(a DIAGNOSTIC); 'train' = the facts are in the loss "
-                         "and the model is updated (the goal) -- REFUSES, see "
-                         "the message it prints")
+                         "(a DIAGNOSTIC); 'train' = a CL-2 checkpoint whose "
+                         "facts were IN THE LOSS: the three numbers of the "
+                         "criterion, with their thresholds")
     ap.add_argument("--selftest", action="store_true",
                     help="run the power / no-invented-signal / read-at-the-cue "
                          "selftest")
@@ -1204,11 +1403,9 @@ def main(argv=None):
     if args.selftest:
         return selftest(args.ckpt, seed=args.seed)
 
-    if args.mode == "train":
-        print(TRAIN_REFUSAL, file=sys.stderr)
-        return 2
-
     gaps = [int(g) for g in args.gaps.split(",") if g.strip()]
+    if args.mode == "train":
+        return run_trained(args, gaps)
     alpha = alphabet_symbols(args.alphabet)
     alpha_size = 256 if alpha is None else len(alpha)
 
