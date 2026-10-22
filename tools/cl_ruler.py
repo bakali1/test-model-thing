@@ -652,6 +652,17 @@ def make_head_cell(name, X, Y, W, b, seed, alpha_size, prior_byte=None,
     return out
 
 
+def _is_gated_ckpt(path):
+    """Does this checkpoint carry a P3 gate?  A gated arm's theta has a
+    layer{i}.gate vector; the layout has to match the model's, or the load
+    would silently drop the gate.  So the ruler DETECTS it instead of being
+    told."""
+    try:
+        d = np.load(path, allow_pickle=False)
+        return any(k.endswith(".gate") for k in d.files)
+    except Exception:
+        return False
+
 def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     """Every cell of one gap, for a TRAINED (CL-2) arm.
 
@@ -721,7 +732,7 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         #    the READOUT, and the one the verdict uses;
         #  * nuis1 (the payload replaced, the key kept): the model may still
         #    answer from the weights it memorised -- this is the
-        #    MEMORISATION SIGNATURE, reported, not used to void the cell.
+        #    COPY CONTROL, reported, not used to void the cell.
         seqn = build_sequences("stream_nuis2", d, stream, rng, alpha, gap=gap)
         Xn = states_at_cue(models["post"], seqn)
         cn = d5.make_cell(cname + "_nuisance", Xn, Y, args.seed, alpha_size,
@@ -744,9 +755,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         cells.append(hn)
         seqw = build_sequences("stream_nuis1", d, stream, rng, alpha, gap=gap)
         Xw = states_at_cue(models["post"], seqw)
-        cw = d5.make_cell(cname + "_nuisance_weights", Xw, Y, args.seed,
+        cw = d5.make_cell(cname + "_copy_control", Xw, Y, args.seed,
                            alpha_size,
-                           note="MEMORISATION SIGNATURE (not a void): the "
+                           note="COPY CONTROL (not a void): the "
                                 "target's PAYLOAD is replaced but its KEY is "
                                 "kept, so a model that memorised the fact "
                                 "can still answer from its WEIGHTS.  A SIGNAL "
@@ -756,10 +767,10 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                               board=bname, readout="ridge (mb._ridge_score)")
         cells.append(cw)
-        hw = make_head_cell(cname + "_nuisance_weights_head", Xw, Y,
+        hw = make_head_cell(cname + "_copy_control_head", Xw, Y,
                             heads["post"][0], heads["post"][1], args.seed,
                             alpha_size, prior_byte=prior_byte,
-                            note="MEMORISATION SIGNATURE (head): the "
+                            note="COPY CONTROL (head): the "
                                  "payload is replaced, the key is kept.")
         hw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                               board=bname, readout="the trained memory head")
@@ -818,18 +829,18 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="the trained memory head")
     cells.append(hn)
-    cw = d5.make_cell("retain_replay_nuisance_weights", Xw, Y, args.seed,
+    cw = d5.make_cell("retain_replay_copy_control", Xw, Y, args.seed,
                       alpha_size,
-                      note="MEMORISATION SIGNATURE for the replay: the "
+                      note="COPY CONTROL for the replay: the "
                            "payload is replaced, the key is kept.",
                       expect_signal=False)
     cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="ridge (mb._ridge_score)")
     cells.append(cw)
-    hw = make_head_cell("retain_replay_nuisance_weights_head", Xw, Y,
+    hw = make_head_cell("retain_replay_copy_control_head", Xw, Y,
                         heads["post"][0], heads["post"][1], args.seed,
                         alpha_size, prior_byte=prior_byte,
-                        note="MEMORISATION SIGNATURE (head) for the replay.")
+                        note="COPY CONTROL (head) for the replay.")
     hw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="the trained memory head")
     cells.append(hw)
@@ -889,7 +900,7 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         sfx = "" if readout == "ridge" else "_head"
         c = by[base + sfx]
         nu = by[base + "_nuisance" + sfx]
-        mem = by[base + "_nuisance_weights" + sfx]
+        mem = by[base + "_copy_control" + sfx]
         if c["verdict"] != "SIGNAL":
             status = "UNMEASURED"
             why = (f"the {readout} cell does not beat its own matched null "
@@ -916,9 +927,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
             "nuisance_verdict": nu["verdict"],
             "nuisance_per_byte": nu["per_byte"],
             "nuisance_null_per_byte": nu["null_per_byte"],
-            "memorisation_signature_verdict": mem["verdict"],
-            "memorisation_signature_per_byte": mem["per_byte"],
-            "memorisation_signature_null_per_byte": mem["null_per_byte"],
+            "copy_control_verdict": mem["verdict"],
+            "copy_control_per_byte": mem["per_byte"],
+            "copy_control_null_per_byte": mem["null_per_byte"],
             "threshold": ACQUIRE_EXACT_THRESHOLD,
             "setting": c["setting"],
         }
@@ -1285,6 +1296,11 @@ def run_trained(args, gaps):
         os.path.dirname(os.path.abspath(__file__))), "data/*.txt")))
     args._text_pool = cl2.TextPool(_files, seed=args.seed) if _files else None
     alpha_kind = str(meta["alphabet"])
+    if args.alphabet and str(args.alphabet) != alpha_kind:
+        print(f"[geometry] OVERRIDE: the checkpoint was trained on the "
+              f"alphabet {alpha_kind} and the CLI asked for {args.alphabet}. "
+              f"The CLI wins; the cells are then NOT the training geometry.")
+        alpha_kind = str(args.alphabet)
     alpha = cl2.alphabet_symbols(alpha_kind)
     alpha_size = 256 if alpha is None else len(alpha)
     facts = int(meta.get("facts", args.facts))
@@ -1317,6 +1333,10 @@ def run_trained(args, gaps):
     print(f"geometry  : {facts} facts/stream, alphabet {alpha_kind} "
           f"({alpha_size} symbols), boards A/B/C = {board_size} facts each "
           f"(seeds {seeds['A']}/{seeds['B']}/{seeds['C']})")
+    print(f"            (the CHECKPOINT's own facts/gap/alphabet: "
+          f"{facts}/{meta.get('gap')}/{alpha_kind}; the ruler's old default "
+          f"--facts 64 was WRONG for a CL-2 arm: its RETAIN lag became "
+          f"8*(facts-1)+d, far past the {HORIZON_B} B horizon)")
     print(f"ruler     : n={args.n} seed={args.seed} gaps={gaps} | "
           f"the ACQUIRE threshold is at d=32 (exact-4 >= "
           f"{ACQUIRE_EXACT_THRESHOLD}), the RETAIN threshold is a ratio >= "
@@ -1326,12 +1346,12 @@ def run_trained(args, gaps):
           f"mb._ridge_score (the state-information number); the global byte "
           f"prior: byte {prior_byte}")
 
-    m_post, info = mb.load_frozen(args.ckpt)
+    m_post, info = mb.load_frozen(args.ckpt, gated=_is_gated_ckpt(args.ckpt))
     models = {"post": m_post}
     heads = {"post": (np.asarray(dz["Wm"], np.float32),
                       np.asarray(dz["bm"], np.float32))}
     if args.ckpt_pre:
-        m_pre, _i2 = mb.load_frozen(args.ckpt_pre)
+        m_pre, _i2 = mb.load_frozen(args.ckpt_pre, gated=_is_gated_ckpt(args.ckpt_pre))
         dp = np.load(args.ckpt_pre)
         models["pre"] = m_pre
         heads["pre"] = (np.asarray(dp["Wm"], np.float32),
@@ -1358,8 +1378,8 @@ def run_trained(args, gaps):
                   f"/{pct(c['null_exact4'])} | prior {pct(c.get('prior_per_byte'))}"
                   f"/{pct(c.get('prior_exact4'))} | coverage "
                   f"{pct(c['coverage'].get('coverage'))} | nuisance "
-                  f"{c['nuisance_verdict']} | memorisation-signature "
-                  f"{c['memorisation_signature_verdict']} | {c['status']}")
+                  f"{c['nuisance_verdict']} | copy-control "
+                  f"{c['copy_control_verdict']} | {c['status']}")
         for ro in ("head", "ridge"):
             r = res["retain"][ro]
             print(f"    RETAIN[{ro:<6}] pre {pct(r['pre_per_byte'])} "
@@ -1401,7 +1421,7 @@ def run_trained(args, gaps):
                   "held_out_ce_nats_per_byte": None}
     ce_base = None
     if args.ckpt_base:
-        m_base, _i3 = mb.load_frozen(args.ckpt_base)
+        m_base, _i3 = mb.load_frozen(args.ckpt_base, gated=_is_gated_ckpt(args.ckpt_base))
         ce_base = ce_cell(m_base, args.ckpt_base)
         print(f"    base (pre the fact training) CE "
               f"{ce_base['held_out_ce_nats_per_byte']}")
@@ -1504,8 +1524,11 @@ def main(argv=None):
                     help="comma separated gaps d (default: %(default)s)")
     ap.add_argument("--n", type=int, default=2048,
                     help="samples per cell (default: %(default)s)")
-    ap.add_argument("--alphabet", default="16", choices=("full", "16", "4"),
-                    help="payload alphabet (default: %(default)s)")
+    ap.add_argument("--alphabet", default=None, choices=("full", "16", "4"),
+                    help="payload alphabet.  DEFAULT: the CHECKPOINT's own "
+                         "alphabet in --mode train (the old default of '16' "
+                         "was WRONG for a CL-2 arm trained on another "
+                         "alphabet); '16' in --mode probe")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gap-text-frac", type=float, default=0.5,
                     help="TRAINED mode: the fraction of the cell rows whose "
@@ -1559,11 +1582,11 @@ def main(argv=None):
     gaps = [int(g) for g in args.gaps.split(",") if g.strip()]
     if args.mode == "train":
         return run_trained(args, gaps)
-    alpha = alphabet_symbols(args.alphabet)
+    alpha = alphabet_symbols(args.alphabet or "16")
     alpha_size = 256 if alpha is None else len(alpha)
 
     t0 = time.time()
-    m, info = mb.load_frozen(args.ckpt)
+    m, info = mb.load_frozen(args.ckpt, gated=_is_gated_ckpt(args.ckpt))
     t_load = time.time() - t0
 
     print("=" * 78)

@@ -5077,3 +5077,79 @@ the criterion. **The programme should stop assuming the state is where the
 memory must live, and start MEASURING which store is doing the work** — the
 copy control now does that, and it is the measurement the whole programme
 should have been making all along.
+
+### 19. THE TWO RESULTS ARE NOT IN CONTRADICTION -- and the difference is the READOUT, not the state.
+
+Two of the programme's biggest results look like they contradict each other:
+
+* **D5** (RESULTS.md §8, the delayed-copy task, `runs/taxis/A_p4_wd0_c.npz`):
+  the state holds an **addressable, persistent address** (the cue key
+  decodes 151x over its own null at 8 B) and a **decaying but real content**
+  (the payload decodes 19.2x over null at 8 B, 6.1x at 32 B, alphabet 256).
+* **CL-2** (§17): the payload is **not** in the state at all -- the head's
+  weights carry a 512-entry table and board B overwrote board A.
+
+**THE AUDIT: DOES D5 SURVIVE THE COPY AUDIT?** It has to, or the two
+results really do conflict. D5's own nuisance control IS the copy control:
+the payload bytes in the input are replaced by fresh random bytes of the
+same alphabet, the key is kept, and the readout must collapse. **It does:
+0.56 % and 0.32 % against a 0.39 % chance -- at chance in both cells.**
+**So D5's payload signal is NOT a copy of the input. The state of that
+model really does hold a decodable payload at 8-128 B.** (The `stream_nuis1`
+cell in `tools/cl_ruler.py` is exactly this control, and the CL-RULER's
+every-nuisance-at-its-null result stands.)
+
+**SO WHERE IS THE DIFFERENCE? In the READOUT.**
+
+| | D5 (the delayed-copy model) | CL-2 (the text+fact arm) |
+|---|---|---|
+| the readout | a **fresh ridge readout fitted on the state** | the model's **own trained head** (a linear map in the weights) |
+| the copy control (input payload replaced) | the decode **collapses to chance** (0.56 %) | the head's answer **barely moves** (0.9609 -> 0.8672) |
+| what that means | the state carries the payload | the head carries the payload |
+
+**A fresh readout on the state collapses under the copy control, and a
+trained head does not, because a fresh readout can only get the payload
+from the state, while a trained head can get it from the weights.** The
+two results are consistent: **the D5 model's state holds a payload; the
+CL-2 model's head holds a table.**
+
+**THEREFORE THE DECISIVE MEASUREMENT IS NOW SHARP, AND IT IS CHEAP.** It is
+not a training run. It is: **fit a FRESH ridge readout on the CL-2 model's
+state, and measure it under the copy control.**
+
+* If the fresh readout recovers the payload **and collapses under the copy
+  control** -> the CL-2 model's state DOES carry the payload, the head was
+  a shortcut the optimiser preferred (**E1**), and the fix is a
+  training/architecture change -- plus a way to stop the head from being
+  the easier path. The capacity budget (§18) then explains why the state
+  route looked unattractive: it is 1.06x-4.06x short for 512 facts.
+* If the fresh readout **does not** recover the payload -> the CL-2
+  model's state does not carry it (**E2**), and the D5 model differs from
+  it in a way that the copy control and the budget can name.
+
+**And the D5 result makes the first outcome more likely, which is a real
+finding in its own right:** the state of a sibling model demonstrably
+carries a payload at 8-128 B, with the copy control confirming it. **So the
+state route is architecturally VIABLE. The CL-2 failure is a crowding
+problem -- the state must carry 512-1024 facts at once, and it demonstrably
+can carry ONE -- not an impossibility.** That is the difference between a
+programme with a hard problem and a programme with a dead end, and it was
+not visible before this audit.
+
+**A SECOND AUDIT, and it is against the programme's own record.** D5's
+nuisance control replaced the payload and kept the key. CL-2's head
+survives the same replacement. **Both facts are about the READOUT, and the
+programme has been reading the CL-2 number ("the payload is not in the
+state") as a statement about the state when it is a statement about the
+head.** §17's phrasing is therefore too strong and is superseded here: the
+correct statement is **"the CL-2 model's HEAD does not read the payload
+from the state; it reads it from the weights."** Whether the state also
+carries it is the question §20 answers.
+
+**The discipline this audit illustrates, and it is the third time the
+programme has had to learn it:** a measurement's meaning is set by its
+CONTROL, and a control that is *absent* silently becomes the
+interpretation. D5 had the copy control, and its payload result is sound.
+CL-2 did not have it, and its head number was about to be misread as a
+statement about the state. **The copy control is now mandatory in every
+cell, and it has already changed the programme's conclusion once tonight.**

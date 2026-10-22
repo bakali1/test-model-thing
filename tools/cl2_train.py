@@ -308,7 +308,8 @@ def build_model(args):
     model = gpu_port.GpuModel(dim=args.dim, layers=args.layers, lr=args.lr,
                               seed=args.seed, device=args.device,
                               half_life_init=(args.half_min, args.half_max),
-                              ring_k=8, ring_credit="full")
+                              ring_k=8, ring_credit="full",
+                              gated=bool(getattr(args, "gated", False)))
     model.theta.requires_grad_(True)
     # THE FIX: the views must be re-made AFTER theta requires grad, or the
     # gradient is silently dropped (see rebind_views).
@@ -631,6 +632,22 @@ def train_step(model, opt, heads, batch, args, wm=None, wm_old=None):
             + args.memory_alpha * mem + args.memory_alpha_old * mem_old)
     opt.zero_grad()
     loss.backward()
+    # M3 (the matched control): the gate is PRESENT but FROZEN at exactly 0.
+    # Its gradient is zeroed here, so AdamW's update for those entries is
+    # 0/(0+eps) = 0 and the gate stays bit-exactly 0 for the whole run: the
+    # arm then differs from the GATED arm in exactly one thing -- whether the
+    # gate is allowed to move.  (Without this, the "frozen" control would be
+    # the ungated arm, which also uses the ring, and the comparison would
+    # confound the gate with the trace.)
+    if getattr(args, "gate_frozen", False) and getattr(model, "gated", False):
+        g = model.theta.grad
+        if g is not None:
+            off = 0
+            for name, shape in model.shapes:
+                size = int(np.prod(shape))
+                if name.endswith(".gate"):
+                    g[off:off + size] = 0.0
+                off += size
     opt.step()
     return {"loss": float(loss.detach()),
             "ce_text": float(ce_text.detach()),
@@ -775,6 +792,21 @@ def build_argparser():
                     help="a JSONL file for the CE trajectory "
                          "(default: <ckpt-dir>/<tag>_ce.jsonl)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--gated", action="store_true",
+                    help="P3: the GATED recurrence, a = sigma(decay + "
+                         "gate*x_in). The gate is a per-dim vector in theta, "
+                         "it starts at EXACTLY 0 (so the arm's starting point "
+                         "is bit-identical to the incumbent), and it is "
+                         "trainable. The CL-2 trainer is autograd-based, so "
+                         "the gate's gradient comes from the forward pass "
+                         "itself -- the engine's credit path is not used by "
+                         "this trainer at all.")
+    ap.add_argument("--gate-frozen", action="store_true",
+                    help="M3, the MATCHED CONTROL: the gate is present but "
+                         "frozen at exactly 0 (its gradient is zeroed before "
+                         "the optimizer step). The arm then differs from the "
+                         "--gated arm in exactly one thing: whether the gate "
+                         "moves. Requires --gated.")
     ap.add_argument("--device", default=None)
     ap.add_argument("--ckpt-dir", default="runs/cl2")
     ap.add_argument("--resume", default=None,
@@ -1078,6 +1110,18 @@ def main(argv=None):
                                wm_old=heads[2] if args.memory_alpha_old > 0 else None)
             model.t += 1
             model.bytes_seen += args.batch * L
+            if getattr(model, "gated", False):
+                gs = [float(l.gate.detach().pow(2).mean().sqrt())
+                      for l in model.layers]
+                gmax = max(float(l.gate.detach().abs().max())
+                           for l in model.layers)
+                stats["gate_rms_mean"] = float(np.mean(gs))
+                stats["gate_rms_max"] = float(np.max(gs))
+                stats["gate_abs_max"] = gmax
+            else:
+                stats["gate_rms_mean"] = 0.0
+                stats["gate_rms_max"] = 0.0
+                stats["gate_abs_max"] = 0.0
             do_ce = (args.ce_eval_every and
                      ((step + 1) % args.ce_eval_every == 0 or step == n_steps - 1))
             held_ce = held_out_ce(model, ce_slices) if do_ce else None
@@ -1092,6 +1136,8 @@ def main(argv=None):
                       f"| behav {stats['behav_per_byte']:.3f}/"
                       f"{stats['behav_exact4']:.3f} "
                       f"| held_ce {held_ce if held_ce is None else round(held_ce, 4)} "
+                      f"| gate {stats['gate_rms_mean']:.4f}/"
+                      f"{stats['gate_abs_max']:.4f} "
                       f"| {el:.0f}s", flush=True)
             if do_ce:
                 log_row(phase, step + 1, stats, held_ce)
@@ -1143,6 +1189,8 @@ def main(argv=None):
                                    "board_seed_b": args.board_seed_b,
                                    "board_seed_c": args.board_seed_c,
                                    "prior": json.dumps(prior),
+                                   "gated": int(bool(args.gated)),
+                                   "gate_frozen": int(bool(args.gate_frozen)),
                                    "memory_eval": json.dumps(evals),
                                    "held_out_ce": float(held_ce_end or 0.0)})
             print(f"    [phase end] {path}", flush=True)
