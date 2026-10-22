@@ -57,3 +57,7 @@ data/eval/
 data/eval_shift/
 legacy/tinystories_bench.txt
 legacy/smaller-4.5m.safetensors
+
+# editable install artifacts
+*.egg-info/
+tmt.egg-info/
