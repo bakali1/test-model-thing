@@ -446,26 +446,63 @@ overwritten. The bottleneck is the **capacity and the stability of the
 associative store**, or moving the content out of the global weights into
 the per-sample state.
 
-**The three candidates, in priority order:**
+**AND THE CAPACITY BUDGET EXPLAINS WHY THE MODEL CHOSE THE HEAD**
+(`tools/state_capacity_budget.py`). The memory head is a **linear** map
+(`state @ Wm + bm` -> 4x256 logits), so ONE linear map must decode, per
+recalled fact, an ADDRESS (>= 1 dim per slot) and a PAYLOAD (>= 4 dims per
+byte with an optimal coding, 16 with one-hot). The state has
+16 x 512 = **8192 scalars**:
 
-1. **CAPACITY.** One linear head (8192 -> 1024) holds 512 facts and must
-   hold 1024. Give it room and RETAIN may become non-zero. Cheapest arm;
-   separates "capacity" from "interference"; a pure head change.
-2. **THE STATE MUST CARRY THE PAYLOAD.** Today the gradient has a
-   **cheaper** path (the head's weights) than the expensive one (writing
-   the payload into the state, where a new fact can evict an old one), and
-   nothing in the loss or the architecture rewards the expensive path.
-   This is an architecture/training choice, not a tuning problem.
-3. **REPLAY.** The standard baseline, which the no-replay premise
-   currently forbids. **The honest reference point is missing: until a
-   replay baseline is measured on the same three numbers, "continual
-   learning is hard" is a claim without a control.**
+| facts to hold | coding | dims needed | have | short by |
+|---|---|---:|---:|---:|
+| 512 (one board) | optimal | 8 704 | 8 192 | **1.06x** |
+| 1024 (two boards) | optimal | 17 408 | 8 192 | **2.12x** |
+| 512 (one board) | one-hot | 33 280 | 8 192 | **4.06x** |
+| 1024 (two boards) | one-hot | 66 560 | 8 192 | **8.12x** |
 
-**The falsifier for (2), pre-registered:** if a state-forced variant still
-scores 0.0000 exact-4 on board B when the head is **zeroed or randomised**
-at eval, then the state does not carry the payload, the M1 / addressable-
-write line is dead, and the programme must fall back to (1) and (3) — which
-is a different programme.
+**The state is too small even for ONE board of 512 facts** (it holds about
+481). And look at the prices: **the address costs 1 dim per fact, the
+payload 4-16 dims per byte.** Under capacity pressure the expensive thing
+is dropped and the cheap thing survives — so **"the address persists and the
+content decays" is EXACTLY what a capacity-limited linear store looks like,
+and the state IS capacity-limited. D5 and CL-2 are the same phenomenon, and
+neither is about write selectivity.**
+
+**THE THREE CANDIDATES, in priority order:**
+
+1. **A SMALLER BOARD, not a bigger model.** `board_size` was an arbitrary
+   choice in the arm's spec; at **64 facts per board**, two boards are
+   128 facts = 2 176 dims, comfortably inside the 8 192 the state has.
+   **Same model, same everything, `board_size 64` instead of 512 — a 20x
+   cheaper change than growing the model, and it puts the state route back
+   inside the budget.** This is the first arm.
+2. **A BIGGER STATE** (dim >= 1088 optimal / >= 4160 one-hot, for two
+   boards) or a **nonlinear / sparse content-addressed store**. Note the
+   plan's §3 "16 layers and 512 dim" was chosen for other reasons and
+   happens to sit exactly at this boundary — the kind of coincidence that
+   silently decides an architecture's fate.
+3. **REPLAY.** The standard baseline, which the no-replay premise currently
+   forbids. **The honest reference point is missing: until a replay
+   baseline is measured on the same three numbers, "continual learning is
+   hard" is a claim without a control.**
+
+**A PASSING RETAIN DOES NOT BY ITSELF SHOW THE STATE IS DOING THE WORK.**
+A bigger head that can hold 1024 facts would also make RETAIN non-zero —
+and that is the *global-store* route, not the state route. **The two must
+be told apart by the copy control**, which is now the programme's decisive
+measurement and which has been missing from every cell so far.
+
+**The falsifier, pre-registered:** if `board_size 64` at dim 512 still
+gives RETAIN = 0.0000 exact-4 **and** the copy control still shows the
+payload is not in the state, then the capacity hypothesis is refuted: the
+state was not the constraint, the optimiser simply preferred the head, and
+the fix is a training/architecture change that makes the state path the
+only path (the zeroed-head eval) rather than a size change. The
+complementary measurement is a **fresh ridge readout on facts the model has
+never seen** (board C, fitted on half the facts and tested on the other
+half): if it recovers them, the trunk has a general mechanism; if it only
+works on the facts it was fitted on, it is a table again — and the table is
+in the readout's weights, not the state.
 
 **The text regression is a SEPARATE failure with a separate cause** (the
 behavioural loss rides on the same logits as the text CE), and it needs its

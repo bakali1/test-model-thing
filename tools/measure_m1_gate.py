@@ -153,6 +153,9 @@ def main():
     ap.add_argument("--B", type=int, default=64)
     ap.add_argument("--gates", default="0,0.01,0.03,0.1,0.3,1.0")
     ap.add_argument("--text-frac", type=float, default=0.5)
+    ap.add_argument("--data-dir", default=None,
+                    help="where the corpus for the gap's text windows is "
+                         "(default: <repo>/data)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -176,8 +179,12 @@ def main():
     alpha = cl2.alphabet_symbols(args.alphabet)
     board = cl2.make_board(args.board_seed_a, args.board_size, alpha)
     import glob
-    files = sorted(glob.glob(os.path.join(ROOT, "data", "*.txt")))
+    data_dir = args.data_dir or os.path.join(ROOT, "data")
+    files = sorted(glob.glob(os.path.join(data_dir, "*.txt")))
     pool = cl2.TextPool(files, seed=args.seed) if files else None
+    if pool is None:
+        print(f"  WARNING: no corpus in {data_dir} -- the gap's text windows "
+              f"fall back to random bytes")
     rng = np.random.default_rng(args.seed)
     batch = cl2.build_fact_batch(args.B, board, alpha, pool, args.text_frac,
                                   args.dim, rng, n_facts=args.facts)
