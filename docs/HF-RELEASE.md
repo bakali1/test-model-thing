@@ -45,7 +45,7 @@ Capture at release time:
 
 ## Limitations
 - Coherent long-form generation limited at 4.5M / ~10^5 steps
-- Memory readout decodable over ~12–128B depending on metric; earlier nulls were instrument artifacts
+- Memory readout decodable over ~12–128B depending on metric, **measured on the delayed-copy model**; earlier nulls were instrument artifacts. **The model card must not state this as a general property of the architecture**: on a continual-learning objective the state holds only the address and the content moves into the weights (`RESULTS.md` §22).
 - Trained on local corpora (not included); see provenance
 - Never trained above 4.5M params
 

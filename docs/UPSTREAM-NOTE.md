@@ -27,6 +27,18 @@ Below are concrete, checkable findings from our measurements. All numbers/locati
 - **Refs:** `RESULTS.md` §6 (D2), `tools/ngram_ce.py`.
 
 ## 5) D5: state holds an addressable, persistent address and a decaying content
+
+> **Qualification added 2026-10-22, because we would rather send upstream
+> a narrower true claim than a broader one that later has to be retracted.**
+> D5's own copy control passes (replace the payload in the input, keep the
+> key: the decode collapses to chance), so **on that model** the state
+> really does hold a decodable payload. **But it is a property of the
+> model's objective, not of the architecture in general**: on our
+> continual-learning arm, trained on a *different* objective, the state
+> holds only the **address** and the content moved into a table in the
+> weights (`RESULTS.md` §22–§23). The lesson we draw is the *methodological*
+> one — **a measurement's meaning is set by its controls** — and we think
+> it applies to review of this work too.
 With fixed instruments (`tools/d5_probe.py`, padding-free, correct ridge, matched 16-symbol alphabet, per-sample veto):
 - **Cue/address:** Trailing key decodes **65–165× over null**, holds **~27% at 128 B** (persistent address).
 - **Content/payload:** Decodes **4.6× over null at 8–12 B**, falls to **1.5× at 128 B** (decaying but real). Δh retention curve and decodable payload agree in shape.
