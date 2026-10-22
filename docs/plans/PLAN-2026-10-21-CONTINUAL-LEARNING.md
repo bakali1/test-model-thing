@@ -442,6 +442,19 @@ cheaper to satisfy by fitting the *head's weights* to a table, and the
 gradient took that path. **So the CL-2 failure is a TRAINING-SIGNAL
 failure: the state was never asked.**
 
+**ARM H1 HAS NOW BEEN RUN, AND IT ANSWERED THE QUESTION (§23).** With
+`--head-frozen` (the head held at its random init, so it cannot accumulate
+a table), the memory loss **does not fall at all** over 19 steps — it sits
+at ~5.9, above the uniform level — while armA's falls 4.5 nats in 25
+(5.9234 -> 1.4057 -> 1.0041). **The entire drop in armA was the head's
+table being fitted.** *Caveat: 19 steps is a strong signal, not a proof;
+the conclusive version is 500 steps, ~45 minutes.* And **P3 is closed as a
+lever**: the gate engages (it reaches 0.110 max) but its between-sample
+spread is **2.4e-05** of its within-sample spread — a global per-dimension
+re-scaling, not selectivity — and a selective *state* write could not have
+fixed the failure anyway, because the failure was a **table being
+overwritten**.
+
 **THE DECISIVE EXPERIMENT, AND IT IS CHEAP. ARM H1 — REMOVE THE HEAD'S
 TABLE FROM THE EQUATION.** Train the same arm with the memory loss
 computed so the head's weights **cannot** carry the content (the head is
