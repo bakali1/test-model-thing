@@ -4614,3 +4614,48 @@ Timing, for planning: the n=2048 forward is 3247.8 s (gap 8) and 3612.9 s
 (gap 32), the ridge 357.1 s and 116.8 s — **~1 hour per gap**. The forward
 is a pure-numpy loop over timesteps x 16 layers and it dominates. Iterate
 at n=512.
+
+### 14. CL-2 has been RUN: the pipeline works end to end, and the first arm is a NULL
+
+`tools/cl2_train.py` executed for the first time. The pipeline is real: it
+builds a fact STREAM as a corpus (facts `KEY(4B)||PAY(4B)` with distractors
+over a real-text background), trains with a **memory loss** (a 256-way head
+on the state **at the cue** predicting the payload, weighted by
+`--memory-alpha`), continues on a stream of NEW facts, and writes a
+checkpoint per phase. `tools/cl_ruler.py` then scores it with the plan's
+three numbers.
+
+**The first arm was a NULL, and the instrument says so.** Tiny arm:
+`--batch 32 --pre-steps 10 --phase1-steps 20 --phase2-steps 20 --facts 4
+--gap 32 --alphabet 16 --dim 64 --layers 4`, n=512 eval.
+
+| cell | gap 8 | gap 32 |
+|---|---|---|
+| acquire | 4.98 % vs null 4.49 % → **NULL** | 6.74 % vs null 6.05 % → **NULL** |
+| retain_pre / _post | 4.79 % vs null 5.57 % → NULL | 6.05 % vs null 6.35 % → NULL |
+| every nuisance control | at its null ✓ | at its null ✓ |
+| NO REGRESSION (held-out CE) | **5.5463 ± 0.0000** nats/B | — |
+
+**And the reason the arm was a null is not the hypothesis — it is the
+budget.** The held-out CE is **5.5463**, and `ln(256) = 5.5452`: the model
+was at **UNIFORM**. It had not learned a single byte of the corpus. The
+nuisance controls and the nulls behaved, the coverage was 1.00, and the
+instrument returned NULL for every cell — which is exactly what a
+well-behaved instrument does when the subject has not learned anything.
+
+**So the honest statement of CL-2's state is: the experiment is now
+RUNNABLE and its verdict is trustworthy, and it has not yet been run at a
+budget where the subject learns anything.** The next arm is a real one
+(dim=512, layers=16, the P4 init, and enough steps that the CE is clearly
+below 5.5) with the `--memory-alpha 0` control beside it. That is the
+experiment, and it is now one command away from being run on the MX150
+(B=1024 fits in 1.05 GiB) as soon as a GPU slot is free.
+
+**Two things this run confirmed about the machinery, which is worth having
+separately from the verdict:**
+- the CL-RULER's nulls, nuisance controls and coverage behave at n=512 as
+  they did at n=2048 — the instrument is stable at the small scale, so
+  iteration can use n=512 (the n=2048 forward is ~1 hour per gap);
+- the CL-RULER correctly reports a **frozen** checkpoint's `dCE = 0` as
+  **UNMEASURED by construction** rather than as a pass, and says so in its
+  own output.

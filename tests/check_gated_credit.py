@@ -98,9 +98,9 @@ def rel_dev(a, b):
 
 def batch(seed, B, T):
     rng = np.random.default_rng(seed)
-    cs = torch.from_numpy(rng.integers(1, 250, (B, T)).astype(np.int64))
-    ns = torch.from_numpy(rng.integers(1, 250, (B, T)).astype(np.int64))
-    ends = torch.zeros((B, T), dtype=torch.float32)
+    cs = torch.from_numpy(rng.integers(1, 250, (B, T)).astype(np.int64)).to(DEV)
+    ns = torch.from_numpy(rng.integers(1, 250, (B, T)).astype(np.int64)).to(DEV)
+    ends = torch.zeros((B, T), dtype=torch.float32, device=DEV)
     return cs, ns, ends
 
 
@@ -180,9 +180,10 @@ def ref_grads(m, P, PL, cs, ns, ends):
     """
     dtype = P["embed"].dtype
     B_, T_ = cs.shape
-    ar = torch.arange(B_)
-    states = [torch.zeros(B_, m.dim, dtype=dtype) for _ in m.layers]
-    loss = torch.zeros((), dtype=dtype)
+    ar = torch.arange(B_, device=cs.device)
+    states = [torch.zeros(B_, m.dim, dtype=dtype, device=cs.device)
+              for _ in m.layers]
+    loss = torch.zeros((), dtype=dtype, device=cs.device)
     for t in range(T_):
         enc = P["embed"][cs[:, t]]
         x = enc

@@ -730,6 +730,13 @@ def main(argv=None):
     ap.add_argument("--mode", default="fixed", choices=("fixed", "varlen"),
                     help="state-read method: fixed-gap (no padding) or "
                          "variable-length (per-sample read position)")
+    ap.add_argument("--gated", action="store_true",
+                    help="the checkpoint is a P3 GATED one (its theta carries "
+                         "a layer{i}.gate vector per layer). The model builder "
+                         "must be told, or the parameter LAYOUT would not "
+                         "match the checkpoint's and the load would be "
+                         "refused. See docs/design/P3-GATE-ANALYSIS.md 5.1 "
+                         "for why the gated arm runs the dense trace.")
     ap.add_argument("--selftest", action="store_true",
                     help="run the readout-power and read-at-the-cue selftest")
     args = ap.parse_args(argv)
@@ -748,7 +755,7 @@ def main(argv=None):
     alpha_size = 256 if alpha is None else len(alpha)
 
     t0 = time.time()
-    m, info = mb.load_frozen(args.ckpt)
+    m, info = mb.load_frozen(args.ckpt, gated=args.gated)
     t_load = time.time() - t0
 
     print("=" * 78)

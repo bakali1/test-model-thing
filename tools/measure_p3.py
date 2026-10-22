@@ -46,8 +46,13 @@ def measure(tag, dim, layers, B, mode, half_life=None, gated=False,
         kw["trace_mode"] = mode
     if half_life is not None:
         kw["half_life_init"] = half_life
-    m = gpu_port.GpuModel(**kw)
-    m.new_states(B)
+    try:
+        m = gpu_port.GpuModel(**kw)
+        m.new_states(B)
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"{tag}: OOM at construction ({str(e).splitlines()[0][:60]})")
+        torch.cuda.empty_cache()
+        return None
     rng = np.random.default_rng(0)
     cs = torch.from_numpy(rng.integers(1, 250, (B, 1)).astype(np.int64)).to(device)
     ns = torch.from_numpy(rng.integers(1, 250, (B, 1)).astype(np.int64)).to(device)
