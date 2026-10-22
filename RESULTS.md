@@ -4874,3 +4874,119 @@ ONE optimizer step the weights must MOVE (`|d theta| > 0` and
 gradients (`tools/cl2_train.py --selftest`, gates (iv) and (v)). It FAILS
 on the old code and PASSES on the fixed code, on the MX150 as well as on
 the CPU.
+
+### 17. THE CL-2 ARM'S THREE NUMBERS -- and the finding that RE-TARGETS the programme.
+
+The arm trained (see §16). It was scored with `tools/cl_ruler.py` and, because
+the ruler's own numbers disagreed with the trainer's, with a direct
+measurement (`tools/cl2_memorization_test.py`, the script is committed). The
+disagreement turned out to be the most important result of the night.
+
+**THE MEASUREMENT.** `armA_f2_end.npz` (the end of the f2 / STREAM phase, no
+replay of the pre-stream facts), evaluated on FRESH streams (new layouts, new
+distractors, new gap text) from each of the three boards, batch 64, on the
+MX150. `head` is the memory head's linear read-out of the STATE at the cue;
+`behav` is the model's own logits at the payload slots. Chance is
+0.0625/byte and 1.53e-05 exact-4; the global byte prior is 0.1659/byte.
+
+| board | what it is | head per-byte / exact-4 | behav per-byte / exact-4 |
+|---|---|---:|---:|
+| **A** (seed 101) | the PRE-STREAM facts, trained in f1, **no replay in f2** | **0.2031 / 0.0000** | 0.3828 / 0.0312 |
+| **B** (seed 202) | the STREAM facts, trained in f2 | **0.9609 / 0.8438** | 0.9922 / 0.9688 |
+| **C** (seed 303) | never trained on | 0.1016 / 0.0000 | 0.1094 / 0.0000 |
+
+**THE THREE NUMBERS.**
+
+* **ACQUIRE -- PASS.** The stream facts are recalled at **0.8438 exact-4**
+  against a chance of 1.53e-05, on *fresh* streams (so it is not
+  memorisation of a training sequence), and the head beats the byte prior
+  (0.9609 vs 0.1659) by ~5.8x. The pre-registered threshold was >= 0.50
+  exact-4.
+* **RETAIN -- FAIL, AND NOT BY A LITTLE.** The pre-stream facts are at
+  **0.0000 exact-4**. Not "reduced": **gone**. With no replay of board A,
+  the model has forgotten 100% of the facts it knew before the stream.
+* **NO REGRESSION -- FAIL in direction, UNMEASURED in magnitude.** The
+  held-out text CE went 2.9856 (end of `pre`) -> 4.5938 (end of f2), and the
+  text-only counterfactual (the same model, same budget, no fact streams)
+  does not exist, so the *size* of the regression is not quantified. The
+  direction is not in doubt: the text got worse. (See §18.)
+
+**THE COPY CONTROL -- the thing that re-targets the programme.** Replace the
+payload bytes **in the input** (in the fact region) with fresh random bytes,
+leaving the cue and the target unchanged, and re-measure:
+
+| condition | head (board B) | behav (board B) |
+|---|---:|---:|
+| as trained | 0.9609 / 0.8438 | 0.9922 / 0.9688 |
+| the input's payload replaced | **0.8672 / 0.5938** | 0.9805 / 0.9219 |
+| the input's payload AND the target tail replaced | **0.8672 / 0.5938** | **0.0742 / 0.0000** |
+
+Two things follow, and they are the night's real finding.
+
+1. **`behav` is a COPY, and now it is proved, not guessed.** The target bytes
+   are literally in the input at the next position (`seq[:, tgt0:tgt1] =
+   pays[:, -1]` in `tools/cl2_train.py`), so a model that copies the next
+   input byte scores ~1.0 for free. Replace the target tail and `behav`
+   collapses to 0.0742/0.0000. **The 0.999/0.994 in the training log is a
+   copy of the input, and it is not evidence of memory.** Every earlier
+   "behavioural recall" number in this programme is suspect for the same
+   reason and should be re-examined.
+2. **THE PAYLOAD IS NOT IN THE RECURRENT STATE.** Replacing the payload in
+   the input barely moves the head (0.9609 -> 0.8672). If the state held the
+   payload, the head's answer would have had to change. It did not. So the
+   state carries the **CUE KEY** -- trivially, because the cue is the last
+   input byte before the readout -- and the key->payload association lives in
+   the **HEAD'S WEIGHTS**.
+
+**SO WHAT ACTUALLY HAPPENED, stated plainly.** The model did not learn to
+hold a fact in its recurrent state. It learned a **512-entry key->payload
+lookup table in the head's weights**, keyed by an address that the state
+carries because the cue is in the input. That is a *working* memory
+architecture -- it generalises across stream layouts, which is why board B
+scores 0.8438 exact-4 on fresh streams -- but it is a memory in the
+**GLOBAL WEIGHTS**, and a global store has one slot per fact. Board B's 512
+entries overwrote board A's 512 entries. **RETAIN is 0.0000 for a reason
+that has nothing to do with interference, and nothing to do with the
+recurrent state.**
+
+**WHAT THIS DOES TO THE PROGRAMME'S LEVER.** The D5 finding was "the address
+persists, the content decays" -- and this experiment says the content was
+never in the state to begin with. **P3 (write selectivity in the recurrent
+state) is aimed at the wrong place**: a state whose write is more selective
+still cannot fix a head whose weights have been overwritten. The lever is
+**the capacity and the stability of the associative store**, or moving the
+content out of the global weights and into the per-sample state.
+
+**The three candidate mechanisms, now with the right order:**
+- **(i) CAPACITY.** One linear head (8192 -> 1024) holding 512 facts, and it
+  must hold 1024 (A and B). Give it room and RETAIN may become non-zero.
+  This is the cheapest test and it separates "capacity" from "interference".
+- **(ii) THE STATE MUST CARRY THE PAYLOAD.** Today the gradient has a
+  cheaper path (the head's weights) than the expensive one (writing the
+  payload into the state, where a new fact can evict an old one). Nothing in
+  the loss or the architecture rewards the expensive path. **This is the
+  architecture's real flaw and it is a training/architecture choice, not a
+  tuning problem.**
+- **(iii) REPLAY.** A replay buffer of board A is the standard, and it is
+  exactly what this programme's "no replay" premise forbids. **The honest
+  scientific comparison is now: no-replay CL-2 against a replay baseline on
+  the same three numbers.** Until that comparison exists, "continual
+  learning is hard" is a claim without a reference point.
+
+**The falsifier for (ii), stated now, before the run:** if a state-forced
+variant (the payload must be recoverable from the state with the head's
+board-specific component removed) still scores 0.0000 exact-4 on board B
+when the head is ZEROED or RANDOMISED at eval, then the state does not carry
+the payload and the whole "addressable write" (M1) line is dead -- and the
+programme must fall back to (i) capacity and (iii) replay, which is a
+different programme.
+
+**A note on the ruler.** `tools/cl_ruler.py` defaults to `--facts 64` while
+the CL-2 trainer defaults to `--facts 4`, so a ruler run that does not pass
+`--facts` probes a stream shape the arm never saw, and its RETAIN lag becomes
+`8*(facts-1)+d` = 504+d -- far past the ~128 B horizon. **The ruler must
+take the arm's `--facts`/`--gap`/`--alphabet`/`--text-frac`, and the
+checkpoint already stores them (`cl2_facts`, `cl2_gap`, `cl2_alphabet`), so
+the ruler should read them from the checkpoint by default.** This is the same
+class of bug as the earlier lag-536 mistake: a tool default that does not
+match the trained model's regime.
