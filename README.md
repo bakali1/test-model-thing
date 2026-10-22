@@ -1,3 +1,30 @@
+<!-- ==================== FORK BANNER (added by bakali1/test-model-thing) ==================== -->
+> **This is a FORK of [`jrz97619761/test-model-thing`](https://github.com/jrz97619761/test-model-thing),
+> and the text below is the ORIGINAL author's README, unchanged.** Please read
+> the fork's own documentation first:
+>
+> * **[`README-FORK.md`](README-FORK.md)** — what this fork adds, the measured
+>   numbers, and the **honest caveats**.
+> * **[`docs/REVIEW-2026-10-22.md`](docs/REVIEW-2026-10-22.md)** — a full audit
+>   and judgment on the fork's work.
+> * **[`docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`](docs/plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md)** —
+>   the current plan.
+> * **[`docs/UPSTREAM-NOTE.md`](docs/UPSTREAM-NOTE.md)** — a note to the original
+>   author, with our findings.
+>
+> **The headline finding of this fork, stated plainly:** the original project's
+> central claim — **test-time / continual training** — was measured properly
+> here for the first time, and on a trained arm it is a **FAIL**:
+> **ACQUIRE PASS** (0.8906 exact-4 on the stream's facts) · **RETAIN FAIL**
+> (ratio 0.0022) · **NO REGRESSION FAIL** (3.0695 → 5.2037 nats/B, against a
+> 5.5452 unigram baseline). The cause is identified: the recurrent state holds
+> the **address**, the **content** ended up in a **table in the weights**, and a
+> new stream overwrites that table. We report this because it is the useful
+> result, not because it flatters the model — and because four of our own
+> wrong conclusions came from **missing controls**, which is the methodological
+> warning we would most like reviewed.
+<!-- ========================================================================================= -->
+
 # Test-Model-Thing (TMT)
 
 [YouTube Video](https://youtu.be/9UERVVwpNew)

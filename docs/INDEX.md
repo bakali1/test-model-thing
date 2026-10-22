@@ -32,7 +32,7 @@ is how 14 plans produced 0 end-to-end wins.)
 | `optimization/OPTIMIZATION_TEST_STATUS.md` | what was measured, what was **not**, what to try next | **current — read before optimizing** |
 | `optimization/GPU_OPTIMIZATION_PLAN.md` | the optimization plan and its measured outcome (§0) | historical + measured |
 | `optimization/GPU_OPTIMIZATION_PLAN-REVIEW.md` | review of that plan | review, closed |
-| `reviews/STRATEGIC-REVIEW-2026-10-05.md` | the deep review: "the memory programme is aimed at an unmeasured quantity"; §3's three structural verdicts on the architecture; §4's copy task | **current — read §0–§4 and §5** (it invalidated the 2015 anchor and set the copy task that CL-2 now runs) |
+| `reviews/STRATEGIC-REVIEW-2026-10-05.md` | the deep review: "the memory programme is aimed at an unmeasured quantity"; §3's three structural verdicts on the architecture; §4's copy task | **read §0–§4 and §5** (it invalidated the 2015 anchor and set the copy task that CL-2 now runs) — **but its selectivity axis is CLOSED**: write selectivity was measured and is not the lever (`RESULTS.md` §23) |
 | `reviews/RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md` | point-by-point response to an external critique, "accepted in part"; names the *Selective-copy training run — not started* | **current — read before claiming a probe is the next step** |
 | `reviews/PLAN-2026-09-23-GPU-IMPLEMENTATION-REVIEW.md` | implementation review + responses | review, closed |
 | `runbooks/MORNING-RUNBOOK.md` | how to run the GPU legs | **current** |

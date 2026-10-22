@@ -2,7 +2,7 @@
 
 ## What this is
 - **Upstream:** [jrz97619761/test-model-thing](https://github.com/jrz97619761/test-model-thing) (MIT, © 2026 jrz97619761). A proof-of-concept **byte-level recurrent LM** (JEPA-style latent prediction, internal state + RTUs, byte I/O, continual/test-time training). 
-- **Scale:** **4.5M parameters** (default `dim=512`, `layers=16`). The model has **never been trained above 4.5M params** in this repo.
+- **Scale:** **4.5M parameters** (default `dim=512`, `layers=16`) for the base model. The continual-learning arm adds a **memory head** (the state at the cue, 16x512, read out to 4x256) — **+8.4M parameters, ~12.9M in total** for that arm, which is the one run above 4.5M.
 - **Engines:** Original MLX (Apple Silicon/Linux CPU possible) and a **bit-identical** torch port (`gpu_port.py` ≡ `numpy_port.py`, gated by `tests/check_parity.py`). Default GPU path uses fused `nvrtc` ring credit (**1.26× end-to-end, bit-identical**; 26.72 vs 33.68 ms/step).
 
 ## What this fork adds
@@ -10,7 +10,7 @@
 - **35 executable gates** (`tests/`) enforcing correctness (parity, ridge readout, LR roles, etc.). **Every new gate is run against the pre-change code and the failure is recorded** — a gate that has never failed is not known to test anything.
 - **Colab/HF durability layer** (`checkpoint_hub.py`): content-verified transport that survives runtime recycling (push every ~2000 steps, re-pull/resume).
 - **1.26× faster ring credit** via fused `nvrtc` (default on CUDA), with measured-and-losing candidates removed. **This speedup was inert until 2026-10-22** — the constructor eagerly rewrote the `auto` default to the slower path, so the branch was dead code; it is now resolved lazily and gated (`tests/check_ring_credit_default.py`).
-- **Capacity/result work (P4+P6):** 15× incumbent retention with **95.4 B half-life** (37.5%/17.1%/5.3%/0.78% at 8/32/128/512 B vs incumbent 4.8%/1.7%/0.36%/0.0007%); eroder is **weight decay on the decay logits** (92.30 → 39.07 B without P6).
+- **Capacity/result work (P4+P6):** 15× incumbent **capacity** (the Δh curve) with **95.4 B half-life** (37.5%/17.1%/5.3%/0.78% at 8/32/128/512 B vs incumbent 4.8%/1.7%/0.36%/0.0007%); eroder is **weight decay on the decay logits** (92.30 → 39.07 B without P6). **Read this as a CAPACITY statistic, not as retention**: the Δh curve is what the state *could* hold, and the *trained* head's actual retention of pre-stream facts is **0.0022** (§20). The two are different quantities and the table below keeps them apart.
 - **Append-only measurement log:** all results recorded in `RESULTS.md` (corrections appended, never history-edited). Instruments were fixed when found broken (e.g. ridge readout λ swap/byte-0 ravel/padding).
 
 ## How to run it

@@ -36,7 +36,7 @@ Capture at release time:
 - Type: Byte-level recurrent LM (JEPA-style latent prediction + RTUs)
 - Params: 4.5M (dim=512, layers=16)
 - Context/memory: Recurrent state (EMA-like) with decay; no fixed context window
-- Training: Continual/test-time capable by design (see caveats)
+- Training: Continual/test-time capable **by design** — and, measured properly on a trained arm, a **FAIL**: ACQUIRE PASS (0.8906 exact-4 on the stream's facts) / RETAIN FAIL (ratio 0.0022) / NO REGRESSION FAIL (3.0695 → 5.2037 nats/B vs a 5.5452 unigram baseline). **The model card's Limitations section must say this, not omit it** (`RESULTS.md` §20, `docs/REVIEW-2026-10-22.md`).
 
 ## Performance (ruler)
 - Held-out (tinystories_valid): CE 1.1741 ± 0.0415 nats/byte (baseline)
