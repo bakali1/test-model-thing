@@ -613,6 +613,34 @@ class Model:
                     E *= dec[:, None, :]
                 else:
                     E *= dec[None, None, :]
+                # The credit: out[v,d] = sum_b E[b,v,d]*dlds[b,d].
+                #
+                # P3: the torch engine's dense credit was REFORMULATED to
+                #     dembed += (E * dlds[:, None, :]).sum(0)
+                # because torch.einsum("bvd,bd->vd", ...) lowers to 131 072
+                # batched 1x1x256 GEMVs and pays ~18x the memory traffic it
+                # implies (116.10 ms/layer against 9.52 ms for the form
+                # above, on the MX150 at B=256, dim=512) -- a 12x step-time
+                # win for the dense path.
+                #
+                # In NUMPY the same reformulation is a NO-OP NUMERICALLY and a
+                # REGRESSION in time, so this line keeps the einsum:
+                #   * np.einsum("bvd,bd->vd", E, dlds) and
+                #     (E * dlds[:, None, :]).sum(0) are BIT-IDENTICAL in numpy
+                #     -- max|diff| = 0.000e+00 at B in {3, 4, 7, 64, 256,
+                #     1024} x dim in {8, 13, 16, 64, 512}, with both positive
+                #     and cancelling (signed) data. numpy sums the contracted
+                #     axis in the same left-fold order for both, so the
+                #     multiply-then-sum semantics the reformulation buys on
+                #     the GPU is ALREADY what this line computes, to the last
+                #     bit.
+                #   * and the einsum is 3x FASTER here: 27.9 ms against
+                #     78.2 ms per layer at B=256, dim=512 (11.4 vs 33.8 ms at
+                #     B=64), because numpy's einsum never materialises the
+                #     (B, 256, dim) product while the reformulation does --
+                #     134 MB per layer of extra traffic on top of the dense
+                #     trace's own 2.1 GB.
+                # Measured by tools/measure_dense_credit_sum.py.
                 dembed += np.einsum("bvd,bd->vd", E, dlds)
                 E[np.arange(B), c_arr, :] += 1.0
             else:

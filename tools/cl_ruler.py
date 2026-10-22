@@ -180,7 +180,7 @@ def gen_fact_stream(n_facts, n, rng, alpha):
     return {"keys": keys, "payloads": payloads, "facts": facts}
 
 
-def build_sequences(kind, d, stream, rng, alpha):
+def build_sequences(kind, d, stream, rng, alpha, gap=None):
     """Build the fixed-length byte sequences of one cell.
 
     kind:
@@ -196,6 +196,18 @@ def build_sequences(kind, d, stream, rng, alpha):
                        the target is then provably absent from the state,
                        while the older facts -- and therefore the state's
                        content -- are untouched.
+      "stream_nuis2"   S with the newest fact's KEY and PAYLOAD both
+                       replaced by fresh random bytes, and the cue replaced
+                       with the new key.  The target is then absent from the
+                       state AND from the model's WEIGHTS (a trained model
+                       has no association for a key it never saw), so this is
+                       the control that asks "does the READOUT invent
+                       signal?".  The payload-only nuisance ("stream_nuis1")
+                       cannot ask that on a TRAINED arm: the model may
+                       answer from the weights it memorised, which is a
+                       property of the MODEL, not a leak of the readout --
+                       so it is reported separately, as the MEMORISATION
+                       SIGNATURE.
 
     The tail of the "stream" cell is produced by the FIXED-GAP GENERATOR
     (generators.delayed_copy(d, gap_mode="fixed")): [KEY][PAYLOAD][gap][KEY],
@@ -203,6 +215,15 @@ def build_sequences(kind, d, stream, rng, alpha):
     at t == L-1 IS the state AT THE CUE.  No zero padding is ever inserted.
 
     Every row has EXACTLY the same length L = 8N + d + 4 (asserted).
+
+    `gap` (an (n, d) uint8 array) REPLACES the generator's distractor bytes.
+    It exists so that the TRAINING geometry can be reproduced exactly: the
+    CL-2 trainer fills the gap with real text for a fraction of the rows and
+    with uniform random bytes for the rest (--text-frac), and a cell that
+    scores the trained model with a DIFFERENT gap content is measuring a
+    distribution shift, not the memory.  Passing the SAME gap array to the
+    signal cell and to its nuisance cell also makes the nuisance differ from
+    the cell in EXACTLY one thing: the target payload.
     """
     d = int(d)
     facts = stream["facts"]
@@ -211,16 +232,25 @@ def build_sequences(kind, d, stream, rng, alpha):
     n, n_facts = facts.shape[0], facts.shape[1]
     L = FACT_LEN * n_facts + d + KEY_LEN
 
-    if kind in ("stream_nuis", "prestream_nuis", "stream_nuis1"):
+    if kind in ("stream_nuis", "prestream_nuis", "stream_nuis1", "stream_nuis2"):
         pay = payloads.copy()
         if kind == "stream_nuis":
             pay[:, n_facts - 1] = _draw(rng, alpha, (n, PAYLOAD_LEN))
             pay[:, 0] = _draw(rng, alpha, (n, PAYLOAD_LEN))
-        elif kind == "stream_nuis1":
+        elif kind in ("stream_nuis1", "stream_nuis2"):
             pay[:, n_facts - 1] = _draw(rng, alpha, (n, PAYLOAD_LEN))
         else:
             pay[:, 0] = _draw(rng, alpha, (n, PAYLOAD_LEN))
         facts = np.concatenate([keys, pay], axis=2)
+    if kind == "stream_nuis2":
+        # the newest fact's KEY is replaced too, and the cue with it: the
+        # fact is then absent from the model's WEIGHTS as well as from the
+        # state, which is what makes it a control of the READOUT.
+        facts = facts.copy()
+        facts[:, n_facts - 1, :KEY_LEN] = _draw(rng, alpha, (n, KEY_LEN))
+        cue_keys = facts[:, n_facts - 1, :KEY_LEN]
+    else:
+        cue_keys = keys[:, n_facts - 1]
 
     seq = np.zeros((n, L), dtype=np.uint8)
     for i in range(n):
@@ -228,9 +258,12 @@ def build_sequences(kind, d, stream, rng, alpha):
             # the fixed-gap generator gives [KEY][PAYLOAD][gap d][KEY]
             cell, _t, _info = G.delayed_copy(d, rng=rng, gap_mode="fixed")
             cell = np.asarray(cell, dtype=np.uint8).copy()
-            cell[0:KEY_LEN] = keys[i, n_facts - 1]
+            cue_key = cue_keys[i]
+            cell[0:KEY_LEN] = cue_key
             cell[KEY_LEN:KEY_LEN + PAYLOAD_LEN] = facts[i, n_facts - 1, KEY_LEN:]
-            cell[KEY_LEN + PAYLOAD_LEN + d:] = keys[i, n_facts - 1]
+            if gap is not None:
+                cell[KEY_LEN + PAYLOAD_LEN:KEY_LEN + PAYLOAD_LEN + d] = gap[i]
+            cell[KEY_LEN + PAYLOAD_LEN + d:] = cue_key
             seq[i] = np.concatenate([facts[i, 0:n_facts - 1].ravel(), cell])
         else:
             noise = rng.integers(0, 256, size=FACT_LEN * (n_facts - 1) + d)
@@ -626,6 +659,12 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
       board B  the facts of the STREAM (the ones the phase-2 loss saw)
       board C  a HELD-OUT board, never trained on
       board A  the PRE-STREAM facts, replayed (the RETAIN set)
+
+    The GAP is the TRAINER's gap (real text for a fraction of the rows,
+    uniform random bytes for the rest), so the cell is the geometry the model
+    was trained on; and the SAME gap array is used for a cell and for its
+    nuisance control, so the two differ in exactly one thing: the target
+    payload.
     """
     t_start = time.time()
     alpha_size = 256 if alpha is None else len(alpha)
@@ -633,6 +672,23 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     setg = setting_of(args, d, alpha_size)
     lag_cue = int(d) + PAYLOAD_LEN          # the payload's distance to the cue
     cells = []
+
+    def make_gap(n, grng):
+        """The trainer's gap: real text for a fraction of the rows, uniform
+        random bytes for the rest (tools/cl2_train.py's own rule)."""
+        if args.gap_text_frac <= 0 or getattr(args, "_text_pool", None) is None:
+            return None
+        pool = args._text_pool
+        gap = np.empty((n, d), np.uint8)
+        use_text = grng.random(n) < float(args.gap_text_frac)
+        n_text = int(use_text.sum())
+        if n_text:
+            gap[use_text] = pool.windows(n_text, d, grng)
+        n_rand = n - n_text
+        if n_rand:
+            gap[~use_text] = grng.integers(0, 256,
+                                           size=(n_rand, d)).astype(np.uint8)
+        return gap
 
     # -- the ACQUIRE cells ------------------------------------------------
     for cname, bname, bnote in (
@@ -644,7 +700,8 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
              "memorisation of board B cannot pass this cell.")):
         board = boards[bname]
         stream = board_stream(board, args.n, args.facts, rng, alpha)
-        seq = build_sequences("stream", d, stream, rng, alpha)
+        gap = make_gap(args.n, rng)
+        seq = build_sequences("stream", d, stream, rng, alpha, gap=gap)
         X = states_at_cue(models["post"], seq)
         Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
         c = d5.make_cell(cname, X, Y, args.seed, alpha_size, note=bnote)
@@ -657,14 +714,22 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         hc["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                               board=bname, readout="the trained memory head")
         cells.append(hc)
-        # the NUISANCE control: the target payload is replaced by fresh
-        # random bytes of the same alphabet, so it is PROVABLY ABSENT.
-        seqn = build_sequences("stream_nuis1", d, stream, rng, alpha)
+        # the NUISANCE controls.  TWO of them, because a trained model can
+        # answer in two different ways:
+        #  * nuis2 (the key AND the payload replaced): the fact is absent
+        #    from the state AND from the weights -- this is the control of
+        #    the READOUT, and the one the verdict uses;
+        #  * nuis1 (the payload replaced, the key kept): the model may still
+        #    answer from the weights it memorised -- this is the
+        #    MEMORISATION SIGNATURE, reported, not used to void the cell.
+        seqn = build_sequences("stream_nuis2", d, stream, rng, alpha, gap=gap)
         Xn = states_at_cue(models["post"], seqn)
         cn = d5.make_cell(cname + "_nuisance", Xn, Y, args.seed, alpha_size,
-                           note="NUISANCE: the target payload is replaced by "
-                                "fresh random bytes of the same alphabet, so "
-                                "it is provably absent from the state.",
+                           note="NUISANCE: the target fact's KEY and PAYLOAD "
+                                "are both replaced by fresh random bytes, so "
+                                "the target is absent from the state AND from "
+                                "the model's weights.  A readout that beats "
+                                "its null here is a leak, not a memory.",
                            expect_signal=False)
         cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                               board=bname, readout="ridge (mb._ridge_score)")
@@ -672,26 +737,57 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         hn = make_head_cell(cname + "_nuisance_head", Xn, Y, heads["post"][0],
                             heads["post"][1], args.seed, alpha_size,
                             prior_byte=prior_byte,
-                            note="NUISANCE (head): the target payload is "
-                                 "provably absent from the state.")
+                            note="NUISANCE (head): the target fact's KEY and "
+                                 "PAYLOAD are both replaced.")
         hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                               board=bname, readout="the trained memory head")
         cells.append(hn)
+        seqw = build_sequences("stream_nuis1", d, stream, rng, alpha, gap=gap)
+        Xw = states_at_cue(models["post"], seqw)
+        cw = d5.make_cell(cname + "_nuisance_weights", Xw, Y, args.seed,
+                           alpha_size,
+                           note="MEMORISATION SIGNATURE (not a void): the "
+                                "target's PAYLOAD is replaced but its KEY is "
+                                "kept, so a model that memorised the fact "
+                                "can still answer from its WEIGHTS.  A SIGNAL "
+                                "here says the recall is a memorisation, not "
+                                "a state read.",
+                           expect_signal=False)
+        cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board=bname, readout="ridge (mb._ridge_score)")
+        cells.append(cw)
+        hw = make_head_cell(cname + "_nuisance_weights_head", Xw, Y,
+                            heads["post"][0], heads["post"][1], args.seed,
+                            alpha_size, prior_byte=prior_byte,
+                            note="MEMORISATION SIGNATURE (head): the "
+                                 "payload is replaced, the key is kept.")
+        hw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                              board=bname, readout="the trained memory head")
+        cells.append(hw)
 
     # -- the RETAIN replay (board A) at BOTH checkpoints --------------------
     board = boards["A"]
     stream = board_stream(board, args.n, args.facts, rng, alpha)
-    seq = build_sequences("stream", d, stream, rng, alpha)
+    gap = make_gap(args.n, rng)
+    seq = build_sequences("stream", d, stream, rng, alpha, gap=gap)
     Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
-    Xpre = states_at_cue(models["pre"], seq)
     Xpost = states_at_cue(models["post"], seq)
-    seqn = build_sequences("stream_nuis1", d, stream, rng, alpha)
+    Xpre = (states_at_cue(models["pre"], seq)
+            if models.get("pre") is not None else None)
+    seqn = build_sequences("stream_nuis2", d, stream, rng, alpha, gap=gap)
     Xn = states_at_cue(models["post"], seqn)
+    seqw = build_sequences("stream_nuis1", d, stream, rng, alpha, gap=gap)
+    Xw = states_at_cue(models["post"], seqw)
     ret = {"lag_bytes": int(d), "lag_bytes_cue": lag_cue,
            "board": "A (the pre-stream facts, replayed)",
            "in_horizon": bool(lag_cue <= HORIZON_B)}
-    for tag, X, mdl, hd in (("pre", Xpre, models["pre"], heads["pre"]),
+    for tag, X, mdl, hd in (("pre", Xpre, models.get("pre"), heads.get("pre")),
                             ("post", Xpost, models["post"], heads["post"])):
+        if X is None or hd is None:
+            # no PRE-STREAM checkpoint: the ratio is a difference, so it is
+            # UNMEASURED -- not zero, not a pass.
+            ret[tag] = {"ridge": None, "head": None}
+            continue
         c = d5.make_cell(f"retain_replay_{tag}", X, Y, args.seed, alpha_size,
                          note=("the PRE-STREAM facts (board A) replayed, read "
                                f"at the cue of the {tag}-stream checkpoint"))
@@ -708,8 +804,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
         cells.append(hc)
         ret[tag] = {"ridge": c, "head": hc}
     cn = d5.make_cell("retain_replay_nuisance", Xn, Y, args.seed, alpha_size,
-                      note="NUISANCE for the replay: the target payload is "
-                           "provably absent from the state.",
+                      note="NUISANCE for the replay: the target fact's KEY "
+                           "and PAYLOAD are both replaced, so the target is "
+                           "absent from the state AND from the weights.",
                       expect_signal=False)
     cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="ridge (mb._ridge_score)")
@@ -721,12 +818,38 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
     hn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
                           board="A", readout="the trained memory head")
     cells.append(hn)
+    cw = d5.make_cell("retain_replay_nuisance_weights", Xw, Y, args.seed,
+                      alpha_size,
+                      note="MEMORISATION SIGNATURE for the replay: the "
+                           "payload is replaced, the key is kept.",
+                      expect_signal=False)
+    cw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                          board="A", readout="ridge (mb._ridge_score)")
+    cells.append(cw)
+    hw = make_head_cell("retain_replay_nuisance_weights_head", Xw, Y,
+                        heads["post"][0], heads["post"][1], args.seed,
+                        alpha_size, prior_byte=prior_byte,
+                        note="MEMORISATION SIGNATURE (head) for the replay.")
+    hw["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                          board="A", readout="the trained memory head")
+    cells.append(hw)
 
     # -- the RETAIN ratio (post / pre, the same rows, the same readout) ---
     ratios = {}
     for readout in ("ridge", "head"):
         pre = ret["pre"][readout]
         post = ret["post"][readout]
+        if pre is None or post is None:
+            ratios[readout] = {
+                "status": "UNMEASURED",
+                "why": ("no PRE-STREAM checkpoint (--ckpt-pre): the RETAIN "
+                        "ratio is a DIFFERENCE (post/pre) and cannot be "
+                        "formed from one checkpoint"),
+                "pre_per_byte": None, "post_per_byte": None,
+                "pre_exact4": None, "post_exact4": None,
+                "pre_verdict": None, "post_verdict": post["verdict"],
+                "ratio_per_byte": None, "ratio_exact4": None}
+            continue
         r = {"pre_per_byte": pre["per_byte"], "post_per_byte": post["per_byte"],
              "pre_exact4": pre["exact4"], "post_exact4": post["exact4"],
              "pre_verdict": pre["verdict"], "post_verdict": post["verdict"],
@@ -757,30 +880,30 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
 
     by = {c["cell"]: c for c in cells}
     # -- the ACQUIRE verdict (the pre-registered threshold is at d=32) ----
+    # The four cells: the trained board (B) and the never-trained board (C),
+    # each with the RIDGE readout and the model's own trained HEAD.
     acq = {"per_readout": {}}
-    for readout, cname in (("ridge", "acquire"),
-                            ("head", "acquire_head")):
-        c = by[cname]
-        nu = by[cname.replace("acquire", "acquire_nuisance")] if readout == "ridge" \
-            else by["acquire_nuisance_head"]
+    for base, readout in (("acquire", "ridge"), ("acquire", "head"),
+                          ("acquire_heldout", "ridge"),
+                          ("acquire_heldout", "head")):
+        sfx = "" if readout == "ridge" else "_head"
+        c = by[base + sfx]
+        nu = by[base + "_nuisance" + sfx]
+        mem = by[base + "_nuisance_weights" + sfx]
         if c["verdict"] != "SIGNAL":
             status = "UNMEASURED"
             why = (f"the {readout} cell does not beat its own matched null "
                    f"(verdict {c['verdict']})")
         elif nu["verdict"] == "SIGNAL":
             status = "UNMEASURED"
-            why = ("the NUISANCE control beats its own null: the readout "
-                   "invents signal, so the cell cannot be trusted.  NOTE: on "
-                   "a TRAINED board the nuisance (the key is kept, the payload "
-                   "is replaced) is not provably absent from the MODEL's "
-                   "knowledge -- the model may answer from its WEIGHTS, which "
-                   "is a memorisation signature and not a state read; on the "
-                   "HELD-OUT board no such association can exist, so a leak "
-                   "there would be a real leak.")
+            why = ("the NUISANCE control (the target fact's key AND payload "
+                   "replaced) beats its own null: the readout invents signal, "
+                   "so the cell cannot be trusted")
         else:
             status = "MEASURED"
             why = ""
-        acq["per_readout"][readout] = {
+        key = readout + ("" if base == "acquire" else "_heldout")
+        acq["per_readout"][key] = {
             "status": status, "why": why,
             "per_byte": c["per_byte"], "exact4": c["exact4"],
             "se": c.get("se"), "se_per_byte": c.get("se_per_byte"),
@@ -793,39 +916,9 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte):
             "nuisance_verdict": nu["verdict"],
             "nuisance_per_byte": nu["per_byte"],
             "nuisance_null_per_byte": nu["null_per_byte"],
-            "threshold": ACQUIRE_EXACT_THRESHOLD,
-            "setting": c["setting"],
-        }
-    # the HELD-OUT acquire cell (the criterion's own wording: "a held-out set
-    # of the same shape")
-    for readout, cname in (("ridge", "acquire_heldout"),
-                            ("head", "acquire_heldout_head")):
-        c = by[cname]
-        nu = by["acquire_heldout_nuisance"] if readout == "ridge" \
-            else by["acquire_heldout_nuisance_head"]
-        if c["verdict"] != "SIGNAL":
-            status = "UNMEASURED"
-            why = (f"the {readout} cell does not beat its own matched null "
-                   f"(verdict {c['verdict']})")
-        elif nu["verdict"] == "SIGNAL":
-            status = "UNMEASURED"
-            why = "the NUISANCE control beats its own null"
-        else:
-            status = "MEASURED"
-            why = ""
-        acq["per_readout"][readout + "_heldout"] = {
-            "status": status, "why": why,
-            "per_byte": c["per_byte"], "exact4": c["exact4"],
-            "se": c.get("se"), "se_per_byte": c.get("se_per_byte"),
-            "null_per_byte": c["null_per_byte"],
-            "null_exact4": c["null_exact4"],
-            "coverage": c["coverage"], "verdict": c["verdict"],
-            "prior_per_byte": c.get("prior_per_byte"),
-            "prior_exact4": c.get("prior_exact4"),
-            "beats_prior": c.get("beats_prior"),
-            "nuisance_verdict": nu["verdict"],
-            "nuisance_per_byte": nu["per_byte"],
-            "nuisance_null_per_byte": nu["null_per_byte"],
+            "memorisation_signature_verdict": mem["verdict"],
+            "memorisation_signature_per_byte": mem["per_byte"],
+            "memorisation_signature_null_per_byte": mem["null_per_byte"],
             "threshold": ACQUIRE_EXACT_THRESHOLD,
             "setting": c["setting"],
         }
@@ -1003,7 +1096,8 @@ def summarize(results, ce, mode):
 # ---------------------------------------------------------------------------
 # the three numbers of a TRAINED arm: PASS / FAIL / UNMEASURED
 # ---------------------------------------------------------------------------
-def summarize_trained(results, ce_post, ce_pre, threshold_gap=32):
+def summarize_trained(results, ce_post, ce_pre, ce_base=None,
+                      threshold_gap=32):
     """The criterion, as a verdict against the pre-registered thresholds.
 
       ACQUIRE       exact-4 >= 0.50 at d=32, on a HELD-OUT set of the same
@@ -1099,6 +1193,17 @@ def summarize_trained(results, ce_post, ce_pre, threshold_gap=32):
               "held_out_ce_pre": ce_pre["held_out_ce_nats_per_byte"],
               "held_out_ce_post": ce_post["held_out_ce_nats_per_byte"],
               "delta_ce": dce}
+    if ce_base and ce_base.get("held_out_ce_nats_per_byte") is not None:
+        nr["held_out_ce_base"] = ce_base["held_out_ce_nats_per_byte"]
+        nr["delta_ce_total"] = (ce_post["held_out_ce_nats_per_byte"]
+                                - ce_base["held_out_ce_nats_per_byte"])
+        nr["delta_ce_total_note"] = (
+            "the TOTAL damage of the continual-learning episode: the model's "
+            "held-out CE before ANY fact training (the end of the text-only "
+            "phase) -> after the stream.  The pre-registered dCE is the "
+            "STREAM's damage alone (f1_end -> f2_end); this is the whole "
+            "episode's, and it is the number that says whether the model kept "
+            "its general ability.")
     return {
         "threshold_gap": g,
         "acquire": {"verdict": acq_verdict,
@@ -1174,6 +1279,11 @@ def run_trained(args, gaps):
         print(TRAIN_REFUSAL, file=sys.stderr)
         return 2
     import tools.cl2_train as cl2          # the boards, imported
+    # the TEXT POOL for the cells' gap (the trainer's own background)
+    import glob as _glob
+    _files = sorted(_glob.glob(os.path.join(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))), "data/*.txt")))
+    args._text_pool = cl2.TextPool(_files, seed=args.seed) if _files else None
     alpha_kind = str(meta["alphabet"])
     alpha = cl2.alphabet_symbols(alpha_kind)
     alpha_size = 256 if alpha is None else len(alpha)
@@ -1247,7 +1357,9 @@ def run_trained(args, gaps):
                   f"exact4 {pct(c['exact4'])} | null {pct(c['null_per_byte'])}"
                   f"/{pct(c['null_exact4'])} | prior {pct(c.get('prior_per_byte'))}"
                   f"/{pct(c.get('prior_exact4'))} | coverage "
-                  f"{pct(c['coverage'].get('coverage'))} | {c['status']}")
+                  f"{pct(c['coverage'].get('coverage'))} | nuisance "
+                  f"{c['nuisance_verdict']} | memorisation-signature "
+                  f"{c['memorisation_signature_verdict']} | {c['status']}")
         for ro in ("head", "ridge"):
             r = res["retain"][ro]
             print(f"    RETAIN[{ro:<6}] pre {pct(r['pre_per_byte'])} "
@@ -1287,8 +1399,14 @@ def run_trained(args, gaps):
     else:
         ce_pre = {"status": "MISSING", "why": "no --ckpt-pre",
                   "held_out_ce_nats_per_byte": None}
+    ce_base = None
+    if args.ckpt_base:
+        m_base, _i3 = mb.load_frozen(args.ckpt_base)
+        ce_base = ce_cell(m_base, args.ckpt_base)
+        print(f"    base (pre the fact training) CE "
+              f"{ce_base['held_out_ce_nats_per_byte']}")
 
-    verdicts = summarize_trained(results, ce_post, ce_pre)
+    verdicts = summarize_trained(results, ce_post, ce_pre, ce_base)
     print("\n" + "=" * 78)
     print("THE THREE NUMBERS")
     print("=" * 78)
@@ -1312,6 +1430,9 @@ def run_trained(args, gaps):
     print(f"  RETAIN        : {r['verdict']['status']}  ({r['verdict']['why']})")
     nr = verdicts["no_regression"]
     print(f"  NO REGRESSION : {nr['status']}  ({nr['why']})")
+    if nr.get("delta_ce_total") is not None:
+        print(f"                 the TOTAL damage of the episode (base -> "
+              f"post-stream): dCE = {nr['delta_ce_total']:.4f} nats/B")
 
     out = {
         "tool": "tools/cl_ruler.py",
@@ -1345,6 +1466,7 @@ def run_trained(args, gaps):
         "results": results,
         "no_regression": ce_post,
         "no_regression_pre": ce_pre,
+        "no_regression_base": ce_base,
         "verdicts": verdicts,
         "runtime_s": time.time() - t0,
     }
@@ -1368,6 +1490,12 @@ def main(argv=None):
                     help="the PRE-STREAM checkpoint (the end of phase f1).  "
                          "The RETAIN ratio and the dCE are differences, so "
                          "without it they are UNMEASURED, not zero")
+    ap.add_argument("--ckpt-base", default=None,
+                    help="the BASE checkpoint: the model's state BEFORE any "
+                         "fact training (the end of the text-only 'pre' "
+                         "phase).  The dCE against it is the TOTAL damage of "
+                         "the continual-learning episode; the dCE against "
+                         "--ckpt-pre is only the damage of the STREAM")
     ap.add_argument("--facts", type=int, default=64,
                     help="facts in the stream (default: %(default)s).  In "
                          "--mode train the CHECKPOINT's own fact count is "
@@ -1379,6 +1507,14 @@ def main(argv=None):
     ap.add_argument("--alphabet", default="16", choices=("full", "16", "4"),
                     help="payload alphabet (default: %(default)s)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--gap-text-frac", type=float, default=0.5,
+                    help="TRAINED mode: the fraction of the cell rows whose "
+                         "gap is REAL TEXT (the rest is uniform random "
+                         "bytes).  This is the CL-2 trainer's own --text-frac, "
+                         "so the cell is the geometry the model was trained "
+                         "on; 0 gives the ruler's own all-random gap, which "
+                         "measures a distribution shift instead of the "
+                         "memory")
     ap.add_argument("--out", default=None, help="write the full result as JSON")
     ap.add_argument("--mode", default="probe", choices=("probe", "train"),
                     help="'probe' = frozen checkpoint scored on a fact stream "

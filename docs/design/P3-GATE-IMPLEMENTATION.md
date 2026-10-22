@@ -159,6 +159,10 @@ as on the CPU: max **6.7e-07** relative, at the float32 floor (§2.1).
 
 ---
 
+**The ALT is no longer a measurement: it is ADOPTED. See section 5** -- the
+formulation, the numerics against a float64 truth, the 5.5x/6.8x end-to-end
+speed on the MX150, and what happened to the dense-vs-ring bit-identity pin.
+
 ## 4. What is still UNMEASURED
 
 * **The dense credit's cost on a T4.** The MX150 is cc 6.1 with no tensor
@@ -171,6 +175,8 @@ as on the CPU: max **6.7e-07** relative, at the float32 floor (§2.1).
   decision, not a measurement: the pin's *value* is that the two paths are
   the same object, and a 1e-7 relative difference preserves that claim, but
   the gate would have to be re-stated.
+  **RESOLVED in section 5 below: measured, adopted, and the pin re-stated
+  with the measured number.**
 * **Whether the gate's mechanism does anything at all.** §2 of the design
   (M1) is untouched by this work: the per-sample spread of `a` on a TRAINED
   model is unmeasured, and a null there would make the arm a no-op.
@@ -179,7 +185,173 @@ as on the CPU: max **6.7e-07** relative, at the float32 floor (§2.1).
 
 ---
 
-## 5. The next experiment
+## 5. The einsum, REFORMULATED (2026-10-22)
+
+**Status: adopted. The dense path is 5.5x (B=64) to 6.8x (B=256) faster on
+the MX150, the peak memory is UNCHANGED, and the numerics move by at most
+one float32 ulp of the credit's scale.**
+
+### 5.1 The change
+
+`gpu_port.py`'s dense credit block:
+
+    - dembed += torch.einsum("bvd,bd->vd", E, dlds)
+    + dembed += (E * dlds[:, None, :]).sum(0)
+
+`numpy_port.py`'s dense path keeps `np.einsum("bvd,bd->vd", E, dlds)`, and
+the reason is measured, not stylistic: **in numpy the two formulations are
+BIT-IDENTICAL** (max|diff| = 0.000e+00 at B in {3, 4, 7, 64, 256, 1024} x
+dim in {8, 13, 16, 64, 512}, with positive and with cancelling data), because
+numpy sums the contracted axis in the same left-fold order for both -- so the
+multiply-then-sum semantics the reformulation buys on the GPU is ALREADY what
+the numpy line computes -- **and numpy's einsum is 3x FASTER there** (27.9
+ms against 78.2 ms per layer at B=256, dim=512), because numpy's einsum
+never materialises the (B, 256, dim) product. Changing it would have been a
+pure regression for a zero numerical change.
+
+The dtype contract: the einsum does **not** promote (float32 in, float32 out)
+and neither does the reformulation, and both accumulate in float32. The
+reformulation's `sum(0)` is a float32 reduction of a float32 product, so the
+accumulation precision is unchanged.
+
+### 5.2 The numerics: new vs old vs the float64 truth
+
+Two references, because they answer different questions:
+
+* the **float64 truth** -- the same contraction in float64: "how far is the
+  float32 answer from the mathematical answer";
+* the **exact sum of the float32 products** -- every float32 product
+  E[b,v,d]*dlds[b,d] is exact in float64, so a float64 sum of them IS the
+  exact sum of the float32 products: "how much of the error is the
+  SUMMATION ORDER", which is the ONLY thing the reformulation changes.
+
+Measured by `tools/measure_dense_credit_sum.py` (the table is reproduced by
+`tests/check_dense_credit_sum.py`). Max abs / max rel against the float64
+truth:
+
+| device | B | dim | einsum (old) | reformulation (new) | order-only error, old -> new |
+|---|---:|---:|---|---|---|
+| MX150 | 64 | 512 | 5.290e-06 / 1.428e-07 | **2.903e-06 / 7.838e-08** | 5.290e-06 -> 2.903e-06 (**0.55x, BETTER**) |
+| MX150 | 256 | 512 | 1.051e-05 / 1.392e-07 | **9.246e-06 / 1.224e-07** | 1.051e-05 -> 9.246e-06 (**0.88x, BETTER**) |
+| MX150 | 256 | 64 | 7.496e-06 / 1.152e-07 | **6.006e-06 / 9.234e-08** | 7.496e-06 -> 6.006e-06 (0.80x, better) |
+| MX150 | 16 | 512 | 3.488e-06 / 1.879e-07 | **1.533e-06 / 8.258e-08** | 3.488e-06 -> 1.533e-06 (0.44x, better) |
+| MX150 | 3 | 8 | 4.278e-07 / 5.202e-08 | **4.278e-07 / 5.202e-08** | 0.000e+00 (identical) |
+| CPU | 64 | 512 | 2.970e-06 / 8.019e-08 | 5.198e-06 / 1.404e-07 | 2.970e-06 -> 5.198e-06 (**1.75x, WORSE**) |
+| CPU | 256 | 512 | 8.503e-06 / 1.126e-07 | 9.535e-06 / 1.263e-07 | 8.503e-06 -> 9.535e-06 (1.12x, worse) |
+| CPU | 16 | 512 | 1.038e-06 / 5.594e-08 | 3.488e-06 / 1.879e-07 | 1.038e-06 -> 3.488e-06 (3.36x, worse) |
+| CPU | 3 | 8 | 4.278e-07 / 5.202e-08 | 4.278e-07 / 5.202e-08 | 0.000e+00 (identical) |
+| numpy (reference) | any | any | -- | -- | **0.000e+00 -- bit-identical** |
+
+**The verdict, stated plainly, per device:**
+
+* **On the GPU -- the device the 12x is for -- the reformulation is CLOSER
+  to the truth than the einsum it replaces**, in every setting measured
+  (0.44x-0.88x of the incumbent's own error). The reason is visible in the
+  arithmetic: the einsum lowers to a per-dim GEMV that accumulates with FMA
+  (the product is never rounded before the addition), while the
+  reformulation rounds each product to float32 and then sums.
+* **On the CPU the reformulation is 1.12x-3.36x WORSE** than the einsum,
+  because torch's CPU einsum happens to use a blocked accumulation. But both
+  are at the float32 epsilon: the RELATIVE deviations are 8.0e-08 (old) and
+  1.4e-07 (new) against a float32 eps of 1.19e-07 -- a difference of about
+  one ulp of the credit's scale.
+* **In numpy nothing moves at all**: the two formulations are the same bits.
+* at **B=3** (the size the P3 credit gate runs at) the two are bit-identical
+  everywhere, which is why **every existing gate's numbers are unchanged**.
+
+### 5.3 The speed, on the MX150 (dim=512, layers=16, T=1, mean of 20 timed
+steps after 5 warmup, `torch.cuda.max_memory_allocated`; the card idle, one
+ssh at a time)
+
+| B | path | before | after | peak before -> after |
+|---|---|---:|---:|---|
+| 64 | ring, default init | 22.2 ms | 21.4 ms | 0.222 -> 0.222 GB |
+| 64 | **dense (the P3 credit path)** | **499.3 ms** | **90.4 ms** | **0.730 -> 0.730 GB** |
+| 64 | **gated arm (dense + gate)** | **504.4 ms** | **85.2 ms** | 0.735 -> 0.735 GB |
+| 64 | dense, P4 init | 508.0 ms | 89.2 ms | 0.731 -> 0.731 GB |
+| 256 | ring, default init | 45.1 ms | 44.7 ms | 0.368 -> 0.368 GB |
+| 256 | **dense** | **2005.3 ms** | **296.8 ms** | **2.500 -> 2.500 GB** |
+| 256 | **gated arm** | **2012.3 ms** | **304.6 ms** | 2.516 -> 2.516 GB |
+| 256 | dense, P4 init | 2004.8 ms | 294.2 ms | 2.500 -> 2.500 GB |
+
+**5.5x at B=64, 6.8x at B=256** end to end (the credit was 96% of the step).
+The **peak memory is UNCHANGED**: the reformulation's transient product
+(B*256*dim*4 = 134 MB at B=256) is allocated and freed inside the trace's
+own footprint, so it never raises the high-water mark. The per-op numbers
+(`tools/measure_p3_credit.py`, unchanged): the credit op goes from
+**116.08 ms to 9.52 ms** per layer -- 12.2x -- and the dense path's credit
+total from 1962 ms to 258 ms per step.
+
+### 5.4 What happened to the dense-vs-ring bit-identity pin
+
+**The pin moved, and here is exactly how much and what it now guarantees.**
+
+`tests/check_dense_trace.py` (a) pins "dense == ring+tail when the tail
+covers every dim". Before the change that comparison was **0.00e+00** --
+not because the two paths were different implementations of one object, but
+because they ran the **same einsum on the same numbers** (the torch tail's
+credit is `torch.einsum("bvh,bh->vh", E, g)`, the dense path's was
+`torch.einsum("bvd,bd->vd", E, dlds)`).
+
+After the change the two paths sum the same terms in a different order:
+
+| comparison | before | after |
+|---|---:|---:|
+| dense vs ring+tail at the gate's size (B=4, dim=16) | 0.00e+00 | **0.00e+00** (unchanged: the two orders coincide at B=4) |
+| dense vs ring+tail at B=64, dim=512, layers=2, T=4 | 0.00e+00 | **1.084e-07** (max abs 1.192e-07 on a scale of 1.100) |
+
+**What the pin now guarantees, stated plainly:** the dense path and the
+ring+tail path are the same OBJECT -- the dense trace is the tail with every
+dim hot, exactly as the design says -- and they agree to **the float32
+rounding floor of the credit's summation, about one ulp** (1.084e-07
+relative, against a float32 ulp of 1.192e-07 at that scale). The gate says
+so; it does not claim bit identity any more. `check_dense_trace.py`'s
+docstring and its (a) check were re-stated accordingly, and a new section
+(f) measures the same comparison at a size where the two orders really do
+differ, with the tolerance stated as a measured float32 floor.
+
+**The ring path was NOT touched to preserve the pin.** The tail's credit
+could have been reformulated the same way -- and then the two paths would be
+bit-identical again -- but the tail is on the DEFAULT path, and the default
+engine's numerics must not move (`check_parity`'s "worst differing element
+0" is the pin for that). So the pin was re-stated, not defended by changing
+the incumbent.
+
+### 5.5 The gates
+
+| gate | result |
+|---|---|
+| `tests/check_dense_credit_sum.py` (**new**) | **PASS** (CPU and MX150) |
+| `tests/check_dense_trace.py` | **PASS** (the re-stated pin, section (f) included) |
+| `tests/check_gated_credit.py` | **PASS** -- and every number in it is UNCHANGED (the gate runs at B=3, where the two formulations are bit-identical) |
+| `tests/check_parity.py` | **PASS** -- "T=1 bit-identity: 114 comparisons, worst differing element 0 (none)" |
+| `tests/check_gradients.py` | **PASS** (worst 3.9e-08) |
+| `tests/check_trainer.py` | **PASS** |
+| the whole `tests/` suite (33 files) | **PASS** (CPU) |
+
+`tests/check_dense_credit_sum.py` is the new gate: it measures the two
+formulations against the float64 truth and against the exact sum of the
+float32 products, with the **tolerance being the MEASURED float32 floor of
+the same computation** (the incumbent einsum's own deviation), and it pins
+that the ENGINE ships the reformulation at the bit level -- the credit's
+operands are the engine's own decayed trace and the state gradient its
+backward produced, the credit is a reduction over the batch axis of their
+elementwise product, and it is NOT the einsum's bytes.
+
+### 5.6 The recommendation
+
+**ADOPT, unconditionally, in the torch engine.** The reason, in one line:
+on the device the engine runs on, the reformulation is 12x faster per layer
+and CLOSER to the float64 truth, at an unchanged peak memory and an unchanged
+default path. The CPU's 1.12x-3.36x loss is one ulp of relative error on a
+path that is 4.6x faster on the CPU too, so it is not worth a flag.
+
+**The numpy reference keeps its einsum**, because there the reformulation is
+a measured no-op numerically (bit-identical) and a 3x regression in time.
+
+---
+
+## 6. The next experiment
 
 **The P3 arm itself, with the D5 protocol** (the design's §6):
 

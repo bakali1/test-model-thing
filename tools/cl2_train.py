@@ -394,20 +394,21 @@ def held_out_ce(model, slices):
     Same bytes and same estimator as the ruler's CE cell (mb._eval_corpus ->
     eval_npz.cross_entropy), but computed on the GPU so it can be run DURING
     training: this is the trajectory that says whether the arm is learning
-    anything at all (a model at UNIFORM sits at ln(256) = 5.5452)."""
+    anything at all (a model at UNIFORM sits at ln(256) = 5.5452).
+
+    The slices are batched into ONE forward (the same number of kernel
+    launches, more rows per launch), because the forward is launch-bound."""
     if not slices:
         return None
-    ces = []
+    x = np.stack([s[:min(len(s) for s in slices)] for s in slices])
     with torch.no_grad():
-        for s in slices:
-            x = s.astype(np.int64)[None, :]
-            logits, _ = engine_forward(model, x, x.shape[1] - 1,
-                                        use_checkpoint=False)
-            tgt = torch.from_numpy(x[:, 1:]).to(logits.device)
-            ce = F.cross_entropy(logits[:, :-1].reshape(-1, 256),
-                                 tgt.reshape(-1))
-            ces.append(float(ce))
-    return float(np.mean(ces))
+        xin = x.astype(np.int64)
+        logits, _ = engine_forward(model, xin, xin.shape[1] - 1,
+                                    use_checkpoint=False)
+        tgt = torch.from_numpy(xin[:, 1:]).to(logits.device)
+        ce = F.cross_entropy(logits[:, :-1].reshape(-1, 256),
+                             tgt.reshape(-1))
+    return float(ce)
 
 
 # ---------------------------------------------------------------------------
@@ -812,13 +813,13 @@ def selftest(args):
     seq = rng.integers(0, 256, size=(B, L)).astype(np.uint8)
     # (i) the autograd forward's CE vs the engine's own step_batch CE
     logits, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
+    _tgt = torch.from_numpy(seq[:, 1:].astype(np.int64)).to(logits.device)
     ce_auto = float(F.cross_entropy(logits[:, :-1].reshape(-1, 256),
-                                    torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)
-                                    ).detach())
+                                    _tgt.reshape(-1)).detach())
     with torch.no_grad():
         logits2, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
     ce_auto2 = float(F.cross_entropy(logits2[:, :-1].reshape(-1, 256),
-                                     torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)))
+                                     _tgt.reshape(-1)).detach())
     print(f"  (i) autograd CE {ce_auto:.6f} | no_grad CE {ce_auto2:.6f} "
           f"(must agree to 1e-4) -> "
           f"{'OK' if abs(ce_auto - ce_auto2) < 1e-4 else 'FAIL'}")
@@ -836,7 +837,8 @@ def selftest(args):
                                        use_checkpoint=False)
     ml = state_cue @ wm + bm
     mem = F.cross_entropy(ml.reshape(-1, 256),
-                          torch.from_numpy(batch["pay_new"]).reshape(-1))
+                          torch.from_numpy(batch["pay_new"]).to(
+                              ml.device).reshape(-1))
     opt.zero_grad()
     mem.backward()
     # the gradient lands on THETA (the flat parameter vector); the embedding
@@ -894,7 +896,9 @@ def selftest(args):
     ok &= bool(dth > 0 and dhd > 0)
 
     # (v) the checkpoint round-trip: what is written must be the WEIGHTS
-    tmp = os.path.join("/tmp", f"cl2_selftest_{os.getpid()}.npz")
+    tmpdir = args.ckpt_dir or "runs/cl2"
+    os.makedirs(tmpdir, exist_ok=True)
+    tmp = os.path.join(tmpdir, f"cl2_selftest_{os.getpid()}.npz")
     save_checkpoint(model, opt2, [wm, bm, wm, bm], tmp,
                     {"phase": "selftest", "step": 1})
     d = np.load(tmp)
@@ -1110,6 +1114,26 @@ def main(argv=None):
         log_row(phase, n_steps, {}, held_ce_end)
         print(f"  [ce {phase} {n_steps}/{n_steps}] held-out CE {held_ce_end}",
               flush=True)
+        # the memory evaluation at the END of the phase (the phase-start one
+        # above is measured BEFORE the phase trains, so it is the previous
+        # phase's state; this one is the phase's own result).
+        end_evals = {}
+        for bname, brd in (("train_board", board), ("heldout_board", board_c)):
+            if brd is None:
+                continue
+            end_evals[bname] = eval_memory(model, heads, brd, alpha, args,
+                                           eval_rng, prior,
+                                           f"{phase}-end/{bname}")
+            e = end_evals[bname]
+            print(f"  [eval {phase}-end/{bname}] head "
+                  f"{e.get('head_per_byte', 0):.4f}/byte, exact4 "
+                  f"{e.get('head_exact4', 0):.4f} | behaviour "
+                  f"{e.get('behav_per_byte', 0):.4f}/byte, exact4 "
+                  f"{e.get('behav_exact4', 0):.4f} | prior "
+                  f"{e['prior_per_byte']:.4f}/{e['prior_exact4']:.4f} | chance "
+                  f"{e['chance_per_byte']:.4f}/{e['chance_exact4']:.2e}",
+                  flush=True)
+        evals = {**evals, **{f"end_{k}": v for k, v in end_evals.items()}}
         if not args.no_checkpoint:
             path = os.path.join(args.ckpt_dir, f"{args.tag}_{phase}_end.npz")
             save_checkpoint(model, opt, heads, path, {"phase": phase, "step": n_steps, "seed": args.seed,

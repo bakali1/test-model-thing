@@ -2214,7 +2214,45 @@ class GpuModel:
                         with rf("dense_decay"):
                             E.mul_(dec_b)
                         with rf("dense_credit"):
-                            dembed += torch.einsum("bvd,bd->vd", E, dlds)
+                            # ---- THE CONTRACTION, REFORMULATED (P3) --------
+                            # The credit is out[v,d] = sum_b E[b,v,d]*dlds[b,d].
+                            #
+                            # torch.einsum("bvd,bd->vd", E, dlds) lowers to
+                            # 131 072 batched 1x1x256 GEMVs and pays ~18x the
+                            # memory traffic it implies: 116.10 ms per layer
+                            # against 6.45 ms for the decay and 9.52 ms for
+                            # the form below, on the MX150 at B=256, dim=512
+                            # (docs/design/P3-GATE-IMPLEMENTATION.md 3.2).
+                            # The elementwise-multiply-then-sum form computes
+                            # the SAME contraction 12x faster, and takes the
+                            # dense path from 2005 ms/step to ~270 ms/step.
+                            #
+                            # It is NOT bit-identical, and it is not claimed to
+                            # be: the two sum the same B products in a
+                            # different order, and float32 addition is not
+                            # associative. MEASURED (tools/
+                            # measure_dense_credit_sum.py, float64 truth, the
+                            # accumulation-only error = the deviation of the
+                            # float32 result from the EXACT sum of the same
+                            # float32 products):
+                            #
+                            #   device  B=64,dim=512   B=256,dim=512
+                            #   MX150   2.90e-06 (new) vs 5.29e-06 (old)
+                            #   CPU     5.20e-06 (new) vs 2.97e-06 (old)
+                            #
+                            # So on the card this engine runs on, the new form
+                            # is CLOSER to the truth than the einsum it
+                            # replaces; on the CPU it is up to 1.75x worse, and
+                            # both are at the float32 epsilon -- relative
+                            # deviations 1.40e-07 (new) and 8.02e-08 (old) at
+                            # B=64, dim=512, against a float32 eps of
+                            # 1.19e-07, i.e. about one ulp of the credit's
+                            # scale. The dtype is unchanged -- float32 in,
+                            # float32 out, accumulated in float32, exactly
+                            # like the einsum (torch.einsum does NOT promote
+                            # to float64) -- and the gate that pins this is
+                            # tests/check_dense_credit_sum.py.
+                            dembed += (E * dlds[:, None, :]).sum(0)
                     with rf("dense_add"):
                         E[ar, c_arr, :] += 1.0
                 else:

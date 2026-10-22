@@ -4742,3 +4742,135 @@ einsum's alternative is acceptable (a decision, not a measurement);
 spread of `a` on a TRAINED model is unmeasured, and a null there would
 make the whole arm a no-op with a measured cause); and any trained gated
 run.
+
+
+---
+
+## 2026-10-22 — the dense credit's einsum, REFORMULATED (adopted)
+
+**The claim:** the dense credit's contraction
+`torch.einsum("bvd,bd->vd", E, dlds)` costs 116.08 ms per layer on the
+MX150 (B=256, dim=512) against the 9.52 ms of the same contraction written
+as `(E * dlds[:, None, :]).sum(0)` — 12.2× — and the dense path was 96% of
+its own step time. **Adopted**, with the summation-order change measured,
+gated and stated.
+
+**The numerics (max abs / max rel against a float64 truth, MX150):**
+
+| B | dim | einsum (old) | reformulation (new) | verdict |
+|---:|---:|---|---|---|
+| 64 | 512 | 5.290e-06 / 1.428e-07 | **2.903e-06 / 7.838e-08** | 0.55× — **BETTER** |
+| 256 | 512 | 1.051e-05 / 1.392e-07 | **9.246e-06 / 1.224e-07** | 0.88× — **BETTER** |
+| 256 | 64 | 7.496e-06 / 1.152e-07 | **6.006e-06 / 9.234e-08** | 0.80× — better |
+| 16 | 512 | 3.488e-06 / 1.879e-07 | **1.533e-06 / 8.258e-08** | 0.44× — better |
+| 3 | 8 | 4.278e-07 / 5.202e-08 | 4.278e-07 / 5.202e-08 | identical (B=3) |
+
+On the **CPU** the reformulation is 1.12×–3.36× *worse* than the einsum
+(torch's CPU einsum uses a blocked accumulation), but both sit at the
+float32 epsilon: 8.0e-08 (old) vs 1.4e-07 (new) relative, against an eps of
+1.19e-07 — about one ulp of the credit's scale. In **numpy** the two
+formulations are **bit-identical** (max|diff| = 0.000e+00 at B in
+{3,4,7,64,256,1024} × dim in {8,13,16,64,512}, positive and cancelling
+data), so the numpy reference keeps its einsum — where the reformulation
+would have been a 3× *regression* (27.9 vs 78.2 ms per layer at B=256,
+dim=512) for a zero numerical change.
+
+**The speed (MX150, dim=512, layers=16, 20 timed steps after 5 warmup, the
+card idle):**
+
+| B | path | before | after | peak |
+|---|---|---:|---:|---|
+| 64 | **dense (the P3 credit path)** | **499.3 ms/step** | **90.4 ms/step** | 0.730 → 0.730 GB |
+| 64 | **gated arm** | **504.4 ms/step** | **85.2 ms/step** | 0.735 → 0.735 GB |
+| 256 | **dense** | **2005.3 ms/step** | **296.8 ms/step** | 2.500 → 2.500 GB |
+| 256 | **gated arm** | **2012.3 ms/step** | **304.6 ms/step** | 2.516 → 2.516 GB |
+| 64 / 256 | ring (default init) | 22.2 / 45.1 ms | 21.4 / 44.7 ms | unchanged |
+
+**5.5× at B=64 and 6.8× at B=256 end to end, at an UNCHANGED peak memory**
+(the reformulation's transient 134 MB product lives inside the trace's own
+footprint). The credit op itself: 116.08 → 9.52 ms per layer.
+
+**The pin, stated plainly.** `check_dense_trace.py`'s "dense == ring+tail"
+comparison was 0.00e+00 before the change — because both paths ran the *same
+einsum on the same numbers* — and is **0.00e+00 at the gate's size (B=4,
+dim=16)** and **1.084e-07 relative (one float32 ulp) at B=64, dim=512**
+after it. The pin now guarantees: *the dense path and the ring+tail path are
+the same object, agreeing to the float32 rounding floor of the credit's
+summation.* The gate was re-stated with that number (docstring, check (a),
+and a new section (f) that measures it where the two orders really differ);
+it was **not** silently weakened, and the **ring path was not touched** to
+defend the old wording (the tail's credit could have been reformulated the
+same way, but the tail is on the default path, whose numerics must not move).
+
+**The gates:** `check_dense_credit_sum.py` (new) **PASS** (CPU and MX150);
+`check_dense_trace` **PASS**; `check_gated_credit` **PASS** with every one
+of its numbers **unchanged** (it runs at B=3, where the two formulations are
+bit-identical); `check_parity` **PASS** — "T=1 bit-identity: 114 comparisons,
+worst differing element 0 (none)"; `check_gradients` **PASS**; `check_trainer`
+**PASS**; the whole `tests/` suite (33 files) **PASS**.
+
+**Recommendation: ADOPT, unconditionally, in the torch engine** — on the
+device the engine runs on it is 12× faster per layer and *closer* to the
+float64 truth, at an unchanged peak memory and an unchanged default path.
+The numpy reference keeps its einsum, on the measurement above.
+
+### 16. CORRECTION to §14 — the CL-2 arm did not "fail for a budget reason". It NEVER TRAINED.
+
+§14 said the first CL-2 arm was "a NULL, and the reason is the budget,
+not the hypothesis", on the evidence that its held-out CE was 5.5463
+against `ln(256) = 5.5452` — the model was at UNIFORM.
+
+**That diagnosis was WRONG.** The arm could not have learned, because
+nothing in it was being updated. Three independent bugs, each of which
+silently discards the gradient while leaving `loss.backward()` and
+`optimizer.step()` perfectly happy
+(`docs/results/CL2-REAL-ARM-2026-10-22.md`):
+
+1. **THE PARAMETER VIEWS WERE DETACHED LEAVES.** `gpu_port.GpuModel` builds
+   its parameter views (`model.views`) while `theta` does **not** require
+   grad; `tools/cl2_train.py:build_model` then called
+   `theta.requires_grad_(True)`. A view of a tensor that did not require
+   grad is a *detached leaf*: after the base is switched it reports
+   `requires_grad=True` but has **no `grad_fn`**, so autograd accumulates
+   **nothing** into it — and because the base's own `.grad` stays `None`,
+   the gradient is **silently lost**. `backward()` raises nothing; the
+   optimizer sees `p.grad is None` and skips the parameter. **The arm
+   updated nothing, ever.**
+2. **THE MEMORY HEAD'S PARAMETERS DID NOT REQUIRE GRAD.** `build_head()`
+   allocated `Wm`/`bm` with `torch.empty`/`torch.zeros` and never called
+   `requires_grad_(True)` — so the **memory loss had no trainable
+   parameters at all**: the head stayed at its random initialisation and
+   the "memory loss" was a **constant**.
+3. **THE CHECKPOINT SAVED THE GRADIENTS, NOT THE WEIGHTS.**
+   `save_checkpoint` wrote `model.gviews` — views into the **gradient**
+   buffer `model.grads` — under the **parameter** names. Every "CL-2
+   checkpoint" held gradients, and loading one installed gradients as
+   weights.
+
+Two more defects in the trainer's self-test, which **had never been run**
+(it crashed at its second check): the gradient check read
+`model.embed.grad` (always `None` for a view) instead of the embed's
+slice of `theta.grad`; and the "the state at the cue does not depend on the
+bytes after it" check captured the state at `L-1` — i.e. **after** the
+changed bytes — so it compared two different states and could only report
+a difference. It now captures at `L-4`.
+
+**§14's "NULL for a budget reason" is therefore WITHDRAWN.** The arm was
+never run, so the question *"can the recurrent state be trained to hold a
+fact?"* was never asked. The number 5.5463 was not a small-budget
+result; it was a **no-op**.
+
+**The lesson, which is the same one the D5 and D1 stories already taught
+and which the programme has now paid for three times:** *a null with an
+instrument bug is a bug.* A CE at exactly `ln(256)` — the uniform
+predictor — is not a weak model, it is a model that was never trained, and
+**the tell was available**: the CE was at the *theoretical maximum* of the
+loss, not merely high. A one-line assertion ("if CE >= ln(256) - 1e-6, the
+arm did not train") would have caught it in the first minute.
+
+**The self-test now has a gate that would have caught all of it**: after
+ONE optimizer step the weights must MOVE (`|d theta| > 0` and
+`|d head| > 0`), and the checkpoint must hold the weights and not the
+gradients (`tools/cl2_train.py --selftest`, gates (iv) and (v)). It FAILS
+on the old code and PASSES on the fixed code, on the MX150 as well as on
+the CPU.
