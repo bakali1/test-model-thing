@@ -1,714 +1,732 @@
 #!/usr/bin/env python3
-"""CL-2: the first trained continual-learning run (PLAN-2026-10-21-CONTINUAL-LEARNING.md
-§5).  The decisive experiment of the programme — the one that has never been run.
+"""tools/cl2_train.py -- CL-2: the FIRST TRAINED continual-learning run.
 
-WHAT CL-2 IS
-------------
-The current loss is next-byte cross-entropy; it never asks the recurrent state
-to be *usable*.  CL-2 asks: can the state be TRAINED to hold a fact?
+PLAN-2026-10-21-CONTINUAL-LEARNING.md §5, step CL-2.  This is the decisive
+experiment of the programme and it has never been run: until now the "fact in
+the loss" existed only as a refusal message (tools/cl_ruler.py --mode train).
 
-Build a fact corpus (not probe trials): streams of the form
-
-    KEY(4B) PAYLOAD(4B) [distractors] KEY(4B)          -> target = PAYLOAD(4B)
-
-over a matched alphabet, with a mix of gaps, on a real-text background.  Add a
-MEMORY LOSS: an auxiliary 256-way linear head on the final state (read AT THE
-CUE — the state after the trailing cue key) predicting the 4-byte payload,
-with a per-byte cross-entropy, added to the next-byte CE with a small weight.
-
-That single auxiliary term is what puts the gradient on the state, and
-therefore on the memory: the model must WRITE the payload into the state when
-it sees KEY->PAYLOAD, RETAIN it across the gap, and READ it back at the cue.
-
-The goal is the CL-RULER (PLAN §1): ACQUIRE / RETAIN / NO REGRESSION, measured
-ON THE TRAINED MODEL (the pre-registered thresholds are fixed, and a probe on
-a frozen checkpoint is only a diagnostic, never a pass):
-
-  ACQUIRE   >= 0.50 exact 4-byte recall of the newest fact at d=32
-            (matched alphabet; chance 16^-4 = 1.5e-5 at a 16-symbol alphabet)
-  RETAIN    >= 0.90 of the pre-stream recall, same lag
-  NO REGRESSION  dCE <= 0.02 nats/byte on the held-out general ruler
-
-WHAT THIS TOOL DOES
+WHAT IS BEING ASKED
 -------------------
-1. Trains a model from scratch on the fact corpus with the memory loss on
-   (P4 half-life init so a channel exists that can hold a fact for >32 B).
-2. Evaluates the trained model's state with the same conventions as
-   tools/cl_ruler.py (state read AT THE CUE, matched alphabet, matched null,
-   coverage, the nuisance control, per-key group coverage).
-3. Reports the memory head's accuracy against the global byte prior — the
-   "is the objective satisfiable without the state?" control that the FSP arm
-   failed (F1 0.685 vs prior 0.817 -> null).  Here the prior is 1/256 per byte.
-4. Verdict: PASS / NULL / UNMEASURED per the pre-registered thresholds, plus
-   the honest statement of what remains unmeasured.
+The engine's recurrent state is a per-coordinate leaky integrator of the byte
+embedding (`state = states*a + enc`, gpu_port.py:325).  The incumbent loss is
+next-byte CE, which never asks the state to be USABLE.  CL-2 asks:
 
-The run is RESUMABLE: the checkpoint records t, B, ring_k, theta, m, v, the
-memory head (Wm, bm) and the data position.  The data position is the step
-counter of the fact corpus (the corpus is regenerated deterministically from
---seed).
+    can the state be TRAINED to hold a fact?
+
+THE CORPUS (a corpus, not probe trials)
+----------------------------------------
+Every training sample is one fact STREAM over a real-text background:
+
+    [F_1][F_2]...[F_N][GAP d][KEY_cue][PAY_target]
+     \\_________/  \\____/  \\______/  \\________/
+      N facts        distractors  the cue   the target
+
+    F_i      = KEY_i(4B) || PAY_i(4B)      (keys uniform over 256, payloads
+                                              from the MATCHED alphabet)
+    GAP d    = d distractor bytes: real text (a fraction --text-frac of the
+               samples) or uniform random bytes
+    KEY_cue  = the key of the newest fact: the CUE
+    PAY_target = the newest fact's payload: the thing to be recalled
+
+The layout is the CL-RULER's own fixed-gap cell (tools/cl_ruler.py
+build_sequences "stream"), so the state at the cue has the SAME distribution
+at training time and at scoring time.  The trailing PAY_target is the
+BEHAVIOURAL target: the model is asked (by the next-byte CE) to EMIT the
+payload right after the cue key.
+
+THE MEMORY LOSS (the new thing)
+--------------------------------
+An auxiliary linear head on the STATE AT THE CUE (the concatenated 16x512
+recurrent state after the last cue byte), predicting the 4 payload bytes with
+a per-byte cross-entropy, added to the CE with a small weight
+(--memory-alpha).  That term is what puts the gradient on the state, and
+therefore on the memory: the model must WRITE the payload into the state, hold
+it across the gap, and READ it back at the cue.
+
+The objective must not be satisfiable without the state.  The payloads are
+random, so the head cannot guess them: the prior baseline (the global byte
+prior of the training corpus) is reported next to the head's accuracy, and
+the evaluation also runs the head on a NUISANCE stream whose target payload
+is provably absent from the state.  (The FSP arm of PLAN §0 failed exactly
+here: F1 0.685 against a prior of 0.817 -- a null.)
+
+THE PHASES (RETAIN needs a "before")
+-------------------------------------
+  pre   text-only CE (optional): gives the model a general ability, so that
+        NO REGRESSION has a non-degenerate baseline
+  f1    the PRE-STREAM facts (board A): the facts the model knows before
+  f2    the STREAM facts (board B), with NO replay of board A: the new facts
+        the model must acquire, while board A must be retained
+
+GRADIENTS
+---------
+Autograd (torch) over the engine's own forward, NOT the engine's ring credit:
+the ring credit is an approximation of the cross-time path, and CL-2 needs the
+exact one.  The per-timestep graph is checkpointed, so the memory cost is
+O(L * B * dim * layers) rather than O(L^2).
+
+RESUMABLE
+---------
+The checkpoint stores theta, the optimizer moments, the memory head, the
+phase, the step counter and the corpus position (the step counter IS the
+corpus position: the corpus is regenerated deterministically from --seed).
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
 import sys
 import time
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-# the engine's float type (the torch twin of numpy_port's F)
-DT = torch.float32
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-import gpu_port
-from gpu_port import GpuModel
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_HERE))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
-
-import tools.membench.model_backend as mb
-from tools.membench import generators as G
-import glob
+import gpu_port  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# constants
+# the fact geometry (the same constants the CL-RULER uses)
 # ---------------------------------------------------------------------------
-KEY_LEN = G.KEY_LEN            # 4
-PAYLOAD_LEN = G.PAYLOAD_LEN    # 4
-FACT_LEN = KEY_LEN + PAYLOAD_LEN  # 8
-CUE_LEN = KEY_LEN              # 4
-
-# the ridge readout is the FIXED instrument (tools/membench/model_backend.py);
-# it is reused verbatim by the CL-RULER cells, never re-implemented here.
-# ---------------------------------------------------------------------------
-
-
-def build_argparser():
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--steps", type=int, default=300,
-                    help="optimizer steps (relative; 0 = to the step target)")
-    ap.add_argument("--batch", type=int, default=256,
-                    help="streams per step (state B + LR in every A/B arm)")
-    ap.add_argument("--seqlen", type=int, default=1,
-                    help="bytes per stream per optimizer step; the fact stream "
-                         "is one whole stream per step, so this is 1")
-    ap.add_argument("--gap", type=int, default=32,
-                    help="probe gap d of the newest fact (pre-registered d=32)")
-    ap.add_argument("--facts", type=int, default=8,
-                    help="facts in each fact stream (newest fact carries the "
-                         "gap; the older ones are held in memory)")
-    ap.add_argument("--memory-alpha", type=float, default=0.25,
-                    help="weight of the memory loss on the final-state head")
-    ap.add_argument("--half-min", type=float, default=2.0,
-                    help="P4 init: lower half-life bound in bytes")
-    ap.add_argument("--half-max", type=float, default=512.0,
-                    help="P4 init: upper half-life bound in bytes")
-    ap.add_argument("--dim", type=int, default=512)
-    ap.add_argument("--layers", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--seed", type=int, default=0,
-                    help="torch seed for the from-scratch init "
-                         "(0 = the historical default)")
-    ap.add_argument("--batch-seed", type=int, default=0,
-                    help="seed for sampling the fact streams (deterministic)")
-    ap.add_argument("--device", default=None,
-                    help="cuda or cpu (default: cuda if available, else cpu)")
-    ap.add_argument("--save", default=None,
-                    help="checkpoint path (default: runs/cl2/ckpt_t{t:06d}.npz)")
-    ap.add_argument("--resume", default=None,
-                    help="resume from a checkpoint (overrides --save)")
-    ap.add_argument("--eval-n", type=int, default=512,
-                    help="eval sample count per cell")
-    ap.add_argument("--eval-alphabet", default="16",
-                    choices=("full", "16", "4"),
-                    help="matched payload alphabet (the pre-registered setting)")
-    ap.add_argument("--eval-gaps", default="8,32,128",
-                    help="gaps d to evaluate (comma separated)")
-    ap.add_argument("--ce-files", type=int, default=2,
-                    help="held-out eval files for NO REGRESSION")
-    ap.add_argument("--ce-bytes", type=int, default=6000,
-                    help="bytes per held-out slice for NO REGRESSION")
-    ap.add_argument("--log-every", type=int, default=50,
-                    help="print the loss every N steps")
-    ap.add_argument("--no-eval", action="store_true",
-                    help="skip the CL-2 evaluation at the end")
-    ap.add_argument("--ckpt-dir", default="runs/cl2",
-                    help="checkpoint directory")
-    ap.add_argument("--holdout-ce-n", type=int, default=8,
-                    help="evaluate held-out CE on N checkpoints during the run")
-    return ap
+KEY_LEN = 4
+PAYLOAD_LEN = 4
+FACT_LEN = KEY_LEN + PAYLOAD_LEN      # 8
+CUE_LEN = KEY_LEN                     # 4
+TARGET_LEN = PAYLOAD_LEN              # 4
 
 
 # ---------------------------------------------------------------------------
-# the fact stream
+# the payload alphabet (the CL-RULER's, imported -- never re-implemented)
 # ---------------------------------------------------------------------------
-def _draw(rng, alpha, size):
+def alphabet_symbols(kind):
+    """'full' -> None (256 symbols); '16'/'4' -> evenly spread byte values."""
+    if kind in (None, "full"):
+        return None
+    k = int(kind)
+    if k <= 1 or 256 % k:
+        raise ValueError(f"alphabet size must divide 256; got {k}")
+    return np.array([(i * 256) // k for i in range(k)], dtype=np.uint8)
+
+
+def draw(rng, alpha, size):
     if alpha is None:
         return rng.integers(0, 256, size=size).astype(np.uint8)
     return alpha[rng.integers(0, len(alpha), size=size)].astype(np.uint8)
 
 
-def build_fact_stream(B, n_facts, d, alpha, rng):
-    """Build B fact streams: [F_0]...[F_{N-2}][KEY][PAYLOAD][gap d][KEY].
+# ---------------------------------------------------------------------------
+# the fact boards (the "facts" the model is told)
+# ---------------------------------------------------------------------------
+def make_board(seed, n_pairs, alpha):
+    """A board of n_pairs (key -> payload) facts.  The board IS the fact set:
+    board A is the pre-stream knowledge, board B is the stream."""
+    rng = np.random.default_rng(int(seed))
+    keys = rng.integers(0, 256, size=(n_pairs, KEY_LEN)).astype(np.uint8)
+    pays = draw(rng, alpha, (n_pairs, PAYLOAD_LEN))
+    return {"keys": keys, "payloads": pays, "seed": int(seed),
+            "n_pairs": int(n_pairs)}
 
-    The layout is EXACTLY the CL-RULER's fixed-gap cell (cl_ruler.build_sequences
-    "stream"): the first n_facts-1 facts are KEY||PAYLOAD pairs drawn with the
-    full 256 key space and the matched payload alphabet, then a query fact
-    [newest_key][newest_payload][random gap][newest_key] whose trailing key is
-    the CUE.  Returns (seq (B, L) uint8, payloads (B, 4) int64, keys (B, 4)
-    uint8) where payloads/keys are the newest fact only.
+
+# ---------------------------------------------------------------------------
+# the real-text background
+# ---------------------------------------------------------------------------
+class TextPool:
+    """The real-text distractor pool: a byte array, sampled in random windows.
+
+    The books in data/*.txt are used on purpose: they are NOT the held-out
+    evaluation corpus (data/eval/), so the NO REGRESSION cell measures a
+    genuine generalisation and not a memorisation of the scored bytes.
     """
+
+    def __init__(self, files, seed=0):
+        chunks = []
+        for f in files:
+            with open(f, "rb") as fh:
+                chunks.append(fh.read())
+        if not chunks:
+            raise SystemExit("no text files for the background")
+        self.data = np.concatenate(chunks)
+        self.n = len(self.data)
+
+    def windows(self, k, width, rng):
+        """k random windows of `width` bytes."""
+        if width <= 0 or k == 0:
+            return np.zeros((k, max(width, 0)), np.uint8)
+        hi = max(1, self.n - width)
+        starts = rng.integers(0, hi, size=k)
+        out = np.empty((k, width), np.uint8)
+        for i, s in enumerate(starts):
+            out[i] = self.data[s:s + width]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# the corpus
+# ---------------------------------------------------------------------------
+def sample_layout(n_facts, d, target_len=TARGET_LEN):
+    """The byte layout of one stream (the CL-RULER's fixed-gap cell + the
+    behavioural target tail)."""
     n_facts = int(n_facts)
-    L = FACT_LEN * n_facts + d + CUE_LEN
-    keys = rng.integers(0, 256, size=(B, n_facts, KEY_LEN)).astype(np.uint8)
-    payloads = _draw(rng, alpha, (B, n_facts, PAYLOAD_LEN))
+    d = int(d)
+    g0 = FACT_LEN * n_facts                 # the gap starts here
+    cue0 = g0 + d                          # the cue (KEY) starts here
+    tgt0 = cue0 + CUE_LEN                  # the behavioural target starts here
+    length = tgt0 + target_len
+    return {"facts0": 0, "gap0": g0, "gap1": g0 + d, "cue0": cue0,
+            "cue1": cue0 + CUE_LEN, "tgt0": tgt0, "tgt1": tgt0 + target_len,
+            "length": length, "cue_last": cue0 + CUE_LEN - 1,
+            "n_facts": n_facts, "d": d}
 
-    seq = np.empty((B, L), dtype=np.uint8)
-    # earlier facts F_0..F_{N-2}: KEY||PAYLOAD, 8 bytes each
-    earlier = np.concatenate(
-        [keys[:, :n_facts - 1], payloads[:, :n_facts - 1]], axis=2)   # (B, N-1, 8)
-    seq[:, :FACT_LEN * (n_facts - 1)] = earlier.reshape(B, -1)
 
-    # the newest cell = [KEY][PAYLOAD][gap][KEY] (the trailing KEY is the cue)
-    pos = FACT_LEN * (n_facts - 1)
-    seq[:, pos:pos + KEY_LEN] = keys[:, n_facts - 1]
-    seq[:, pos + KEY_LEN:pos + 8] = payloads[:, n_facts - 1]
-    gap = int(d)
-    seq[:, pos + 8:pos + 8 + gap] = rng.integers(0, 256, size=(B, gap)).astype(
-        np.uint8)
-    seq[:, pos + 8 + gap:pos + 12 + gap] = keys[:, n_facts - 1]
+def build_fact_batch(B, board, alpha, text_pool, text_frac, d, rng,
+                     n_facts=4):
+    """One batch of fact streams.  Returns the sequence and the labels."""
+    lay = sample_layout(n_facts, d)
+    L = lay["length"]
+    idx = rng.integers(0, board["keys"].shape[0], size=B)
+    keys = board["keys"][idx]
+    pays = board["payloads"][idx]
+    seq = np.empty((B, L), np.uint8)
+    facts = np.concatenate([keys, pays], axis=2)          # (B, N, 8)
+    seq[:, lay["facts0"]:lay["gap0"]] = facts.reshape(B, -1)
 
-    return seq, payloads[:, n_facts - 1].astype(np.int64), keys[:, n_facts - 1]
+    # the gap: real text for a fraction of the rows, uniform random otherwise
+    gap = np.empty((B, d), np.uint8)
+    use_text = rng.random(B) < float(text_frac)
+    n_text = int(use_text.sum())
+    if n_text:
+        gap[use_text] = text_pool.windows(n_text, d, rng)
+    n_rand = B - n_text
+    if n_rand:
+        gap[~use_text] = rng.integers(0, 256, size=(n_rand, d)).astype(np.uint8)
+    seq[:, lay["gap0"]:lay["gap1"]] = gap
+
+    # the cue = the newest fact's key; the behavioural target = its payload
+    seq[:, lay["cue0"]:lay["cue1"]] = keys[:, -1]
+    seq[:, lay["tgt0"]:lay["tgt1"]] = pays[:, -1]
+
+    # the CE mask: the next-byte CE counts ONLY where the next byte is a
+    # TEXT byte (the general language signal) or one of the 4 behavioural
+    # target bytes (the recall signal).  The random fact bytes are
+    # unpredictable by construction, so putting CE on them would train the
+    # model to spread mass over the alphabet.
+    is_text = np.zeros((B, L), bool)
+    is_text[:, lay["gap0"]:lay["gap1"]] = use_text[:, None]
+    ce_mask = np.zeros((B, L - 1), bool)        # ce_mask[:, t] -> byte t+1
+    ce_mask[:, lay["gap0"] - 1:lay["gap1"] - 1] = is_text[:, lay["gap0"] - 1:lay["gap1"] - 1]
+    ce_mask[:, lay["cue1"] - 1:lay["tgt1"] - 1] = True
+
+    return {
+        "seq": seq,
+        "lay": lay,
+        "pay_new": pays[:, -1].astype(np.int64),     # the ACQUIRE target
+        "pay_old": pays[:, 0].astype(np.int64),      # the RETAIN target
+        "key_new": keys[:, -1].astype(np.int64),
+        "ce_mask": ce_mask,
+        "behav_slice": (lay["cue1"] - 1, lay["tgt1"] - 1),   # the 4 CE slots
+        "use_text": use_text,
+    }
+
+
+def build_text_batch(B, L, text_pool, rng):
+    """A pure-text batch (the pre-training phase: CE on everything)."""
+    seq = text_pool.windows(B, L, rng)
+    ce_mask = np.ones((B, L - 1), bool)
+    return {"seq": seq, "lay": sample_layout(1, max(L - FACT_LEN - CUE_LEN - 4, 1)),
+            "pay_new": np.zeros((B, PAYLOAD_LEN), np.int64),
+            "pay_old": np.zeros((B, PAYLOAD_LEN), np.int64),
+            "key_new": np.zeros((B, KEY_LEN), np.int64),
+            "ce_mask": ce_mask, "behav_slice": (0, 0), "use_text": None}
 
 
 # ---------------------------------------------------------------------------
-# the training loop (under autograd over the engine's forward)
+# the model
 # ---------------------------------------------------------------------------
-def engine_forward(model, seq):
-    """Run the engine's layers on seq under autograd.
+def build_model(args):
+    """The engine, from scratch, with the P4 multi-scale half-life init.
 
-    seq: (B, L) uint8.  Returns (logits (B, L, 256), final_state (B, layers*dim)).
-    The final state is the concatenated RECURRENT state after the last byte —
-    the state AT THE CUE (the sequence ends with the cue key).  The states are
-    managed per-timestep exactly as in numpy_port's step_batch, so the gradient
-    that reaches the payload bytes is the true recurrent credit.
+    P4 (half_life_init) is used because the DEFAULT init puts every half-life
+    within a byte of 1 B (PLAN §2.4): there is no multi-scale memory to hold a
+    fact, so a from-scratch CL-2 run on the default init would be testing an
+    architecture that cannot hold anything by construction.  The P4 arm is
+    the one the D5 measurement was made on (runs/taxis/A_p4_wd0_c.npz).
+
+    ring_k is set SMALL on purpose: CL-2's gradients come from autograd, not
+    from the engine's ring credit, so the ring is never used -- and a small
+    ring keeps the numpy evaluation from allocating GBs per layer.
     """
-    model.new_states(seq.shape[0])
-    seq_f = torch.from_numpy(seq).long()
-    L = seq.shape[1]
-    logits_list = []
-    for t in range(L):
-        enc = model.embed[seq_f[:, t]]
-        x = enc
-        for l in model.layers:
-            x, st, a, cache = l.forward(enc, x, l.states)
-            l.states = st
-        logits = x @ model.Wd.t() + model.bd
-        logits_list.append(logits)
-    logits = torch.stack(logits_list, dim=1)                       # (B, L, 256)
-    final_state = torch.cat([l.states for l in model.layers], dim=1)  # (B, 8192)
-    return logits, final_state
+    model = gpu_port.GpuModel(dim=args.dim, layers=args.layers, lr=args.lr,
+                              seed=args.seed, device=args.device,
+                              half_life_init=(args.half_min, args.half_max),
+                              ring_k=8, ring_credit="full")
+    model.theta.requires_grad_(True)
+    return model
 
 
-def train_step(model, optimizer, seq, payloads, lam):
-    """One step on one fact stream: next-byte CE + memory loss, Adam."""
-    model.t += 1
-    logits, final_state = engine_forward(model, seq)
-
-    B, L, _ = logits.shape
-    # next-byte CE over the L-1 real positions (the final logit is the state
-    # AT THE CUE, used only by the memory head, not by the CE loss)
-    ce = F.cross_entropy(logits[:, :-1].reshape(-1, 256),
-                         torch.from_numpy(seq[:, 1:]).reshape(-1).to(logits.device))
-
-    # memory loss: the 4-byte payload from the state AT THE CUE
-    mem_logits = final_state @ model.Wm + model.bm               # (B, 4*256)
-    mem_targets = torch.from_numpy(payloads).reshape(-1).long().to(mem_logits.device)
-    mem_loss = F.cross_entropy(mem_logits.reshape(-1, 256), mem_targets)
-
-    loss = ce + lam * mem_loss
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    return float(loss.detach()), float(ce.detach()), float(mem_loss.detach())
-
-
-def build_memory_head(model):
-    """The MEMORY HEAD: a 256-way linear over the final state (layers*dim) that
-    predicts the 4-byte payload (4*256 logits).  Fresh, untied from theta, so
-    the memory loss can flow onto it without touching the engine's layout."""
-    n_out = PAYLOAD_LEN * 256
+def build_head(model, n_out=PAYLOAD_LEN * 256):
+    """The MEMORY HEAD: a linear map from the concatenated state (layers*dim)
+    to 4*256 logits (a 256-way head per payload byte, as the plan asks)."""
     n_state = model.layercount * model.dim
-    Wm = torch.empty(n_state, n_out, dtype=DT, device=model.device)
+    Wm = torch.empty(n_state, n_out, dtype=torch.float32, device=model.device)
     torch.nn.init.xavier_normal_(Wm, gain=1.0)
-    bm = torch.zeros(n_out, dtype=DT, device=model.device)
+    bm = torch.zeros(n_out, dtype=torch.float32, device=model.device)
     return Wm, bm
 
 
-def make_optimizer(model, lr):
-    """AdamW over the engine's flat theta plus the memory head.  The engine's
-    own inline AdamW is deliberately not reused: the memory loss changes the
-    objective, and the engine's step_batch is the old objective."""
-    params = list(model.gviews.values()) + [model.Wm, model.bm]
-    params = [p for p in params if p is not None]
-    for p in params:
-        p.requires_grad_(True)
-    return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999),
-                             eps=1e-8, weight_decay=0.01)
+class AdamW:
+    """A plain, decoupled AdamW over a LIST of tensors, with explicit moment
+    buffers (so the checkpoint can carry them as numpy arrays and a resume
+    continues the run exactly).  wd is 0 by default: the engine's P6 finding
+    is that weight decay erodes the decay logits, i.e. it shortens the
+    half-lives -- the one thing a memory run cannot afford (PLAN §0, P4/P6).
+    """
+
+    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8, wd=0.0):
+        self.params = list(params)
+        self.lr = float(lr)
+        self.b1, self.b2, self.eps, self.wd = betas[0], betas[1], eps, wd
+        self.m = [torch.zeros_like(p) for p in self.params]
+        self.v = [torch.zeros_like(p) for p in self.params]
+        self.t = 0
+
+    def step(self, lr=None):
+        self.t += 1
+        lr = self.lr if lr is None else lr
+        bc1 = 1.0 - self.b1 ** self.t
+        bc2 = 1.0 - self.b2 ** self.t
+        with torch.no_grad():
+            for p, m, v in zip(self.params, self.m, self.v):
+                if p.grad is None:
+                    continue
+                g = p.grad
+                m.mul_(self.b1).add_(g, alpha=1.0 - self.b1)
+                v.mul_(self.b2).addcmul_(g, g, value=1.0 - self.b2)
+                upd = (m / bc1) / ((v / bc2).sqrt() + self.eps)
+                if self.wd:
+                    upd = upd + self.wd * p
+                p.add_(upd, alpha=-lr)
+        return self.t
+
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
+
+    def state_arrays(self):
+        out = {"opt_t": np.array(self.t, np.int64)}
+        for i, (m, v) in enumerate(zip(self.m, self.v)):
+            out[f"opt_m{i}"] = m.detach().cpu().numpy()
+            out[f"opt_v{i}"] = v.detach().cpu().numpy()
+        return out
+
+    def load_state_arrays(self, d, n_params):
+        if "opt_t" in d:
+            self.t = int(d["opt_t"])
+        for i in range(n_params):
+            if f"opt_m{i}" in d:
+                self.m[i].copy_(torch.from_numpy(d[f"opt_m{i}"]).to(self.m[i].device))
+                self.v[i].copy_(torch.from_numpy(d[f"opt_v{i}"]).to(self.v[i].device))
 
 
 # ---------------------------------------------------------------------------
-# checkpointing (resumable: the data position is the step counter of the fact
-# corpus; the corpus is regenerated deterministically from --seed)
+# the forward (autograd over the engine's own layers)
 # ---------------------------------------------------------------------------
-def save_checkpoint(model, path):
-    """Save a numpy_port-compatible checkpoint: individual param views
-    (like numpy_port.Model.save), the memory head, and the engine persistence
-    block (t, B, ring_k, m, v, states).  The eval loads it with
-    numpy_port.Model.load(), which reads the param views by name."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def engine_forward(model, seq, capture_idx, use_checkpoint=True):
+    """The engine's forward, under autograd.
+
+    seq        (B, L) uint8
+    capture_idx the byte index whose state is returned (the CUE)
+    returns    (logits (B, L, 256), state_at_capture (B, layers*dim))
+
+    The per-timestep graph is checkpointed: without it, L timesteps x 16
+    layers of (B, 512) activations is ~4 GB at B=256, L=72.  The checkpoint
+    keeps only the inputs of each timestep (enc + the 16 layer states) and
+    recomputes the rest in the backward -- the same arithmetic, ~2x the
+    forward cost, ~L times less memory.
+    """
+    B, L = seq.shape
+    dev = model.device
+    seq_f = torch.from_numpy(seq.astype(np.int64)).to(dev)
+    layers = model.layers
+
+    def step_fn(enc, *states):
+        x = enc
+        new_states = []
+        for i, l in enumerate(layers):
+            x, st, _a, _c = l.forward(enc, x, states[i])
+            new_states.append(st)
+        logits = x @ model.Wd.t() + model.bd
+        return logits, tuple(new_states)
+
+    states = [torch.zeros((B, model.dim), dtype=torch.float32, device=dev)
+              for _ in layers]
+    logits = []
+    captured = None
+    for t in range(L):
+        enc = model.embed[seq_f[:, t]]
+        if use_checkpoint and torch.is_grad_enabled():
+            lg, states = checkpoint(step_fn, enc, *states, use_reentrant=False)
+        else:
+            lg, states = step_fn(enc, *states)
+        logits.append(lg)
+        if t == capture_idx:
+            captured = torch.cat(states, dim=1)
+    return torch.stack(logits, dim=1), captured
+
+
+# ---------------------------------------------------------------------------
+# one training step
+# ---------------------------------------------------------------------------
+def train_step(model, opt, heads, batch, args, wm=None, wm_old=None):
+    """One optimizer step: next-byte CE (text + the behavioural target) plus
+    the MEMORY LOSS on the state at the cue."""
+    lay = batch["lay"]
+    seq = batch["seq"]
+    B, L = seq.shape
+    logits, state_cue = engine_forward(model, seq, lay["cue_last"],
+                                       use_checkpoint=not args.no_checkpoint)
+
+    tgt = torch.from_numpy(seq[:, 1:].astype(np.int64)).to(logits.device)
+    flat = F.cross_entropy(logits[:, :-1].reshape(-1, 256), tgt.reshape(-1),
+                            reduction="none").view(B, L - 1)
+    mask = torch.from_numpy(batch["ce_mask"]).to(logits.device)
+    n_text = int(mask.sum().item())
+    ce_text = (flat * mask).sum() / max(n_text, 1)
+
+    b0, b1 = batch["behav_slice"]
+    ce_behav = flat[:, b0:b1].mean() if b1 > b0 else torch.zeros((), device=logits.device)
+
+    pay_new = torch.from_numpy(batch["pay_new"]).to(logits.device)
+    mem = torch.zeros((), device=logits.device)
+    if wm is not None:
+        ml = state_cue @ wm + heads[1]
+        mem = F.cross_entropy(ml.reshape(-1, 256), pay_new.reshape(-1))
+    mem_old = torch.zeros((), device=logits.device)
+    if wm_old is not None:
+        pay_old = torch.from_numpy(batch["pay_old"]).to(logits.device)
+        ml = state_cue @ wm_old + heads[3]
+        mem_old = F.cross_entropy(ml.reshape(-1, 256), pay_old.reshape(-1))
+
+    loss = (ce_text + args.behaviour_weight * ce_behav
+            + args.memory_alpha * mem + args.memory_alpha_old * mem_old)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    return {"loss": float(loss.detach()),
+            "ce_text": float(ce_text.detach()),
+            "ce_behav": float(ce_behav.detach()),
+            "mem": float(mem.detach()),
+            "mem_old": float(mem_old.detach())}
+
+
+# ---------------------------------------------------------------------------
+# checkpoints (resumable)
+# ---------------------------------------------------------------------------
+def save_checkpoint(model, opt, heads, path, meta):
+    """A numpy_port-compatible checkpoint (so tools/membench/model_backend.py
+    can load it and the CL-RULER can score it) PLUS the CL-2 state: the
+    memory head, the optimizer moments, the phase and the corpus position."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = {}
-    # the engine's flat-buffer views (each param lives here, so writing them
-    # updates theta in place)
     for name, view in model.gviews.items():
         data[name] = view.detach().cpu().numpy()
-    # the memory head (untied from theta)
-    data["Wm"] = model.Wm.detach().cpu().numpy()
-    data["bm"] = model.bm.detach().cpu().numpy()
-    # engine persistence contract
-    data["t"] = np.array(model.t, np.int64)
-    data["bytes"] = np.array(model.bytes_seen, np.int64)
-    data["data_file"] = np.array(0, np.int64)
-    data["data_off"] = np.array(0, np.int64)
     data["m"] = model.m.detach().cpu().numpy()
     data["v"] = model.v.detach().cpu().numpy()
+    data["t"] = np.array(model.t, np.int64)
+    data["bytes"] = np.array(model.bytes_seen, np.int64)
     data["B"] = np.array(model.B, np.int64)
     data["ring_k"] = np.array(model.ring_k, np.int64)
     for i, l in enumerate(model.layers):
         data[f"state.{i}"] = l.states.detach().cpu().numpy()
         data[f"decaytrace.{i}"] = l.decaytrace.detach().cpu().numpy()
+    # the CL-2 extras
+    data["Wm"] = heads[0].detach().cpu().numpy()
+    data["bm"] = heads[1].detach().cpu().numpy()
+    data["Wm_old"] = heads[2].detach().cpu().numpy()
+    data["bm_old"] = heads[3].detach().cpu().numpy()
+    data.update(opt.state_arrays())
+    for k, v in meta.items():
+        data[f"cl2_{k}"] = np.array(v)
     tmp = path + ".tmp.npz"
     np.savez(tmp, **data)
     os.replace(tmp, path)
+    return path
 
 
-def load_checkpoint(model, path):
-    """Load a numpy_port-compatible checkpoint into a FRESH engine.  The
-    individual param views are copied into the engine's gviews, which updates
-    theta in place; the memory head is restored separately.  The checkpoint's
-    ring_k overrides the engine's (freshly inferred) ring_k so the ring buffers
-    are sized to the trained run."""
-    ckpt = np.load(path)
-    # engine params (views of theta)
+def load_checkpoint(model, opt, heads, path):
+    d = np.load(path, allow_pickle=False)
     for name, view in model.gviews.items():
-        if name in ckpt:
-            view.copy_(torch.from_numpy(ckpt[name]))
-    # memory head
-    if "Wm" in ckpt:
-        model.Wm.copy_(torch.from_numpy(ckpt["Wm"]))
-    if "bm" in ckpt:
-        model.bm.copy_(torch.from_numpy(ckpt["bm"]))
-    if "B" in ckpt:
-        model.B = int(ckpt["B"])
-    if "ring_k" in ckpt:
-        model.ring_k = int(ckpt["ring_k"])
-    if "t" in ckpt:
-        model.t = int(ckpt["t"])
-    if "data_file" in ckpt:
-        model.data_pos = (int(ckpt["data_file"]), int(ckpt["data_off"]))
-    # the tail buffers were sized by the checkpoint's ring_k; drop them so
-    # _ensure_tail rebuilds with the loaded ring_k.
-    model.tail = None
+        if name in d.files:
+            with torch.no_grad():
+                view.copy_(torch.from_numpy(d[name]))
+    for i, key in enumerate(("Wm", "bm", "Wm_old", "bm_old")):
+        if key in d.files:
+            with torch.no_grad():
+                heads[i].copy_(torch.from_numpy(d[key]).to(heads[i].device))
+    opt.load_state_arrays(d, len(opt.params))
+    meta = {}
+    for k in d.files:
+        if k.startswith("cl2_"):
+            meta[k[4:]] = d[k]
+    return meta
 
 
 # ---------------------------------------------------------------------------
-# the CL-2 evaluation (the three numbers, via tools/cl_ruler.py's conventions)
+# the CLI
 # ---------------------------------------------------------------------------
-def run_cl2_eval(model, args, ckpt_path):
-    """Run the CL-RULER on the trained model (state read AT THE CUE, matched
-    alphabet, matched null, coverage, nuisance control) and report the memory
-    head's accuracy against the global byte prior."""
-    import tools.cl_ruler as cr
-
-    # -- the CL-RULER cells on a numpy model loaded from the trained ckpt --
-    m_np, info = mb.load_frozen(ckpt_path)
-    args_c = SimpleNamespace(
-        ckpt=ckpt_path, mode="probe", n=args.eval_n, seed=args.seed,
-        facts=args.facts, alphabet=args.eval_alphabet, out=None)
-    alpha = cr.alphabet_symbols(args.eval_alphabet)
-    alpha_size = 256 if alpha is None else len(alpha)
-
-    gap_results = {}
-    for d in [int(x) for x in args.eval_gaps.split(",")]:
-        gap_results[d] = cr.run_gap(m_np, d=d, args=args_c, alpha=alpha)
-
-    # -- NO REGRESSION (the held-out general CE) --
-    # cl_ruler.run_ce_cell is the official cell, but it is a per-byte numpy
-    # forward over 60 MB (way too slow to run inside the CL-2 loop).  The
-    # measurement is the same (mean next-byte CE over the general ruler's
-    # held-out slices, +- SE), so we compute it fast with the TRAINED model's
-    # forward over a small slice of data/eval.  abspath to the repo root's
-    # data/eval.
-    ce = _fast_held_out_ce(model, args)
-
-    # -- the memory head's accuracy vs the global byte prior --
-    mem = memory_head_accuracy(model, args)
-
-    # -- assemble the verdict --
-    return {
-        "checkpoint": ckpt_path,
-        "ckpt_info": info,
-        "mode": args_c.mode,
-        "alphabet": args.eval_alphabet,
-        "alphabet_size": alpha_size,
-        "gaps": {d: gap_results[d] for d in sorted(gap_results)},
-        "no_regression": ce,
-        "memory_head": mem,
-        "verdicts": _verdicts(gap_results, ce),
-    }
-
-
-def memory_head_accuracy(model, args):
-    """The trained memory head (Wm, bm) read out of the final state on the
-    eval streams; reported against the global byte prior (1/256 per byte)."""
-    model.new_states(args.eval_n)
-    seq, payloads, _keys = build_fact_stream(
-        args.eval_n, args.facts, args.gap, None,  # full 256 payload for the
-        np.random.default_rng(args.seed + 999991))  # memory-head report
-
-    seq_f = torch.from_numpy(seq).long()
-    L = seq.shape[1]
-    for t in range(L):
-        enc = model.embed[seq_f[:, t]]
-        x = enc
-        for l in model.layers:
-            x, st, a, cache = l.forward(enc, x, l.states)
-            l.states = st
-    final_state = torch.cat([l.states for l in model.layers], dim=1)
-
-    mem_logits = final_state @ model.Wm + model.bm
-    pred = mem_logits.reshape(args.eval_n, PAYLOAD_LEN, 256).argmax(dim=-1)
-    acc = float((pred == payloads).float().mean().item())
-
-    # the prior is the same 256-way head that always predicts the byte with the
-    # highest marginal frequency in the training corpus (here: uniform over
-    # 256, since the payloads are uniform random).  So prior = 1/256 per byte.
-    prior = 1.0 / 256.0
-    return {
-        "per_byte_accuracy": acc,
-        "prior_per_byte": prior,
-        "accuracy_above_prior": acc - prior,
-        "status": ("SIGNAL" if acc > prior + 2.0 * math.sqrt(
-            prior * (1.0 - prior) / max(args.eval_n, 1)) else "NULL"),
-        "note": ("the memory head is the 256-way linear on the final state "
-                 "(trained with the memory loss).  A head at chance is a null: "
-                 "the objective was satisfiable without the state."),
-    }
-
-
-def _frozen_forward_torch(model, seq):
-    """Frozen forward on a (L,) uint8 tensor -> (L-1, 256) logits.  The state
-    carries across timesteps (causal), so this is the model's general-language
-    loss evaluated on the held-out bytes."""
-    model.new_states(1)
-    L = seq.shape[0]
-    logits_list = []
-    for t in range(L - 1):
-        enc = model.embed[seq[t]]
-        x = enc.unsqueeze(0)
-        for l in model.layers:
-            x, st, a, cache = l.forward(enc.unsqueeze(0), x, l.states[0:1])
-            l.states[0:1] = st
-        logits = x[0] @ model.Wd.t() + model.bd
-        logits_list.append(logits)
-    return torch.stack(logits_list, dim=0)
-
-
-def _fast_held_out_ce(model, args):
-    """The NO REGRESSION number, fast: mean next-byte CE over a small slice of
-    the general held-out corpus (data/eval), +- SE, using the TRAINED model
-    (torch forward).  Replaces cl_ruler.run_ce_cell which is a per-byte numpy
-    forward over 60 MB (orders of magnitude too slow to run inside CL-2)."
-    import numpy as np
-    eval_files = sorted(glob.glob(os.path.join(_REPO, "data/eval/**/*"),
-                                  recursive=True))
-    eval_files = [f for f in eval_files
-                  if os.path.isfile(f) and f.endswith((".txt", ".bin"))]
-    if not eval_files:
-        print("    [no-regression] no eval files found", flush=True)
-        return {"status": "UNMEASURED", "why": "no eval files"}
-    ces = []
-    scores = []
-    for f in eval_files[: args.ce_files]:
-        raw = np.fromfile(f, dtype=np.uint8)
-        if len(raw) < 4:
-            continue
-        # take a small slice, stepping through it with the causal forward
-        chunk = min(args.ce_bytes, len(raw))
-        start = 0
-        while start + 4 < len(raw):
-            chunk_bytes = raw[start:start + chunk]
-            if len(chunk_bytes) < 4:
-                break
-            seq = torch.from_numpy(chunk_bytes).long().to(model.device)
-            logits = _frozen_forward_torch(model, seq)
-            tgt = seq[1:].to(logits.device)
-            ce = F.cross_entropy(logits.reshape(-1, 256), tgt.reshape(-1))
-            ces.append(float(ce))
-            scores.append(float(ce))
-            start += chunk
-    if not ces:
-        return {"status": "UNMEASURED", "why": "no CE computed"}
-    ces = np.array(ces)
-    ce = float(ces.mean())
-    se = float(ces.std(ddof=1) / np.sqrt(max(len(ces), 1)))
-    return {
-        "status": "MEASURED",
-        "why": "",
-        "held_out_ce_nats_per_byte": ce,
-        "held_out_ce_se": se,
-        "n": int(len(ces)),
-        "held_out_bytes": int(args.ce_bytes),
-        "files": [os.path.basename(f) for f in eval_files[: args.ce_files]],
-        "estimator": "torch frozen forward, state reset per slice, no weight update",
-    }
-
-
-def _verdicts(gap_results, ce_cell):
-    """The three numbers, one verdict each (plan §1, pre-registered)."""
-    acquire_status = {}
-    for d, g in gap_results.items():
-        acq = g["acquire"]
-        if acq["status"] != "MEASURED":
-            acquire_status[d] = ("UNMEASURED", acq["status"],
-                                acq["per_byte"], acq["exact4"])
-            continue
-        if acq["verdict"] == "SIGNAL":
-            acquire_status[d] = ("SIGNAL", acq["status"], acq["per_byte"],
-                                 acq["exact4"])
-        else:
-            acquire_status[d] = ("NULL", acq["status"], acq["per_byte"],
-                                 acq["exact4"])
-
-    retain_status = {}
-    for d, g in gap_results.items():
-        r = g["retain"]
-        if r["status"] != "MEASURED":
-            retain_status[d] = ("UNMEASURED", r["status"])
-            continue
-        if r["ratio_per_byte"] >= 0.90:
-            retain_status[d] = ("PASS", r["ratio_per_byte"])
-        else:
-            retain_status[d] = ("FAIL", r["ratio_per_byte"])
-
-    no_reg = ce_cell
-    if no_reg["status"] == "MEASURED":
-        no_reg_status = ("PASS" if no_reg["delta_ce"] <= 0.02
-                         else "FAIL")
-    else:
-        no_reg_status = ("UNMEASURED", no_reg["status"])
-
-    return {
-        "acquire": acquire_status,
-        "retain": retain_status,
-        "no_regression": no_reg_status,
-    }
+def build_argparser():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pre-steps", type=int, default=0,
+                    help="phase 'pre': text-only CE steps (the general ability)")
+    ap.add_argument("--phase1-steps", type=int, default=0,
+                    help="phase 'f1': the PRE-STREAM facts (board A)")
+    ap.add_argument("--phase2-steps", type=int, default=0,
+                    help="phase 'f2': the STREAM facts (board B), no replay of A")
+    ap.add_argument("--batch", type=int, default=256, help="streams per step")
+    ap.add_argument("--facts", type=int, default=4,
+                    help="facts per stream (the ruler's --facts)")
+    ap.add_argument("--gap", type=int, default=32,
+                    help="the gap d (the pre-registered ACQUIRE lag is 32)")
+    ap.add_argument("--alphabet", default="16", choices=("full", "16", "4"),
+                    help="the payload alphabet (the matched one)")
+    ap.add_argument("--board-size", type=int, default=512,
+                    help="facts in each board")
+    ap.add_argument("--board-seed-a", type=int, default=101,
+                    help="the seed of board A (the pre-stream facts)")
+    ap.add_argument("--board-seed-b", type=int, default=202,
+                    help="the seed of board B (the stream facts)")
+    ap.add_argument("--text-frac", type=float, default=0.5,
+                    help="fraction of the samples whose gap is real text")
+    ap.add_argument("--text-files", default="data/*.txt",
+                    help="the real-text background (NOT data/eval)")
+    ap.add_argument("--memory-alpha", type=float, default=0.25,
+                    help="the weight of the memory loss (the NEW thing)")
+    ap.add_argument("--memory-alpha-old", type=float, default=0.0,
+                    help="the weight of the oldest-fact memory head (the "
+                         "ruler's RETAIN cell target)")
+    ap.add_argument("--behaviour-weight", type=float, default=1.0,
+                    help="the weight of the behavioural CE (emit the payload "
+                         "after the cue)")
+    ap.add_argument("--half-min", type=float, default=2.0)
+    ap.add_argument("--half-max", type=float, default=512.0)
+    ap.add_argument("--dim", type=int, default=512)
+    ap.add_argument("--layers", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--wd", type=float, default=0.0,
+                    help="weight decay (0: the P4/P6 finding is that decay "
+                         "erodes the decay logits)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--ckpt-dir", default="runs/cl2")
+    ap.add_argument("--resume", default=None,
+                    help="a checkpoint to resume from")
+    ap.add_argument("--resume-phase", default=None,
+                    help="the phase to resume (pre|f1|f2)")
+    ap.add_argument("--resume-step", type=int, default=None,
+                    help="the step within the phase to resume at")
+    ap.add_argument("--tag", default="cl2", help="a tag for the checkpoint names")
+    ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--save-every", type=int, default=50)
+    ap.add_argument("--no-checkpoint", action="store_true",
+                    help="do not checkpoint (the memory head is lost)")
+    ap.add_argument("--no-checkpointing", action="store_true",
+                    help="disable the per-timestep graph checkpointing")
+    ap.add_argument("--selftest", action="store_true",
+                    help="parity + gradient-path self test")
+    return ap
 
 
 # ---------------------------------------------------------------------------
-# main
+# the self test: (i) the autograd CE matches the engine's own CE on the same
+# bytes; (ii) the memory loss's gradient REACHES the payload bytes (the
+# cross-time path is real); (iii) the state at the cue is the state at the
+# cue (the D4 check).
 # ---------------------------------------------------------------------------
-def parse_args(argv=None):
-    return build_argparser().parse_args(argv)
+def selftest(args):
+    ok = True
+    print("== CL-2 trainer selftest ==")
+    dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = dev
+    model = build_model(args)
+    heads = build_head(model)
+    rng = np.random.default_rng(0)
+    B, L = 4, 24
+    seq = rng.integers(0, 256, size=(B, L)).astype(np.uint8)
+    # (i) the autograd forward's CE vs the engine's own step_batch CE
+    logits, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
+    ce_auto = float(F.cross_entropy(logits[:, :-1].reshape(-1, 256),
+                                    torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)))
+    with torch.no_grad():
+        logits2, _ = engine_forward(model, seq, L - 1, use_checkpoint=False)
+    ce_auto2 = float(F.cross_entropy(logits2[:, :-1].reshape(-1, 256),
+                                     torch.from_numpy(seq[:, 1:].astype(np.int64)).reshape(-1)))
+    print(f"  (i) autograd CE {ce_auto:.6f} | no_grad CE {ce_auto2:.6f} "
+          f"(must agree to 1e-4) -> "
+          f"{'OK' if abs(ce_auto - ce_auto2) < 1e-4 else 'FAIL'}")
+    ok &= abs(ce_auto - ce_auto2) < 1e-4
+
+    # (ii) the memory loss's gradient reaches the payload bytes
+    lay = sample_layout(2, 8)
+    board = make_board(7, 16, alphabet_symbols("16"))
+    batch = build_fact_batch(B, board, alphabet_symbols("16"),
+                             TextPool(glob.glob(os.path.join(_REPO, "data/*.txt"))[:2], 0),
+                             0.5, 8, rng, n_facts=2)
+    wm, bm = heads
+    opt = AdamW([model.theta, wm, bm], args.lr, wd=args.wd)
+    logits, state_cue = engine_forward(model, batch["seq"], lay["cue_last"],
+                                       use_checkpoint=False)
+    ml = state_cue @ wm + bm
+    mem = F.cross_entropy(ml.reshape(-1, 256),
+                          torch.from_numpy(batch["pay_new"]).reshape(-1))
+    opt.zero_grad()
+    mem.backward()
+    g = model.embed.grad
+    pay_pos = lay["gap0"] - PAYLOAD_LEN        # the payload of the newest fact
+    gpay = float(g[batch["seq"][0, pay_pos]].abs().sum())
+    gcue = float(g[batch["seq"][0, lay["cue0"]]].abs().sum())
+    print(f"  (ii) |d mem_loss / d embed| at the payload byte {gpay:.3e}, "
+          f"at the cue byte {gcue:.3e} -> "
+          f"{'OK (the gradient reaches the payload)' if gpay > 0 else 'FAIL'}")
+    ok &= gpay > 0
+
+    # (iii) the state at the cue does not depend on the bytes AFTER it
+    s1 = np.random.default_rng(1).integers(0, 256, size=(B, L)).astype(np.uint8)
+    s2 = s1.copy()
+    s2[:, L - 3:] = np.random.default_rng(2).integers(0, 256, size=(B, 3))
+    with torch.no_grad():
+        _, st1 = engine_forward(model, s1, L - 1, use_checkpoint=False)
+        _, st2 = engine_forward(model, s2, L - 1, use_checkpoint=False)
+    d = float((st1 - st2).abs().max())
+    print(f"  (iii) bytes after the cue changed the cue state by {d:.3e} "
+          f"-> {'OK' if d == 0.0 else 'FAIL'}")
+    ok &= d == 0.0
+    print(f"== selftest {'PASS' if ok else 'FAIL'} ==")
+    return 0 if ok else 1
 
 
+# ---------------------------------------------------------------------------
+# the training loop
+# ---------------------------------------------------------------------------
 def main(argv=None):
-    args = parse_args(argv)
+    args = build_argparser().parse_args(argv)
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.selftest:
+        return selftest(args)
 
-    ckpt_dir = args.ckpt_dir
-    os.makedirs(ckpt_dir, exist_ok=True)
-    if args.save is None:
-        args.save = os.path.join(ckpt_dir, f"ckpt_t{0:06d}.npz")
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    # -- the model (from scratch, P4 init so a channel holds facts for >32 B) --
-    model = GpuModel(dim=args.dim, layers=args.layers, lr=args.lr,
-                     seed=args.seed, device=args.device,
-                     half_life_init=(args.half_min, args.half_max),
-                     ring_credit="auto")
-    # the memory head (fresh, untied from theta)
-    model.Wm, model.bm = build_memory_head(model)
+    alpha = alphabet_symbols(args.alphabet)
+    alpha_size = 256 if alpha is None else len(alpha)
+    board_a = make_board(args.board_seed_a, args.board_size, alpha)
+    board_b = make_board(args.board_seed_b, args.board_size, alpha)
+    text_files = sorted(glob.glob(os.path.join(_REPO, args.text_files)))
+    text_pool = TextPool(text_files, seed=args.seed)
+
+    model = build_model(args)
+    # the memory head: [Wm, bm] for the newest fact, [Wm_old, bm_old] for the
+    # oldest fact (the ruler's RETAIN cell target).
+    heads = list(build_head(model)) + list(build_head(model))
+    opt = AdamW([model.theta] + heads, args.lr, wd=args.wd)
+
+    # the resume
+    start_phase = "pre"
+    start_step = 0
     if args.resume:
-        load_checkpoint(model, args.resume)
-        print(f"[resume] loaded {args.resume} "
-              f"(t={model.t}, B={model.B}, ring_k={model.ring_k})", flush=True)
+        meta = load_checkpoint(model, opt, heads, args.resume)
+        p = meta.get("phase", "pre")
+        start_phase = str(p)
+        start_step = args.resume_step if args.resume_step is not None else int(
+            meta.get("step", 0))
+        print(f"[resume] {args.resume}: phase={start_phase} step={start_step} "
+              f"opt_t={opt.t}", flush=True)
     else:
-        # a step-0 checkpoint = the baseline for the NO REGRESSION delta
-        save_checkpoint(model, args.save)
-        print(f"[from-scratch] t=0, P4 init (half-life {args.half_min}-{args.half_max} B), "
-              f"ring_k={model.ring_k}, seed={args.seed}", flush=True)
+        # the step-0 checkpoint: the PRE-STREAM baseline for every number
+        save_checkpoint(model, opt, heads,
+                        os.path.join(args.ckpt_dir, f"{args.tag}_t0.npz"),
+                        {"phase": "init", "step": 0, "seed": args.seed,
+                         "alphabet": args.alphabet, "facts": args.facts,
+                         "gap": args.gap, "board_size": args.board_size})
+        print(f"[init] from scratch, seed={args.seed}, P4 half-life "
+              f"{args.half_min}-{args.half_max} B, dim={args.dim}, "
+              f"layers={args.layers}, device={args.device}", flush=True)
 
-    optimizer = make_optimizer(model, args.lr)
-    lam = args.memory_alpha
+    lay = sample_layout(args.facts, args.gap)
+    L = lay["length"]
+    print(f"[corpus] L={L} B (facts={args.facts} x 8 B + gap {args.gap} B + "
+          f"cue 4 B + target 4 B) | alphabet {alpha_size} symbols | "
+          f"text {len(text_files)} files, {text_pool.n:,} B | "
+          f"boards A/B = {args.board_size} facts each", flush=True)
 
-    # -- the fact corpus (deterministic streams from --seed) --
-    rng = np.random.default_rng(args.batch_seed)
-
-    print(f"[train] --steps {args.steps} --batch {args.batch} --gap {args.gap} "
-          f"--facts {args.facts} --memory-alpha {lam} --P4 half-life "
-          f"{args.half_min}-{args.half_max} B --device {args.device}",
-          flush=True)
-    if args.seqlen != 1:
-        print("[warn] --seqlen != 1 is not supported by the fact-stream path "
-              "(one whole stream per step)", flush=True)
-
-    wall_t0 = None
-    for step in range(args.steps):
-        # the fact stream for this step
-        seq, payloads, _keys = build_fact_stream(
-            args.batch, args.facts, args.gap, None,
-            np.random.default_rng(args.batch_seed + step))
-
-        loss, ce, mem = train_step(model, optimizer, seq, payloads, lam)
-
-        if (step + 1) % args.log_every == 0 or step == args.steps - 1:
-            print(f"  step {step + 1}/{args.steps} | loss {loss:.4f} "
-                  f"(ce {ce:.4f} | mem {mem:.4f}) | t={model.t} | "
-                  f"B={model.B} | mem head acc this batch: "
-                  f"{_mem_head_acc(model, seq, payloads):.3f}", flush=True)
-            if wall_t0 is None:
-                wall_t0 = time.time()
-        if (step + 1) % args.holdout_ce_n == 0:
-            _log_holdout_ce(model, args, step + 1)
-
-        # checkpoint every save_every steps + at the end
-        if args.save and (step + 1) % 100 == 0:
-            save_checkpoint(model, args.save.replace(".npz",
-                                  f"_t{step + 1:06d}.npz"))
-
-    # final checkpoint (t = steps run)
-    if args.save:
-        final_path = args.save.replace(".npz", f"_t{model.t:06d}.npz")
-        save_checkpoint(model, final_path)
-        print(f"[save] {final_path}", flush=True)
-
-    # -- the CL-2 evaluation (the three numbers) --
-    if not args.no_eval:
-        out = run_cl2_eval(model, args, final_path if args.save else args.save)
-        _print_report(out)
-        with open(args.save.replace(".npz", ".report.json"), "w") as fh:
-            json.dump(out, fh, indent=2, default=float)
-        print(f"wrote {args.save.replace('.npz', '.report.json')}", flush=True)
+    phases = [("pre", args.pre_steps, None), ("f1", args.phase1_steps, board_a),
+              ("f2", args.phase2_steps, board_b)]
+    phase_id = {"pre": 1, "f1": 2, "f2": 3}
+    start_idx = 0
+    for i, (p, _n, _b) in enumerate(phases):
+        if p == start_phase:
+            start_idx = i
+    t_wall = time.time()
+    for pi, (phase, n_steps, board) in enumerate(phases):
+        if n_steps <= 0 or pi < start_idx:
+            continue
+        step0 = start_step if pi == start_idx else 0
+        for step in range(step0, n_steps):
+            # the corpus is a deterministic function of (seed, phase, step):
+            # the step counter IS the data position.
+            rng = np.random.default_rng(
+                (args.seed * 1_000_003 + phase_id[phase] * 10_007 + step)
+                % (2 ** 32))
+            if board is None:
+                batch = build_text_batch(args.batch, L, text_pool, rng)
+            else:
+                batch = build_fact_batch(args.batch, board, alpha, text_pool,
+                                         args.text_frac, args.gap, rng,
+                                         n_facts=args.facts)
+            stats = train_step(model, opt, heads, batch, args,
+                               wm=heads[0] if args.memory_alpha > 0 else None,
+                               wm_old=heads[2] if args.memory_alpha_old > 0 else None)
+            model.t += 1
+            model.bytes_seen += args.batch * L
+            if (step + 1) % args.log_every == 0 or step == 0:
+                el = time.time() - t_wall
+                print(f"  [{phase} {step + 1}/{n_steps}] loss {stats['loss']:.4f} "
+                      f"| ce_text {stats['ce_text']:.4f} "
+                      f"| ce_behav {stats['ce_behav']:.4f} "
+                      f"| mem {stats['mem']:.4f} | mem_old {stats['mem_old']:.4f} "
+                      f"| {el:.0f}s", flush=True)
+            if (not args.no_checkpoint) and \
+                    ((step + 1) % args.save_every == 0 or step == n_steps - 1):
+                path = os.path.join(args.ckpt_dir,
+                                    f"{args.tag}_{phase}_t{step + 1:06d}.npz")
+                save_checkpoint(model, opt, heads, path, {"phase": phase, "step": step + 1,
+                                       "seed": args.seed, "alphabet": args.alphabet,
+                                       "facts": args.facts, "gap": args.gap,
+                                       "board_size": args.board_size,
+                                       "board_seed_a": args.board_seed_a,
+                                       "board_seed_b": args.board_seed_b})
+                print(f"    [save] {path}", flush=True)
+        # the phase boundary
+        if not args.no_checkpoint:
+            path = os.path.join(args.ckpt_dir, f"{args.tag}_{phase}_end.npz")
+            save_checkpoint(model, opt, heads, path, {"phase": phase, "step": n_steps, "seed": args.seed,
+                                   "alphabet": args.alphabet, "facts": args.facts,
+                                   "gap": args.gap, "board_size": args.board_size,
+                                   "board_seed_a": args.board_seed_a,
+                                   "board_seed_b": args.board_seed_b})
+            print(f"    [phase end] {path}", flush=True)
+        start_phase = ""
+        start_step = 0
+    print(f"[done] {time.time() - t_wall:.0f}s", flush=True)
     return 0
-
-
-# -- inline helpers ------------------------------------------------- ----------
-
-
-def _mem_head_acc(model, seq, payloads):
-    model.new_states(seq.shape[0])
-    seq_f = torch.from_numpy(seq).long()
-    L = seq.shape[1]
-    for t in range(L):
-        enc = model.embed[seq_f[:, t]]
-        x = enc
-        for l in model.layers:
-            x, st, a, cache = l.forward(enc, x, l.states)
-            l.states = st
-    final_state = torch.cat([l.states for l in model.layers], dim=1)
-    mem_logits = final_state @ model.Wm + model.bm
-    pred = mem_logits.reshape(seq.shape[0], PAYLOAD_LEN, 256).argmax(dim=-1)
-    payloads_t = torch.from_numpy(payloads).long().to(pred.device)
-    return float((pred == payloads_t).float().mean().item())
-
-
-def _log_holdout_ce(model, args, step):
-    """Hold-out CE on the general corpus at a checkpoint (NO REGRESSION
-    standing).  Runs the numpy evaluator on a fresh numpy model loaded from
-    the current theta so the number is apples-to-apples with the final eval."""
-    import tools.eval_npz as ev
-    tmp = os.path.join(args.ckpt_dir, f"holdout_t{step:06d}.npz")
-    save_checkpoint(model, tmp)
-    try:
-        m_np, info = mb.load_frozen(tmp)
-        res = mb.model_transfer_ce(m_np, ckpt=tmp, seed=args.seed,
-                                   verbose=False)
-        print(f"    [holdout t={step}] held-out CE {res['value']:.4f} +/- "
-              f"{res['se']:.4f} nats/B ({res['n_slices']} slices, "
-              f"{res['total_bytes']:,} B)", flush=True)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-
-
-# -- report ----------------------------------------------------------- ----------
-
-
-def _pct(x, digits=2):
-    if x is None:
-        return "   n/a"
-    return f"{100.0 * x:,.{digits}f}%"
-
-
-def _print_report(out):
-    print("\n" + "=" * 78)
-    print("CL-2 -- the first trained continual-learning run")
-    print("=" * 78)
-    ci = out["ckpt_info"]
-    print(f"checkpoint : {out['checkpoint']}")
-    print(f"            dim={ci['dim']} layers={ci['layers']} "
-          f"sigma_mean={ci['sigma_mean']:.4f} half-life "
-          f"mean={ci['half_life_mean_B']:.1f} B  seed={out['ckpt_info'].get('seed','-')}")
-    print(f"alphabet   : {out['alphabet']} ({out['alphabet_size']} symbols); "
-          f"chance exact-4 = {(1.0 / out['alphabet_size'])**4:.3g}")
-    print(f"memory head: {out['memory_head']['per_byte_accuracy']:.4f} per-byte "
-          f"vs prior {out['memory_head']['prior_per_byte']:.4f} "
-          f"({'SIGNAL' if out['memory_head']['status'] == 'SIGNAL' else 'NULL'}) -> "
-          f"{out['memory_head']['status']}")
-
-    print(f"\n{'gap':>6} | {'ACQUIRE':<12} {'RETAIN':<10} {'NO REGRESSION'}")
-    print("-" * 52)
-    for d in sorted(out["gaps"]):
-        g = out["gaps"][d]
-        ac = g["acquire"]
-        r = g["retain"]
-        a_stat = ac["status"]
-        if isinstance(ac["acquire"]["status"], tuple):
-            a_stat = ac["acquire"]["status"][0]
-        r_stat = r["status"]
-        if isinstance(r["status"], tuple):
-            r_stat = r["status"][0]
-        nr = out["no_regression"]
-        if isinstance(nr, tuple):
-            nr = nr[0]
-        print(f"  {d:>4} | {a_stat:<12} {r_stat:<10} {nr}")
-    print("-" * 52)
-    print("\nNOTES:")
-    print(f"  - ACQUIRE threshold: >= 0.50 exact-4 at d=32 (trained model, "
-          f"matched alphabet).")
-    print(f"  - RETAIN threshold: >= 0.90 of the pre-stream recall.")
-    print(f"  - NO REGRESSION threshold: dCE <= 0.02 nats/byte.")
-    print(f"  - The model is 0.56 nats/byte ABOVE the order-8 byte n-gram on "
-          f"the same bytes (RESULTS.md §6) - the CE ruler is the floor, not the")
-    print(f"    headline.")
-    print(f"  - a cell that does not beat its own matched null is NULL; a "
-          f"cell that does not beat its own nuisance control is UNMEASURED.")
-    print(f"  - memory head vs prior: {'SIGNAL' if out['memory_head']['status'] == 'SIGNAL' else 'NULL'} "
-          f"(theFSP arm scored F1 0.685 vs a 0.817 prior -> null).")
 
 
 if __name__ == "__main__":

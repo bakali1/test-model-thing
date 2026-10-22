@@ -217,7 +217,7 @@ it is incidental and the fix is mechanical.
 | R1 | `gpu_port.py:1623` (compiled path) `w.mul_(dec[None, None, :])` | decay broadcast over `(B,K,dim)` | (iii) | **nothing arithmetically.** `dec[:, None, :]` is the same elementwise product. Bit-identical in the ungated case. |
 | R2 | `gpu_port.py:1630` (triton path) `w.mul_(dec[None, None, :])` | same | (iii) | same as R1. |
 | R3 | `gpu_port.py:1640` (`full`, the portable reference) `w.mul_(dec[None, None, :])` | same | (iii) | same as R1. This is the path the bit-identity gates compare against, so it is the reference for any kernel change. |
-| R4 | `gpu_port.py:1583-1585` `if dec.dim() != 1: mode = "full"` (the grouped path's guard) | the grouped kernel needs a per-dim decay | (iii) | **already handled**: the code anticipates a per-sample `dec` and degrades to the portable path. Evidence that the change is smaller than the refusal implies. |
+| R4 | `gpu_port.py:1586-1590` `if dec.dim() != 1: mode = "full"` (the grouped path's guard) | the grouped kernel needs a per-dim decay | (iii) | **already handled**: the code anticipates a per-sample `dec` and degrades to the portable path. Evidence that the change is smaller than the refusal implies. |
 | R5 | `gpu_port.py:893-910` `_ring_credit_grouped_torch`, `w.mul_(dec[None, None, :])` at 906 | same | (iii) | same as R1; the path already refuses per-sample `dec` via R4. |
 | R6 | `gpu_port.py:442-465` `_NVRTC_RING_SRC` — `float wv = w[idx] * dec[d];` with the comment *"dec is (D,), NOT (B,D)"* | the raw pointer is indexed by **dim only** | **(i)** | **the fused nvrtc path is a hard blocker for a per-sample `dec`.** Fix: `dec[b*D+d]` plus a contiguous `(B,D)` decay on the call site. ~3 lines of CUDA. **Risk:** this is the 1.26× end-to-end winner path, and a wrong index is a silently wrong gradient, not a crash. Needs a bit-identity gate against the `full` path. |
 | R7 | `gpu_port.py:639-720` the grouped nvrtc kernel — `wv[u].x *= dec[d0];` (691-692, 711-712) | same | (i) | same as R6, for the `float4` and scalar variants (`d0` → `b*D + d0`). |
@@ -233,7 +233,7 @@ it is incidental and the fix is mechanical.
 | T2 | `gpu_port.py:283` `E.mul_(sig_hot[None, None, :])` (the unfused fallback) | same | (iii) | same as T1. |
 | T3 | `gpu_port.py:258-262` the nvrtc fused tail kernel `tmt_tail_fused` (`args=[E, sig_hot, g, out, B, V, H]`) | the raw pointer is indexed by **hot-dim only** (`sig[h]`) | **(i)** for the fused tail path | the kernel must index `sig[b*H+h]`; ~4 lines of CUDA + a contiguous `(B,H)` argument. The fallback (T2 + the einsum) is always correct — the kernel is a speed item, not a correctness item, *provided the fallback is used when the kernel is unavailable*. |
 | T4 | `tail_credit.py:93-160` the numba kernels `_tail_decay` / `_tail_credit` / `_tail_fused_decay_credit` (`ev[h] *= sig[h]`, `d = E[b,v,h] * sig[h]`) | same | **(i)** for the fused path | same as T3; the numba path is the CPU's "fused" equivalent and the CPU parity path. |
-| T5 | `gpu_port.py:144-145` `hot_from_np(sigmas, ring_k, hot_frac) = sigmas ** ring_k > hot_frac`; `gpu_port.py:169-175` (mask + cols); `tail_credit.py:181-183` `hot_from` | the hot set is a **per-dim** function of the **decay logits** | **(i)** | **The second half of the real blocker.** Under a two-sided gate, hotness is per-stream and time-varying. Either the set becomes the union over the batch and is refreshed every step (cost: a per-step rebase, which `gpu_port.py:1912-1914`'s comment says was 99 % of GPU step time when it ran per step), or the retention gets a per-dim ceiling. |
+| T5 | `gpu_port.py:144-145` `hot_from_np(sigmas, ring_k, hot_frac) = sigmas ** ring_k > hot_frac`; `gpu_port.py:169-175` (mask + cols); `tail_credit.py:181-183` `hot_from` | the hot set is a **per-dim** function of the **decay logits** | **(i)** | **The second half of the real blocker.** Under a two-sided gate, hotness is per-stream and time-varying. Either the set becomes the union over the batch and is refreshed every step (cost: a per-step rebase, which `gpu_port.py:1925-1928`'s comment says was 99 % of GPU step time when it ran per step), or the retention gets a per-dim ceiling. |
 | T6 | `tail_credit.py:186-224` `sync()` — rebuilds the hot set every `REBASE_EVERY` steps, adopts/drops dims, seeds newly-hot dims from the ring | the hot set changes slowly | **(i)** under a two-sided gate | a stale hot set double-counts a dim that has just become hot (ring + tail) *and* leaves a dim hot-by-σ cold-by-`a` on the ring where it is truncated at `K`. |
 | T7 | `tail_credit.py:225-240` `_seed_from_ring` (`np.add.at(E, (bidx, ids[:,k,None], hh), w[:,k,:])`); `gpu_port.py:205-218` `TorchTail.sync` (`ring_ws_t[l][:, :, adopt_t]`, `ring_b_t[:, k]`) | the ring's weights are per-stream | **(iii)** | **nothing** — both seed the tail's `E` from the ring's *per-stream* weights, which under a per-sample `a` already carry the per-sample survival products. Correct as written. |
 | T8 | `gpu_port.py:2189` / `numpy_port.py:575` `sig_hot = dec[self.tail.cols_of(i)]` | `dec` is `(dim,)` ⇒ `sig_hot` is `(H,)` | **(i)** | must become `dec[:, cols]` ⇒ `(B, H)`; the tail's `begin_step`/`credit` then take a per-sample `sig_hot`. One line at each call site. |
@@ -364,8 +364,8 @@ measurable.
   **and** the ring's `w` must no longer be the whole story — the credit is no
   longer a pure function of `w`, so the fused nvrtc ring kernel needs a second
   pointer and a new index (`R6` becomes a bigger change);
-* the tail's `add_byte` must add `wt` instead of `1.0` (`tail_credit.py:133,
-  154` and `gpu_port.py:290-294`), and the dense path's `E[ar,c,:] += 1.0`
+* the tail's `add_byte` must add `wt` instead of `1.0` (`tail_credit.py:282-287`
+  and `gpu_port.py:286-292`), and the dense path's `E[ar,c,:] += 1.0`
   likewise;
 * a **new gradient**: `∂L/∂gate` for a write weight needs its own trace
   (`wt_trace_t = a_t·wt_trace_{t-1} + (∂g_t/∂θ)·e_t`) — the same shape as the
@@ -416,7 +416,7 @@ logit remains the ceiling; the gate provides the dynamic range below it).
 **c‴ — re-derive the credit on the ring with a per-stream hot set.**
 Theoretically the most faithful (the hot set becomes
 `{d : max_b a_{b,d}^K > HOT_FRAC}`, refreshed every step) but it costs a
-per-step rebase (the engine's own comment, `gpu_port.py:1912-1914`, records a
+per-step rebase (the engine's own comment, `gpu_port.py:1925-1928`, records a
 per-step sync at 99 % of GPU step time), a per-stream mask (R9), and a hot set
 whose union can grow toward `dim` — at which point the tail *is* the dense
 trace, with the dense memory bill and none of the dense path's simplicity.
