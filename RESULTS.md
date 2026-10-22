@@ -5466,3 +5466,96 @@ a readout is fitted, **the split must be over the things the readout could
 memorise** — here, over the board facts, not over the rows. **And every
 ridge cell in the ruler should be re-run with the fact-level split before
 it is believed.**
+
+### 23. ARM H1: WITH THE HEAD'S TABLE REMOVED, THE STATE DOES NOT LEARN TO CARRY THE PAYLOAD. (2026-10-22)
+
+§22 concluded that the recurrent state carries the **address** and the
+weights carry the **content**, and that the CL-2 failure is a
+**training-signal** failure — the state was never asked. That predicted a
+cheap, decisive experiment: **remove the head's table from the equation
+and see whether the state can do the job.** It was run.
+
+**THE ARM.** `tools/cl2_train.py --head-frozen`: the memory head is held at
+its random initialisation, so it is a **fixed random readout** of the state
+at the cue and **cannot accumulate a key→payload table**. The only way to
+reduce the memory loss is to **write the payload into the state**. The
+probe was cut short to fit the session's stop: 60 pre + 25 f1 steps at
+batch 32, with `--head-eval-fresh` (the head re-randomised at eval) also
+implemented. Log: `docs/results/cl2/H1probe.log`.
+
+**THE RESULT — the memory loss does not move at all.**
+
+| f1 step | H1 (head FROZEN) `mem` | H1 `head` | armA (head trainable) `mem` | armA `head` |
+|---:|---:|---:|---:|---:|
+| 1 | 6.0844 | – | 5.9234 | 0.002/0.000 |
+| 12 | 5.8716 | 0.008/0.000 | – | – |
+| 13 | 5.8607 | 0.000/0.000 | – | – |
+| 15 | 5.8862 | 0.000/0.000 | – | – |
+| 17 | 5.8770 | 0.008/0.000 | – | – |
+| 18 | 5.7681 | 0.008/0.000 | – | – |
+| 19 | 5.9912 | 0.000/0.000 | – | – |
+| **25** | – | – | **1.4057** | 0.542/0.117 |
+| **50** | – | – | **1.0041** | 0.676/0.238 |
+
+**armA's memory loss falls 4.5 nats in 25 steps. H1's does not fall at
+all in 19** — it sits at ~5.9, which is *above* the uniform level
+(`ln 256 = 5.5452`). **The entire drop in armA was the head's table being
+fitted. With the table removed, the state does not learn to carry the
+payload.**
+
+**THE CAVEAT, STATED PLAINLY: 19 STEPS IS SHORT, AND THIS IS A STRONG
+SIGNAL, NOT A PROOF.** armA's drop happened over 25–50 steps, and H1 was
+cut at 19. The honest claim is: **there is no downward trend whatsoever in
+19 steps, where armA had already fallen 4.5 nats by step 25.** The
+conclusive version is a 500-step H1 arm, and it is the first thing the
+next session should run. It is cheap: 500 steps at batch 32 is ~45 minutes.
+
+**AND THE GATED ARM (armG) CONFIRMS THE MECHANISM FROM THE OTHER SIDE.**
+`docs/results/cl2/armsG.log`, 60 pre + 120 f1 + 60 f2 at batch 32:
+
+| | f1 10 | f1 40 | f1 70 | f1 90 | f1 120 | f2 60 |
+|---|---:|---:|---:|---:|---:|---:|
+| `gate` (mean/max) | 0.0056/0.0330 | 0.0076/0.0496 | 0.0093/0.0650 | 0.0104/0.0773 | 0.0120/0.0887 | **0.0153/0.1124** |
+| `mem` | 3.1689 | 2.2096 | 1.6726 | 1.7119 | **1.5259** | 2.4188 |
+
+**M1's ANSWER: THE GATE ENGAGES.** It starts at exactly 0.0000 (so the
+arm's start is bit-identical to the incumbent) and grows steadily and
+monotonically through the fact phases, to a mean of 0.0153 and a max of
+0.1124. **The gate is not inert** — which is a real, publishable positive
+about P3's mechanism. **But the arm's `mem` still falls to 1.5259 with a
+TRAINABLE head**, i.e. the same table-shaped solution: a moving gate does
+not stop the model from routing the memory through the head.
+
+**AND THE FACT-SPLIT RULER RUN CONFIRMS §22 IN THE INSTRUMENT ITSELF**
+(`armA_ruler_factsplit.log`, the ruler re-run with `--split-by-fact`):
+
+```
+ACQUIRE[ridge]         per_byte 10.35% | exact4  0.00% | nuisance NULL | copy-control NULL | UNMEASURED
+ACQUIRE[head]          per_byte 96.97% | exact4 89.06% | nuisance NULL | copy-control SIGNAL | MEASURED
+ACQUIRE[ridge_heldout] per_byte 10.16% | exact4  0.00% | nuisance NULL | copy-control NULL | UNMEASURED
+ACQUIRE[head_heldout]  per_byte 10.11% | exact4  0.00% | nuisance NULL | copy-control NULL | MEASURED
+RETAIN[head ]  pre 96.44% | post 19.78% | ratio 0.205 | MEASURED
+RETAIN[ridge]  pre 13.78% | post 11.81% (NULL) | ratio 0.857 | UNMEASURED
+[retain lag] 36 B behind the cue (the horizon is 128 B): inside
+```
+
+**With the split over facts, the ridge readout is UNMEASURED on both
+boards (exact-4 = 0.00%) while the head scores 89.06% exact-4 on board
+B.** The instrument now says the same thing the standalone probe did.
+
+**WHERE THIS LEAVES THE PROGRAMME, IN ONE PARAGRAPH.** The recurrent state
+can carry an **address** (the key) and the weights can carry a **table** of
+key→payload. Neither is the store the goal needs. The H1 probe says the
+state **cannot be taught to carry the payload** under CL-2's objective —
+at least not in 19 steps, and not at all through the path the objective
+makes easy. **So the programme's next architecture is not a bigger state
+and not a better write: it is a store that is neither a copy nor a table —
+a content-addressed slot memory with learned addressing, where a fact is
+written ONCE at a key and read MANY times without evicting its neighbours.
+** That is also what D5's delayed-copy model implies (its state DOES carry
+a payload, with its copy control collapsing) — **so the state is not
+incapable, it is untrained for the job.** The next arms are: (a) a longer
+H1 (500 steps) to make the negative conclusive; (b) a **D5-style copy
+circuit trained explicitly** inside the CL-2 arm (a loss that asks the
+state to carry the payload, with the head's table removed); and (c) the
+content-addressed store.

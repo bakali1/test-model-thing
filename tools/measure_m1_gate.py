@@ -81,10 +81,17 @@ def load_params(m, path):
 
 
 def measure(m, seq, gate_scale, seed=0):
-    """One forward over the sequence, collecting `a` per layer."""
+    """One forward over the sequence, collecting `a` per layer.
+
+    gate_scale < 0 means: KEEP the gate the checkpoint carries (the TRAINED
+    gate) -- that is the M1 number that matters: the per-sample spread of
+    `a` with the gate the arm actually learned.
+    """
     g = torch.Generator().manual_seed(seed)
     for l in m.layers:
-        if gate_scale == 0.0:
+        if gate_scale < 0:
+            pass                      # the checkpoint's own (trained) gate
+        elif gate_scale == 0.0:
             l.gate = torch.zeros(m.dim, dtype=F, device=m.device)
         else:
             v = torch.randn(m.dim, generator=g, dtype=F)
@@ -198,7 +205,10 @@ def main():
         res = measure(m, seq, scale, seed=args.seed)
         rows[scale] = res
         last = res[-1]
-        print(f"\n  gate RMS = {scale:g}")
+        gr = last["gate_rms"]
+        print(f"\n  gate RMS = {scale:g}"
+              + (f"  (the CHECKPOINT's own trained gate: RMS {gr:.4e}, "
+                 f"max {last['gate_abs_max']:.4e})" if scale < 0 else ""))
         print(f"    {'layer':>5} | {'a mean':>9} {'between':>11} "
               f"{'within':>11} {'B/W ratio':>10} | {'across-samp/':>13} "
               f"{'across-time':>12}")

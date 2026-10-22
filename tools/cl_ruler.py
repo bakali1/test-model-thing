@@ -698,12 +698,14 @@ def make_cell_factsplit(name, X, Y, tr, te, seed, alpha_size, note=None,
     n_exact, n_pb, n_se, n_lam = mb._ridge_score(Xtr, ytr[perm], Xte, yte[perm],
                                                   lams=LAMS, seed=seed)
     cov = coverage_report(Y, tr, te, alpha_size)
+    split_def = ("FACT-LEVEL (disjoint over board facts): fit rows = target "
+                 "fact's board index < board_size//2; test rows = >= half. "
+                 "Rows share facts on a finite board; a row-level split would "
+                 "leak the board table.")
     out = {
         "cell": name, "n": int(X.shape[0]),
         "readout": "mb._ridge_score (imported, unmodified), FACT-LEVEL split",
-        "split": ("over BOARD FACTS: the fit rows are the ones whose target "
-                  "fact's board index is in the first half of the board, the "
-                  "test rows the other half"),
+        "split": split_def,
         "per_byte": float(per_byte), "exact4": float(exact),
         "se": float(se), "lam": float(lam),
         "se_per_byte": float(math.sqrt(max(per_byte * (1 - per_byte), 0.0)
@@ -716,6 +718,8 @@ def make_cell_factsplit(name, X, Y, tr, te, seed, alpha_size, note=None,
         "label_alphabet_size": int(alpha_size),
         "chance_per_byte": 1.0 / alpha_size,
         "chance_exact4": (1.0 / alpha_size) ** Y.shape[1],
+        "setting": {"split": split_def, "split_type": "fact_level",
+                    "split_over": "board_facts"},
     }
     if note:
         out["note"] = note
@@ -803,8 +807,11 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
         X = states_at_cue(models["post"], seq)
         Y = stream["payloads"][:, args.facts - 1].astype(np.int64)
         c = ridge_cell(cname, X, Y, stream, note=bnote)
-        c["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                             board=bname, readout="ridge (mb._ridge_score)")
+        setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                       board=bname, readout="ridge (mb._ridge_score)")
+        if isinstance(c.get("setting"), dict):
+            setting.update(c["setting"])
+        c["setting"] = setting
         cells.append(c)
         hc = make_head_cell(cname + "_head", X, Y, heads["post"][0],
                             heads["post"][1], args.seed, alpha_size,
@@ -829,8 +836,10 @@ def run_gap_trained(models, heads, d, args, alpha, boards, prior_byte,
                                 "the model's weights.  A readout that beats "
                                 "its null here is a leak, not a memory.",
                            expect_signal=False)
-        cn["setting"] = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
-                              board=bname, readout="ridge (mb._ridge_score)")
+        setting = dict(setg, lag_bytes=int(d), lag_bytes_cue=lag_cue,
+                       board=bname, readout="ridge (mb._ridge_score)")
+        if isinstance(cn.get("setting"), dict): setting.update(cn["setting"])
+        cn["setting"] = setting
         cells.append(cn)
         hn = make_head_cell(cname + "_nuisance_head", Xn, Y, heads["post"][0],
                             heads["post"][1], args.seed, alpha_size,
