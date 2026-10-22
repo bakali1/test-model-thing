@@ -5375,3 +5375,94 @@ and the held-out CE must be within 0.05 nats/B of the board-512 arm's.
 **armB answers a DIFFERENT question from A5** and the two must be reported
 separately: armB is "does the **MEMORY loss** cost text" (it also spends
 2000 steps on fact streams); A5 is "does the **FACT TRAINING** cost text".
+
+### 22. CORRECTION to §20/§21: THE STATE CARRIES THE ADDRESS, NOT THE CONTENT. The ridge's "generalisation" was a TABLE.
+
+**The measurement that produced this** is `tools/state_fact_capacity.py`
+(gate: `tests/check_state_capacity.py`), run on `armA_f2_end.npz` with
+**n = 1024**, on boards C (never trained) and B (trained), reading the
+state at the cue and fitting a ridge readout **per fact slot**, with the
+FIT/TEST split taken **over BOARD FACTS** — facts 0-255 fitted, facts
+256-511 tested — so a board fact can never appear on both sides. Raw
+output: `docs/results/cl2/factcap.log`.
+
+| board | fact slot | per-byte | null | **exact-4** | copy control |
+|---|---:|---:|---:|---:|---|
+| C (never trained) | 0 | 0.0928 | 0.0563 | **0.0000** | NULL |
+| C | 1 | 0.0960 | 0.0585 | **0.0000** | NULL |
+| C | 2 | 0.0807 | 0.0663 | **0.0000** | NULL |
+| C | 3 | 0.0728 | 0.0698 | **0.0000** | NULL |
+| B (trained) | 0 | 0.0846 | 0.0520 | **0.0000** | NULL |
+| B | 1 | 0.0968 | 0.0545 | **0.0000** | NULL |
+| B | 2 | 0.0872 | 0.0641 | **0.0000** | NULL |
+| B | 3 | 0.1041 | 0.0705 | **0.0000** | NULL |
+
+chance: 0.0625 per byte, 1.53e-05 exact-4. **Every cell is 0.0000 exact-4.**
+
+**THIS CORRECTS §20 AND §21.** The ruler's ridge readout scored 0.3828 /
+0.1953 exact-4 on board C — facts the model was **never trained on** —
+which §20 and §21 read as "the state holds a copy of the payload, and it
+is generic to unseen facts". **It is not.** The ruler's ridge splits over
+**ROWS**, and the rows share board facts, so the readout could (and did)
+memorise a **table over the board**: the state supplies the **index** (the
+key) and the readout's weights supply the **content**. The fact-level
+split removes the table and **the signal vanishes**.
+
+**SO THE CORRECTED PICTURE IS SHARPER, AND IT UNIFIES EVERYTHING:**
+
+> **The recurrent state carries the ADDRESS — the key — durably and
+> generically, even for facts the model was never taught. The CONTENT —
+> the payload — lives only in the WEIGHTS, in a table.** And the table
+> holds the facts it was trained on and nothing else, which is exactly why
+> board B's 512 entries overwrote board A's and RETAIN is 0.0022.
+
+Two of §21's rows were therefore wrong: the state does **not** hold a
+copy of the payload, and the ridge's "RETAIN ratio 0.985" was a refit
+artefact, not a mechanism. (That half of §21 was already flagged as a
+refit; this measurement settles it.)
+
+**AND NOW THE D5 RESULT EXPLAINED.** D5's model — trained on a
+delayed-copy task — demonstrably **does** hold a decodable payload in its
+state (19.2x over null at 8 B, and its copy control collapses to chance,
+so it is not a copy of the input). The CL-2 model does **not**. Same
+architecture, same state size. The difference is the **loss**: D5's
+objective asked the state to carry the payload; **CL-2's objective never
+did.** The memory loss `state_cue @ wm` is satisfied far more cheaply by
+fitting the *head's weights* to a table, and the gradient took that path.
+**So the CL-2 failure is a TRAINING-SIGNAL failure, not an architectural
+one** — the state was never asked.
+
+**WHICH MAKES THE DECISIVE EXPERIMENT CHEAP AND SPECIFIC. Train the CL-2
+arm with the head's TABLE removed from the equation** — the head is
+re-initialised at every step, or the memory loss is computed through a
+readout that cannot accumulate, or the head is replaced by a fixed random
+projection. Then the **only** way to reduce the memory loss is to write
+the payload into the state. Pre-registered:
+
+* the memory loss must fall **below the arm's 0.0200–0.0453** range
+  (i.e. the state really is carrying the payload, not the head);
+* with the head zeroed at eval, the head's exact-4 on board B must stay
+  **>= 0.50** (the pre-registered ACQUIRE threshold) — otherwise the
+  state is not carrying the payload and the copy circuit must be trained
+  (D5-style) first;
+* the head's exact-4 on board A (post) must rise by **>= 0.05** over
+  0.0020 — the RETAIN criterion;
+* the held-out CE must stay within **0.05 nats/B** of the ungated arm's
+  5.2037.
+
+**A FAILURE IS A RESULT AND IT IS WORTH HAVING:** if the memory loss
+cannot fall with the table removed, the state cannot carry the payload
+under this objective, the D5-style copy circuit must be trained
+explicitly, and the programme's next architecture is a **content-addressed
+store with learned addressing** — a third kind of store, neither a copy
+nor a table.
+
+**THE DISCIPLINE, FOR THE FOURTH TIME TONIGHT, AND THIS TIME THE MISSING
+CONTROL WAS THE SPLIT.** A measurement's meaning is set by its controls:
+a missing copy control (§17), a missing nuisance control (§19), a missing
+criterion wiring (§20), and now **a split that let the readout memorise
+the board instead of generalising**. The fix is the same each time: when
+a readout is fitted, **the split must be over the things the readout could
+memorise** — here, over the board facts, not over the rows. **And every
+ridge cell in the ruler should be re-run with the fact-level split before
+it is believed.**
