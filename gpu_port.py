@@ -909,11 +909,15 @@ class GpuModel:
         #   grouped  -- the same arithmetic with NO atomics: the contending
         #               adds to a byte id are combined in the reference's row
         #               order first (see _NVRTC_GROUP_SRC)
-        #   auto     -- compiled on CUDA, full elsewhere (safe default)
+        #   auto     -- the FASTEST bit-identical path: nvrtc on CUDA (26.72
+        #                ms/step on a T4 against compiled's 33.68, with the
+        #                IDENTICAL loss), degrading to compiled if the NVRTC
+        #                kernel is unavailable and to full off CUDA.  The
+        #                resolution happens LAZILY in _ring_mode(), NOT here:
+        #                resolving it eagerly made the whole auto branch dead
+        #                code and left every default run on the slower
+        #                `compiled` path (see the 2026-10-21 fix).
         self.ring_credit = ring_credit
-        if self.ring_credit == "auto":
-            self.ring_credit = ("compiled"
-                                if str(device).startswith("cuda") else "full")
         self._compiled_ring_credit = None
         self._compile_failed = False
         self._ring_resolved = None
@@ -1257,21 +1261,20 @@ class GpuModel:
             return self._ring_resolved
         mode = self.ring_credit
         is_cuda = str(self.device).startswith("cuda")
-        if not is_cuda:
+        if mode == "auto":
+            # Resolved HERE and not in the constructor, because the decision
+            # needs the device capability and the NVRTC availability, and
+            # because the constructor used to resolve `auto` to `compiled`
+            # eagerly -- which made the nvrtc default unreachable and left
+            # every run on the 33.68 ms path instead of the 26.72 ms one.
+            if not is_cuda:
+                mode = "full"
+            else:
+                mode = "nvrtc" if _nvrtc_ring_kernel() else "compiled"
+        elif not is_cuda:
             # compiled/triton/nvrtc are all CUDA-only; `full` is portable.
             if mode in ("compiled", "triton", "nvrtc"):
                 mode = "full"
-        elif mode == "auto":
-            # The default is the FASTEST bit-identical path, not the first
-            # one that was written. Measured end to end on a T4 (the whole
-            # step_batch, 40 timed steps, a fresh model per arm):
-            #   full 35.46 ms/step | compiled 33.68 | nvrtc 26.72 | grouped 27.92
-            # with the IDENTICAL loss 7.58001 on all four -- the paths are the
-            # same arithmetic, so the faster one is free. The fused NVRTC
-            # kernel was already shipped (it is the only fused option below
-            # cc 7.0, where it measured 2.2-2.7x on an MX150); it was simply
-            # not the default where Inductor was available.
-            mode = "nvrtc" if _nvrtc_ring_kernel() else "compiled"
         if is_cuda and mode in ("compiled", "triton") and torch.cuda.is_available():
             major, _ = torch.cuda.get_device_capability()
             if major < 7:
