@@ -17,7 +17,7 @@ is how 14 plans produced 0 end-to-end wins.)
 |---|---|---|
 | `../README.md` | project entry point, how to run | **current** |
 | `../RESULTS.md` | the ruler and all measured results | **current — append-only** |
-| **`plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`** | **THE plan.** Continual learning as the goal; the three-number CL-RULER; the architecture as it actually is (16 readouts over one EMA bank); the size decision; CL-0…CL-5 with pre-registered falsifiers; the whole-programme kill criterion | **current — the only plan to read before an experiment** |
+| **`plans/PLAN-2026-10-21-CONTINUAL-LEARNING.md`** | **THE plan.** Continual learning as the goal; the three-number CL-RULER; the architecture as it actually is (16 readouts over one EMA bank); the size decision; CL-0…CL-6 with pre-registered falsifiers; the whole-programme kill criterion | **current — the only plan to read before an experiment** |
 | `plans/PLAN-2026-09-23-GPU.md` | the GPU port plan: engine, hub, correctness gate, week-1 order | **executed** — the port landed; the corpus axis is closed |
 | ~~`plans/PLAN-2026-09-25.md`~~ | next-day execution plan | **archived** → `plans/superseded/` |
 | ~~`plans/PLAN-2026-09-22.md`~~ | the original phase plan | **archived** → `plans/superseded/` |

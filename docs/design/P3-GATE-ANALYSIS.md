@@ -1,5 +1,36 @@
 # P3 gate — obstacle analysis (2026-10-22)
 
+> ### SUPERSEDED 2026-10-22 — the conclusion below is WRONG, and this note
+> is kept because the error is instructive.
+>
+> **This document moved the programme's lever to "the write's selectivity
+> (the P3 gate)". That move was a mistake, and it is now the reason the
+> plan needed rewriting.**
+>
+> **What was wrong.** The analysis rested on the reading that "the address
+> survives where the content decays" is the signature of an order-losing
+> weighted average, and therefore a write-selectivity problem. **It is not:
+> it is a CAPACITY result.** The address costs ~1 dim per fact and the
+> payload 4–16 dims per byte, so under capacity pressure the *cheap* thing
+> survives and the *expensive* thing is dropped. The state is **1.06×–4.06×
+> short** for ONE board of 512 facts (`tools/state_capacity_budget.py`).
+>
+> **And the move was beside the point anyway.** §22–§23 of `RESULTS.md`
+> show that **the state carries the ADDRESS and the weights carry the
+> CONTENT**: a fresh readout on the state, split over *board facts* rather
+> than rows, scores **exact-4 = 0.0000 in every cell**. The failure that
+> costs the criterion is **a table in the weights being overwritten**, which
+> a selective *state* write cannot reach.
+>
+> **The measurements below remain valid** — the dense-credit cost, the
+> gate's gradient, the throughput. **The conclusion does not.** And the
+> gate itself was measured afterwards: it **engages** (0.110 max) but is
+> **not selective** — its between-sample spread is **2.4e-05** of its
+> within-sample spread (M1), so it is a global per-dimension re-scaling.
+> **P3 is closed as a lever** (`RESULTS.md` §23).
+>
+> **The replacement is the plan's own §4/M2 — an explicit keyed store.**
+
 **Status:** analysis only. No repo file other than this one was changed; no
 training, no long job, no commit.
 

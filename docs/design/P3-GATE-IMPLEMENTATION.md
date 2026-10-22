@@ -1,5 +1,27 @@
 # P3 gate — implementation note and measurements (2026-10-22)
 
+> ### READ THIS FIRST (added 2026-10-22, after the measurements)
+>
+> **The implementation is sound and every number in it is valid.** The
+> dense-credit reassociation (12× on the contraction, 6.8× end to end,
+> measured against a float64 truth, with the dense-vs-ring bit-identity pin
+> honestly restated as a measured float32 floor) is real work and it
+> stands.
+>
+> **But the P3 LINE IS CLOSED AS A LEVER, and this document is now the
+> record of a closed line rather than a proposal.** `RESULTS.md` §23 and
+> M1/M6: the gate **engages** (it reaches 0.110 max) but is **not
+> selective** — its between-sample spread is **2.4e-05** of its
+> within-sample spread, so it is a global per-dimension re-scaling, not a
+> per-sample choice. **And a selective *state* write could not have fixed
+> the programme's failure anyway**, because the failure was **a table in
+> the weights being overwritten** (§22), not a state being overwritten.
+>
+> **The replacement is the plan's §4/M2 — an explicit keyed store** — plus
+> a training-signal arm (CL-6b: the D5-style copy circuit trained
+> explicitly). **The dense path is now 6.8× faster, so the arm that
+> matters — the keyed store — is affordable.**
+
 **Status:** implemented, gated, measured. No commit; the working tree is dirty
 on purpose.
 

@@ -566,7 +566,14 @@ reach >= 0.50 exact recall at d=32 the recurrent state cannot be trained to
 hold a fact" — the head's 0.975 is at the **read-out**, not yet at the
 **behaviour**, and the ruler's verdict governs.
 
-### CL-2b — THE TRAINING SIGNAL. (2026-10-22; rewritten three times; this is the current step)
+### CL-2b — THE TRAINING SIGNAL. (2026-10-22; rewritten three times; **the reasoning that CL-6 executes**)
+
+> **CL-2b is the RECORD of what was measured and what it means. It is not
+> the current step — CL-6 is.** CL-2b was rewritten three times in one
+> night, and each rewrite is a correction of the one before: it was
+> "the store", then "the training signal", then the measured result. The
+> section is kept whole because the sequence of corrections is the
+> argument.
 
 **What CL-2 measured** (`RESULTS.md` §20, §22; the ruler's raw output is
 `docs/results/cl2/armA_ruler.json` and the fact-capacity output is
@@ -805,6 +812,11 @@ flattens the `(n, 4)` payload targets, and the split then indexes only
 `idx ∈ [0, n)`, so **only payload byte 0 of each sample is ever decoded** —
 while the metric is published as *"fraction of exact 4-byte payload matches"*
 against a chance level of 2⁻³² (the true chance for byte 0 is 1/256).
+  *(AMENDED 2026-10-22: 2⁻³² is the FULL-BYTE figure and is wrong for
+  the matched 16-symbol alphabet, where the chance for a 4-byte payload is
+  16⁻⁴ = 1.53e-05. The same error survives in §8 and has been fixed there;
+  it is left visible here because it is the same class of error as D1 — a
+  number that is right for one setting and quoted for another.)*
 
 ⇒ **"The readout never beats its own control" → "the read path does not
 work" → the previous plan's pivot is NOT established.** It is an artifact of
