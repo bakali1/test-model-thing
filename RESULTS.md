@@ -5242,3 +5242,61 @@ never smaller. **The failure is certain; A5 now only quantifies it.** That
 frees the GPU for the arms that decide the *next* question, and the next
 question is no longer "is the text regression real" but **"what makes the
 head forget board A"**.
+
+### 21. THE SYNTHESIS: THE STATE HOLDS A COPY, THE HEAD HOLDS A TABLE, AND NEITHER SURVIVES A STREAM.
+
+Put the ruler's verdict (§20) next to the copy control (§17) and the fresh
+readout, and the programme's bottleneck is nameable in one sentence.
+
+| | what it holds | generic to unseen facts? | survives the next stream? |
+|---|---|---|---|
+| the **recurrent state** | a **COPY** of the payload that was in the input (readable by a *fitted* probe: 0.3828/0.1953 exact-4 on board C, never trained; collapses to NULL when the key AND payload are replaced) | **yes** — it is a copy circuit, so it works for any fact | **no** — a copy is overwritten/diluted by the next write (this is D5's "the content decays") |
+| the **trained head** | a **TABLE** of key->payload in the **weights** (0.9697/0.8906 exact-4 on board B; survives replacing the input's payload) | **no** — it only knows the facts it was trained on | **no** — board B's 512 entries overwrote board A's (RETAIN ratio 0.0022) |
+
+**So the two stores available are a copy and a table, and the programme's
+goal needs a THIRD KIND of store: one that is written once, read many
+times, and does not overwrite itself when a new fact arrives.** Neither
+the copy nor the table has that property, and that is why ACQUIRE passes
+and RETAIN is 0.0022 in the same run.
+
+**AND THE CAPACITY BUDGET SAYS A LINEAR-RECURRENT STATE CANNOT BE THAT
+STORE AT THIS BOARD SIZE.** The state is 8192 scalars and a linear-readable
+store of 512 facts needs 8 704 dims (optimal coding) or 33 280 (one-hot):
+**1.06x-4.06x short for one board.** So the answer is not "make the state
+bigger" — it is that a **recurrent linear state is the wrong KIND of
+object** for a store that must hold hundreds of facts at once. The store
+must change in kind: a **content-addressed slot store** (a key-value memory
+with learned addressing, so a write is placed at a key and never evicts
+another), or a much larger state, or a **read-only global table with
+protected capacity** (a table whose entries for old keys are not
+overwritten), or **replay**.
+
+**This retires one whole line and sharpens another.**
+* **RETIRED: "the state must hold the payload".** It does, for a copy, and
+  D5's copy control proves it for a sibling model. That was the premise of
+  the M1 / addressable-write line, and it is not the bottleneck.
+* **RETIRED: P3 (write selectivity in the recurrent state).** Selective
+  writing helps a *copy* survive longer, and D5's copy IS decaying. But
+  RETAIN's failure is not decay — it is **overwriting**: the head's table
+  lost board A entirely, 0.9644 -> 0.1978 per-byte, in a way that selective
+  *writes to the state* cannot touch, because the state was never the store.
+  **P3 was aimed at the wrong object.** (The M1 measurement is still worth
+  having — "does the gate engage at all" — but it is now a question about
+  the copy's lifetime, not about the programme's success criterion.)
+* **SHARPENED: the store.** The next arms are about the KIND and CAPACITY
+  of the store — a content-addressed slot store, a protected table, a
+  smaller board (the budget fits 64 facts per board in the existing state),
+  a bigger state, or replay. And the criterion's ACQUIRE must be board B
+  (§20), with the held-out board C reported beside it as the separate and
+  stronger claim.
+
+**WHAT THE PROGRAMME NOW BELIEVES, IN ONE PARAGRAPH.** A recurrent model
+can learn a fact and hold it well enough to recall it exactly
+(ACQUIRE: 0.89 exact-4 against a 0.002 null), and the same model, after
+one stream, has **lost every fact it knew before** (RETAIN: 0.0022) and
+has **very nearly stopped being a language model** (held-out CE 5.20
+against a unigram baseline of 5.55). The reason is not interference, not
+capacity, and not write selectivity: **it is that the only two stores the
+architecture has are a copy and a table, and neither is written once and
+read many times.** The next experiment is to build the third kind and
+measure it on the same three numbers.
