@@ -323,15 +323,51 @@ one per requirement):
 3. use a **matched alphabet** when an `exact` rate is wanted (16 symbols →
    21.3 %/byte, 4 symbols → 44.9 %/byte, both with their own nulls).
 
-### CL-2 — The first trained continual-learning run. (2 days, T4)
-Train on a synthetic fact stream with the fact **in the loss** — the
-"Selective-copy training run — not started" item from
-`RESPONSE-2026-10-06-EXTERNAL-CRITIQUE.md`. Plus a replay set of pre-stream
-facts to measure forgetting. This is the decisive experiment: it makes memory
-a **loss** instead of a probe.
-*Falsifier:* if after the agreed budget the trained model does not reach
-≥ 0.50 exact recall at d=32 (chance 2⁻³²), the recurrent state cannot be
-trained to hold a fact, and the in-state route (M1) is expensive for nothing.
+### CL-2 — The first trained continual-learning run. (2 days, T4) — **RUN 2026-10-22; the arm TRAINS**
+
+**Status (verified from the MX150 logs, 2026-10-22).** After the
+detached-leaf / `requires_grad` fixes (see `RESULTS.md` §16), the arm
+trains for the first time: `ce_text` fell **6.0684 -> 1.5886**, the memory
+head's accuracy reached **0.975 (new) / 0.910 (old)**, and the behavioural
+recall reached **0.999 / 0.994**. The earlier "CE = ln 256 = uniform"
+no-op is gone. **The question "can the recurrent state be trained to hold
+a fact?" now has an affirmative answer at the level of the read-out.**
+
+**The new finding, and the next problem.** The general held-out CE
+**regressed**: 2.9856 at the end of the `pre` (text-only) phase, 8.4117 at
+f1 step 100, 4.5938 at the end of f2. Against the plan's threshold
+(dCE <= 0.02 nats/B) that is a large regression, and it is the **only**
+thing standing between the arm and a PASS on all three numbers. The
+mechanism candidate is **interference at the shared output head**: in
+`tools/cl2_train.py:train_step` the behavioural loss `ce_behav` is computed
+on the **same logits** as the text CE, so the model's one output path must
+model natural text *and* emit an arbitrary 4-symbol payload, and the
+behavioural CE opened at **8.78 nats** when the fact phase began. The
+recovery from 8.41 to ~4.0-4.6 is consistent with the text path re-learning
+while the fact loss persists.
+
+**The copy confound, stated before it is forgotten.** `behav 0.999/0.994`
+and `head 0.975/0.910` are **not yet** proof of recall: the payload sits in
+the *input* 32 B before the cue, so a copy circuit could supply it — to the
+logits directly, and to the head through the state. The CL-RULER's matched
+nulls exist to separate this, and the arm is only a PASS if it beats them.
+
+**The next experiment is now CL-2b** (pre-registered, in
+`docs/design/CL2-INTERFERENCE-EXPERIMENT.md`): separate interference from
+fact-distribution-shift, with a matched control per candidate cause —
+`behaviour-weight` 1.0 vs 0.1, a fact-diluted batch, a **decoupled head**
+(the payload read by a separate readout instead of the shared logits), and
+`--memory-alpha 0` as the baseline.
+
+*Falsifier:* if the decoupled-head arm does **not** bring the held-out CE
+back within 0.05 nats/B of the matched control, then the regression is not
+output-head interference and the cause lies elsewhere (e.g. the facts'
+distribution, or the state itself being overwritten); the next lever moves
+to the write.
+*Original falsifier, now partly retired:* "if the trained model does not
+reach >= 0.50 exact recall at d=32 the recurrent state cannot be trained to
+hold a fact" — the head's 0.975 is at the **read-out**, not yet at the
+**behaviour**, and the ruler's verdict governs.
 
 ### CL-3 — The four ideas, on the ruler. (1 week, T4)
 Four arms, same seed / corpus / byte budget, judged **only** on the three
