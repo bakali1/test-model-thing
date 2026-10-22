@@ -109,6 +109,19 @@ closed.
 - **ACQUIRE** passes at ≥ 0.50 exact recall of a 4-byte payload at d=32
   (chance 2⁻³²) on a *trained* model; a probe on a frozen checkpoint is
   diagnostic, not a pass.
+  **ALPHABET CAVEAT (2026-10-21, measured):** this threshold is only
+  *measurable* with a **matched alphabet**, and the plan must say so. At the
+  full 256-symbol alphabet the D5 measurement gives a payload per-byte
+  accuracy of 12.11 % at 8 B and 2.25 % at 32 B, so the exact-4-byte rate is
+  `0.0225⁴ ≈ 2.6e-7` — a 0.50 exact rate is unreachable at 32 B by
+  arithmetic, whatever the model does. With a **16-symbol** alphabet the
+  same state gives 22.09 %/byte at 32 B, an exact-4 rate of 0.49 %, and
+  16⁻⁴ = 1.5e-5 as the chance. **So ACQUIRE is scored on a matched alphabet
+  (16 or 4 symbols, reported), and the alphabet size is part of the ruler
+  setting** — exactly as the SE and the sample count are. The full-256 run
+  is kept as the *upper* bound on the signal (it gave 19.2× over null, the
+  strongest ratio measured), and the matched-alphabet run is the one the
+  threshold applies to.
 - **RETAIN** passes at ≥ 0.90 of the pre-stream recall, measured on a
   **replayed** set of pre-stream facts that were *not* in the stream.
 - **NO REGRESSION** passes at ΔCE ≤ 0.02 nats/B on the general ruler.
