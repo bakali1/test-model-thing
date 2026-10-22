@@ -767,6 +767,16 @@ def main():
                          "Triton cannot run at all; triton = fused-kernel "
                          "fallback; nvrtc = NVRTC fused decay+credit+scatter, "
                          "the only fused path on pre-Volta GPUs (+33%% there)")
+    ap.add_argument("--fused-adam",
+                    choices=("auto", "on", "off"),
+                    default="auto",
+                    help="auto = single-kernel fused AdamW on CUDA when the "
+                         "NVRTC kernel compiles, else the bit-identical torch "
+                         "fallback; on = same but reports when it degrades; "
+                         "off = the incumbent ~25-30-pass inline AdamW. The "
+                         "fallback is bit-identical so CPU-only boxes and the "
+                         "MX150 are unaffected (cc 6.1 degrades to torch if "
+                         "NVRTC cannot compile).")
     ap.add_argument("--grad-assembly", choices=("cat", "loop"), default="cat",
                     help="cat = one fused gradient-buffer write (default, "
                          "bit-identical); loop = 69-copy reference for A/B")
@@ -997,6 +1007,7 @@ def main():
                 ring_k=args.ring_k, lr=args.lr, lr_decay=args.lr_decay,
                 decay_init=args.decay_init,
                 ring_credit=args.ring_credit,
+                fused_adam=args.fused_adam,
                 grad_assembly=args.grad_assembly,
                 sync_metrics=not args.async_metrics,
                 from_scratch=args.from_scratch, seed=args.seed,
@@ -1039,6 +1050,10 @@ def main():
         print(f"  [wd] the '.decay'/'.gate' groups get weight decay "
               f"{args.wd_decay} (default 0.01 = the incumbent's uniform "
               f"weight decay)")
+    if args.fused_adam != "auto":
+        print(f"  [adam] fused-adam={args.fused_adam} (auto = fused NVRTC "
+              f"kernel on CUDA when it compiles, else the bit-identical "
+              f"torch fallback)")
     if args.trace_mode == "dense":
         print("  [trace] dense (B,256,dim) embedding trace per layer: the "
               "ring and tail_credit are bypassed, so ring_k and its 256 "

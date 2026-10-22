@@ -47,6 +47,27 @@ RING_CREDIT_MODES = ("auto", "full", "compiled", "triton", "nvrtc", "grouped")
 # numpy-compatible algorithm and remains the production default.
 ALGORITHM_VERSION_LEGACY = 0
 
+# PLAN (fused AdamW, single-kernel):
+#   1. CPU fallback first: _adamw_torch() is the incumbent's inline update
+#      extracted verbatim (bit-identical on CPU / MX150 / no-GPU boxes).
+#   2. Fused kernel: _FUSED_ADAM_SRC, an NVRTC one-pass kernel launched via
+#      torch.cuda._compile_kernel + cuLaunchKernel (same pattern as the
+#      grouped ring credit). Constants are passed as a float32 device tensor
+#      because _CudaKernel.__call__ promotes Python floats to c_double.
+#   3. Gate: GpuModel(fused_adam="auto|on|off") resolving lazily to 'kernel'
+#      (CUDA + compiled) or 'torch' (bit-identical fallback); never raises.
+#   4. Flag: --fused-adam in train_gpu.py plumbed through Trainer -> GpuModel.
+#   5. Test: tests/check_fused_adamw.py pins fused vs numpy_port reference and
+#      CPU-fallback vs fused-path agreement.
+#
+# The incumbent update (~25-30 array passes) is fused into ONE kernel pass:
+#   m = b1*m + (1-b1)*g ; v = b2*v + (1-b2)*g*g ; v = sqrt(v)
+#   th -= lv * (m*bc1 / (v*bc2 + eps) + wv*th)
+# with identical op order / float32 rounding as numpy_port, so it is
+# bit-identical (max|Delta| = 0.0) when the kernel compiles.
+
+FUSED_ADAM_MODES = ("auto", "on", "off")
+
 
 def _sig(x):
     return torch.sigmoid(x)
@@ -103,12 +124,18 @@ class TorchTail:
     (see RESULTS.md, "factored tail bugs").
     """
 
-    def __init__(self, B, ring_k, hot_frac=HOT_FRAC, device="cpu", cap_gb=None):
+    def __init__(self, B, ring_k, hot_frac=HOT_FRAC, device="cpu",
+                 cap_gb=None, fused=False):
         self.B = B
         self.ring_k = ring_k
         self.hot_frac = hot_frac
         self.device = device
         self.cap_bytes = None if cap_gb is None else float(cap_gb) * 1e9
+        # Fused mode folds begin_step's decay into credit() so the (B,256,H)
+        # accumulator is read once per step instead of twice (3 passes -> 2).
+        # Callers skip begin_step and pass `sig_hot` to credit().
+        self.fused = bool(fused)
+        self._tail_nvrtc_warned = False
         self.cols = {}   # layer -> int64 tensor (H,) on device
         self.mask = {}   # layer -> bool (dim,) on device
         self.E = {}      # layer -> (B,256,H) fp32 on device
@@ -192,17 +219,68 @@ class TorchTail:
             self.E[l] = E
 
     def begin_step(self, layer, sig_hot):
+        # Deferred under fused mode: credit() does the decay in its single pass
+        # over E. A stray call here would double-decay, so no-op explicitly.
+        if self.fused:
+            return
         E = self.E.get(layer)
         if E is not None and sig_hot.numel():
             E.mul_(sig_hot[None, None, :])
 
-    def credit(self, layer, dlds):
-        """dlds (B,D) -> (256,H) fp32 (decayed E, lags>=1 exact)."""
+    def credit(self, layer, dlds, sig_hot=None):
+        """dlds (B,D) -> (256,H) fp32 (decayed E, lags>=1 exact).
+
+        Fused mode (self.fused and sig_hot given): decay + credit in ONE pass
+        over E (E*sig computed in place, then left-folded with g). Callers skip
+        begin_step and pass the per-hot-dim sigma here. Unfused (sig_hot=None):
+        credit from the E already decayed by begin_step."""
         E = self.E.get(layer)
         if E is None:
             return None
         cols = self.cols[layer]
         g = dlds[:, cols]                                # (B,H)
+        if self.fused and sig_hot is not None:
+            return self._fused_credit(E, g, sig_hot)
+        return torch.einsum("bvh,bh->vh", E, g)
+
+    def _fused_credit(self, E, g, sig_hot):
+        """ONE pass over E: decay in place AND accumulate the credit.
+
+        CPU: delegates to tail_credit._tail_fused_decay_credit through a
+        zero-copy numpy bridge (E is float32 contiguous), which is BIT-IDENTICAL
+        to the numpy reference. GPU: the tmt_tail_fused nvrtc CUDA kernel (1
+        read of E, one thread per (byte,hot-dim), left fold over b). If the
+        kernel is unavailable the call decays E in place and falls back to the
+        unfused einsum so correctness is never lost."""
+        if E.is_cuda:
+            kern = _nvrtc_tail_kernel()
+            if kern is not None:
+                B, V, H = E.shape
+                out = torch.zeros((V, H), dtype=F, device=E.device)
+                grid = (int(V), int(H), 1)
+                kern(grid=grid, block=(1, 1, 1),
+                     args=[E, sig_hot, g, out, B, V, H])
+                return out
+            if not self._tail_nvrtc_warned:
+                print("[tail_credit] fused CUDA kernel unavailable on this "
+                      "device; falling back to mul_+einsum (correct, 2 reads)",
+                      flush=True)
+                self._tail_nvrtc_warned = True
+        else:
+            # CPU: bit-identical to the numpy reference via the numba kernel.
+            if _tc._njit is not None:
+                # Zero-copy bridge: E/g/sig_hot are CPU float32 contiguous, so
+                # .numpy() shares storage and the kernel decays E in place.
+                g_c = g.contiguous()
+                sig_c = sig_hot.contiguous()
+                out = torch.zeros((E.shape[1], E.shape[2]), dtype=F,
+                                  device=E.device)
+                _tc._tail_fused_decay_credit(
+                    E.numpy(), sig_c.numpy(), g_c.numpy(), out.numpy())
+                return out
+        # Fallback: decay here (begin_step was skipped) then einsum. This is the
+        # unfused arithmetic; reads E twice but is always correct.
+        E.mul_(sig_hot[None, None, :])
         return torch.einsum("bvh,bh->vh", E, g)
 
     def add_byte(self, layer, c_arr):
@@ -451,6 +529,62 @@ def _nvrtc_ring_kernel():
     return _NVRTC_RING_KERNEL
 
 
+# NVRTC fused TAIL credit (cc-floor free; runs on cc 6.1+). The ring credit
+# already showed the pattern: one pass that reads w once, multiplies by the
+# decay, writes it back, and scatters. The tail has the same shape (decay +
+# credit) but NO scatter -- it reduces (B,H) of g into a (V,H) "out" per layer
+# via a per-(byte,hot-dim) left fold, and writes the decayed EMA back to E so
+# add_byte sees the decayed accumulator. One thread per (v,h) walks b in order
+# -- the reference's left fold -- so the only cross-backend variance is the
+# float32 vs float64 accumulator (the ring credit lives with the same ~1e-6).
+_NVRTC_TAIL_SRC = r"""
+extern "C" __global__
+void tmt_tail_fused(float* E, const float* sig, const float* g, float* out,
+                    int B, int V, int H) {
+    int v = blockIdx.x;            // 0..V (==256)
+    int h = blockIdx.y;            // 0..H (hot dims for this layer)
+    if (v >= V || h >= H) return;
+    float acc = 0.0f;
+    int vho = v * H + h;           // out[v,h] index
+    int stride_v = V * H;          // E stride for the b (stream) axis
+    for (int b = 0; b < B; b++) {
+        // E layout (B,V,H) C-contiguous: E[b,v,h] = E[b*V*H + v*H + h]
+        float d = E[b * stride_v + vho] * sig[h];   // decay (E*sig FIRST)
+        E[b * stride_v + vho] = d;                  // writeback decayed EMA
+        acc += d * g[b * H + h];                     // credit (E*sig)*g, left fold
+    }
+    out[vho] = acc;
+}
+"""
+_NVRTC_TAIL_KERNEL = None
+_NVRTC_TAIL_FAILED = False
+
+
+def _nvrtc_tail_kernel():
+    """Compile (once) and return the fused tail kernel, or None.
+
+    None is normal: like _nvrtc_ring_kernel, any JIT failure degrades to the
+    portable mul_+einsum path rather than killing a run. The kernel has no cc
+    floor, so it runs on the MX150 (cc 6.1)."""
+    global _NVRTC_TAIL_KERNEL, _NVRTC_TAIL_FAILED
+    if _NVRTC_TAIL_KERNEL is not None or _NVRTC_TAIL_FAILED:
+        return _NVRTC_TAIL_KERNEL
+    try:
+        if not hasattr(torch.cuda, "_compile_kernel"):
+            raise RuntimeError("torch.cuda._compile_kernel is unavailable")
+        if not _ensure_cuda_home():
+            raise RuntimeError("no CUDA_HOME and no bundled cuda_runtime headers")
+        _NVRTC_TAIL_KERNEL = torch.cuda._compile_kernel(
+            _NVRTC_TAIL_SRC, "tmt_tail_fused")
+    except Exception as exc:                     # pragma: no cover
+        _NVRTC_TAIL_FAILED = True
+        print(f"[tail_credit] nvrtc tail kernel unavailable "
+              f"({type(exc).__name__}: {str(exc).splitlines()[0][:90]}) -> "
+              f"falling back to mul_+einsum", flush=True)
+        return None
+    return _NVRTC_TAIL_KERNEL
+
+
 # ---------------------------------------------------------------------------
 # The GROUPED credit -- the legal way to take the contention out.
 #
@@ -668,6 +802,94 @@ def _nvrtc_group_kernels():
     return _NVRTC_GROUP_KERNEL, _NVRTC_GROUP_SCALAR_KERNEL
 
 
+# ---------------------------------------------------------------------------
+# FUSED ADAMW -- one kernel, one pass over the flat param buffer.
+#
+# The incumbent inline update (~25-30 array passes) is fused into a single
+# elementwise kernel:
+#
+#     m = b1*m + (1-b1)*g
+#     v = b2*v + (1-b2)*g*g
+#     th -= lv * (m*bc1 / (sqrt(v)*bc2 + eps) + wv*th)
+#
+# with the SAME op order and float32 rounding as numpy_port's update, so the
+# kernel is bit-identical to the torch fallback (max|Delta| = 0.0).
+#
+# The NaN guard and the global grad clip stay on the host (one reduction +
+# one sync each, exactly as the incumbent); the kernel only fuses the moment
+# and parameter updates. `bc1 = 1/(1-b1**t)` and `bc2 = 1/(1-b2**t)` are
+# host-side int t, computed in Python double then narrowed to float32 -- the
+# same narrowing torch applies when it multiplies a float32 tensor by a
+# Python scalar.
+#
+# NOTE: torch.cuda._CudaKernel.__call__ promotes Python floats to c_double
+# (8 bytes) and ints to c_int, so the float constants are passed as a single
+# float32 device tensor (c[0..6]) and `n` as an int -- never as bare Python
+# floats, which the launcher would mis-encode.
+_FUSED_ADAM_SRC = r"""
+extern "C" __global__
+void tmt_fused_adamw(float* __restrict__ th,
+                     const float* __restrict__ gr,
+                     float* __restrict__ m,
+                     float* __restrict__ v,
+                     const float* __restrict__ lv,
+                     const float* __restrict__ wv,
+                     const float* __restrict__ c,
+                     int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gr[i];
+    const float b1 = c[0], om1 = c[1];
+    const float b2 = c[2], om2 = c[3];
+    const float bc1 = c[4], bc2 = c[5], eps = c[6];
+    // m = b1*m + (1-b1)*g   (mul then add, same order as the torch inline)
+    const float mi = b1 * m[i] + om1 * g;
+    // v = b2*v + (1-b2)*(g*g)
+    const float gg = g * g;
+    const float vi = b2 * v[i] + om2 * gg;
+    const float vi_sqrt = sqrtf(vi);
+    // eps added AFTER bias correction, inside the role-LR bracket
+    const float denom = vi_sqrt * bc2 + eps;
+    const float adapt = (mi * bc1) / denom;
+    const float update = lv[i] * (adapt + wv[i] * th[i]);
+    th[i] = th[i] - update;
+    m[i] = mi;
+    v[i] = vi_sqrt;
+}
+"""
+
+_FUSED_ADAM_KERNEL = None
+_FUSED_ADAM_FAILED = False
+
+
+def _nvrtc_fused_adamw():
+    """Compile (once) and return the fused AdamW kernel, or None.
+
+    None is a normal outcome: no CUDA_HOME, no _compile_kernel, or any
+    NVRTC failure degrades to the bit-identical torch fallback rather than
+    killing a run. cc 6.1 (MX150) is supported because the kernel uses only
+    plain elementwise float32 (sqrtf, +, *, /) -- no intrinsics above
+    compute capability 1.0.
+    """
+    global _FUSED_ADAM_KERNEL, _FUSED_ADAM_FAILED
+    if _FUSED_ADAM_KERNEL is not None or _FUSED_ADAM_FAILED:
+        return _FUSED_ADAM_KERNEL
+    try:
+        if not hasattr(torch.cuda, "_compile_kernel"):
+            raise RuntimeError("torch.cuda._compile_kernel is unavailable")
+        if not _ensure_cuda_home():
+            raise RuntimeError("no CUDA_HOME and no bundled cuda_runtime headers")
+        _FUSED_ADAM_KERNEL = torch.cuda._compile_kernel(
+            _FUSED_ADAM_SRC, "tmt_fused_adamw")
+    except Exception as exc:                     # pragma: no cover
+        _FUSED_ADAM_FAILED = True
+        print(f"[fused_adam] nvrtc unavailable ({type(exc).__name__}: "
+              f"{str(exc).splitlines()[0][:90]}) -> falling back to torch",
+              flush=True)
+        return None
+    return _FUSED_ADAM_KERNEL
+
+
 def _ring_credit_grouped_torch(dest, w, dlds, hot_mask, rows, dec):
     """The portable (CPU) grouped credit: the same left fold, in torch.
 
@@ -738,6 +960,7 @@ class GpuModel:
                  grad_assembly="cat", seed=0, ring_k=None, distill_alpha=0.0,
                  ce_only=False, seqlen=1, gated=False, trace_mode="ring",
                  grad_clip=0.0, nan_guard=True, wd_decay=0.01,
+                 fused_adam="auto",
                  fsp_alpha=0.0, fsp_r=16, fsp_tau=64, fsp_pos_weight=50.0,
                  fsp_layer=-1):
         # trace_mode: how per-byte embedding credit is accumulated.
@@ -899,6 +1122,10 @@ class GpuModel:
         if grad_assembly not in ("cat", "loop"):
             raise ValueError(f"unknown grad_assembly={grad_assembly!r}")
         self.grad_assembly = grad_assembly
+        if fused_adam not in FUSED_ADAM_MODES:
+            raise ValueError(f"unknown fused_adam={fused_adam!r}")
+        self.fused_adam = fused_adam
+        self._fused_adam_resolved = None
         # ring_credit: how the ring credit is applied.
         #   full     -- materialize (B,K,D) then index_add_ (portable, CPU-safe)
         #   compiled -- Inductor fuses multiply + mask + scatter: measured +27%
@@ -929,6 +1156,12 @@ class GpuModel:
         # same documented switch as numpy_port: TMT_TAIL=0 disables the exact
         # long-lag credit entirely (ring-only embed credit, as pre-tail).
         self.tail_enabled = os.environ.get("TMT_TAIL", "1") != "0"
+        self.tail_fused = _tc.tail_fused_resolve(
+            os.environ.get("TMT_FUSED_TAIL", "off"), self.device)
+        if self.tail_fused:
+            print("  [tail] FUSED decay+credit enabled: 3 tail passes -> 2 "
+                  "(one read of E per step). bit-identical on CPU (numba); "
+                  "nvrtc CUDA kernel on GPU.", flush=True)
         # Tail memory = sum_layers B*256*H*4 bytes. At B=4096 with 512 hot
         # dims/layer that is ~34 GB: guard before allocating (PLAN risk list:
         # "hot-dim blowup: abort if tail > cap"). Override with TMT_TAIL_CAP_GB.
@@ -1172,7 +1405,8 @@ class GpuModel:
             return
         if self.tail is None or self.tail.B != self.B:
             self.tail = TorchTail(self.B, self.ring_k, hot_frac=HOT_FRAC,
-                                  device=self.device, cap_gb=self.tail_cap_gb)
+                                  device=self.device, cap_gb=self.tail_cap_gb,
+                                  fused=self.tail_fused)
             if self.tail_state:
                 self._tail_restore_from(self.tail_state)
                 self.tail_state = {}
@@ -1928,14 +2162,23 @@ class GpuModel:
                     # rhythm -- and therefore which lag each credit term sits
                     # at -- matches.
                     E = self.dense_E[i]
-                    with rf("dense_decay"):
-                        E.mul_(dec[None, None, :])
-                    with rf("dense_credit"):
-                        dembed += torch.einsum("bvd,bd->vd", E, dlds)
+                    if self.tail_fused:
+                        # FUSED: decay+credit in one pass over E (1 read).
+                        with rf("dense_decay_credit"):
+                            dembed += self._fused_credit(E, dlds, dec)
+                    else:
+                        with rf("dense_decay"):
+                            E.mul_(dec[None, None, :])
+                        with rf("dense_credit"):
+                            dembed += torch.einsum("bvd,bd->vd", E, dlds)
                     with rf("dense_add"):
                         E[ar, c_arr, :] += 1.0
                 else:
-                    if self.tail is not None and self.tail.nhot(i):
+                    sig_hot = (dec[self.tail.cols_of(i)]
+                               if (self.tail is not None and self.tail.nhot(i)
+                                   and self.tail.fused) else None)
+                    if (self.tail is not None and self.tail.nhot(i)
+                            and not self.tail.fused):
                         self.tail.begin_step(i, dec[self.tail.cols_of(i)])
                     hot_mask = (self.tail.mask_of(i)
                                 if self.tail is not None and self.tail.nhot(i)
@@ -1949,7 +2192,7 @@ class GpuModel:
                         w[:, p] = 1.0                    # this byte = lag 1
                     if self.tail is not None and self.tail.nhot(i):
                         with rf("tail_credit"):
-                            tailc = self.tail.credit(i, dlds)
+                            tailc = self.tail.credit(i, dlds, sig_hot)
                             if tailc is not None:
                                 cols = self.tail.cols_of(i)
                                 dembed[:, cols] = dembed[:, cols] + tailc
@@ -2064,51 +2307,7 @@ class GpuModel:
         # green while changing the schedule and the correction history.)
         with rf("optimizer"):
             t = self.t
-            th, gr, m, v = self.theta, self.grads, self.m, self.v
-            # ---- NaN guard (PLAN-2026-10-11 P0 item 3) -------------------
-            # A non-finite gradient is REFUSED, not applied: theta, m and v
-            # are left exactly as they were. `t` still advances (the data was
-            # consumed; rewinding the LR schedule would be a second, quieter
-            # way to change the run), and the refusal is counted so a run that
-            # silently stopped learning is visible in the log.
-            #
-            # The guard is a no-op on finite gradients, and the check is a
-            # single reduction plus one host sync -- the same trade the CUDA
-            # fork makes for its global grad-norm sync.
-            self.last_nan_refused = False
-            finite = True
-            if self.nan_guard:
-                finite = bool(torch.isfinite(gr).all().item())
-                if not finite:
-                    self.nan_refusals += 1
-                    self.last_nan_refused = True
-            if finite:
-                # ---- global grad clip ----------------------------------
-                # PyTorch's clip_grad_norm_ convention: scale the whole
-                # gradient by min(clip / (norm + 1e-6), 1). Applied BEFORE the
-                # AdamW moments are updated, so the moments see the gradient
-                # that was actually applied.
-                if self.grad_clip > 0.0:
-                    gn = float(torch.linalg.vector_norm(gr).item())
-                    coef = self.grad_clip / (gn + 1e-6)
-                    if coef < 1.0:
-                        gr.mul_(coef)
-                m.mul_(self.b1).add_((1.0 - self.b1) * gr)
-                v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
-                v.sqrt_()
-                # The learning rate is a per-coordinate VECTOR so a role can be
-                # scaled independently. Filled with exactly float32(self.lr) when
-                # lr_decay is unset, which makes this arithmetically identical to
-                # the old scalar form (a Python float promotes to float32 against a
-                # float32 tensor) -- tests/check_lr_roles.py gates that bit-exactly.
-                lv = self._role_lr_vec()
-                # The weight decay is ALSO a per-coordinate vector, so the
-                # `.decay`/`.gate` groups can be exempted (P6). With the
-                # default wd_decay == wd it is a uniform vector and therefore
-                # bit-identical to the incumbent's scalar `wd * th`.
-                th.sub_(lv * (m * (1.0 / (1.0 - self.b1 ** t)) /
-                              (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
-                              + self._wd_coord_vec() * th))
+            self._adamw(t)
             # else: the update is REFUSED. theta, m, v untouched.
         return loss
 
@@ -2160,6 +2359,96 @@ class GpuModel:
                 off += k
         self._lr_vec = lv
         return lv
+
+    # ---------------- fused AdamW ----------------
+    # One arithmetic statement, shared by the torch fallback and the NVRTC
+    # kernel, so both paths are bit-identical by construction.
+    def _resolve_fused_adam(self):
+        """'kernel' if the fused NVRTC path should run, else 'torch'.
+
+        auto/on: kernel when on CUDA and the NVRTC kernel compiled;
+        otherwise the bit-identical torch fallback. off: always torch.
+        Never raises: a run that cannot fuse still runs, on CPU or on the
+        MX150 (cc 6.1), where the kernel degrades to torch if NVRTC fails.
+        """
+        if self.fused_adam == "off":
+            return "torch"
+        if not self.device.startswith("cuda"):
+            return "torch"
+        return "kernel" if _nvrtc_fused_adamw() is not None else "torch"
+
+    def _adamw(self, t):
+        """One AdamW update over the flat param buffer (theta, m, v).
+
+        Bit-identical to the incumbent's inline torch update on ANY device:
+            m = b1*m + (1-b1)*g
+            v = b2*v + (1-b2)*g*g ; v = sqrt(v)
+            th -= lv * (m*bc1 / (sqrt(v)*bc2 + eps) + wv*th)
+        with the same op order and float32 rounding as numpy_port. The NaN
+        guard and global grad clip stay on the host (one reduction + one sync
+        each, exactly as the incumbent), so a non-finite gradient still
+        refuses the update and leaves theta/m/v untouched; t still advances.
+
+        resolved = 'kernel' (CUDA NVRTC, one pass) or 'torch' (CPU fallback,
+        bit-identical). Never raises.
+        """
+        th, gr, m, v = self.theta, self.grads, self.m, self.v
+        # ---- NaN guard (same contract as the incumbent) ------------------
+        self.last_nan_refused = False
+        finite = True
+        if self.nan_guard:
+            finite = bool(torch.isfinite(gr).all().item())
+            if not finite:
+                self.nan_refusals += 1
+                self.last_nan_refused = True
+        if not finite:
+            return  # theta, m, v untouched; t already advanced by the caller
+        # ---- global grad clip (same convention as the incumbent) ---------
+        if self.grad_clip > 0.0:
+            gn = float(torch.linalg.vector_norm(gr).item())
+            coef = self.grad_clip / (gn + 1e-6)
+            if coef < 1.0:
+                gr.mul_(coef)
+        if self._resolve_fused_adam() == "kernel":
+            self._adamw_kernel(t, th, gr, m, v)
+        else:
+            self._adamw_torch(t, th, gr, m, v)
+
+    def _adamw_torch(self, t, th, gr, m, v):
+        """CPU / fallback path: the incumbent's inline update, extracted so
+        the kernel and the fallback share ONE arithmetic statement."""
+        lv = self._role_lr_vec()
+        wv = self._wd_coord_vec()
+        m.mul_(self.b1).add_((1.0 - self.b1) * gr)
+        v.mul_(self.b2).add_((1.0 - self.b2) * (gr * gr))
+        v.sqrt_()
+        th.sub_(lv * (m * (1.0 / (1.0 - self.b1 ** t)) /
+                      (v * (1.0 / (1.0 - self.b2 ** t)) + self.eps)
+                      + wv * th))
+
+    def _adamw_kernel(self, t, th, gr, m, v):
+        """CUDA NVRTC path: one kernel, one pass over the flat buffer."""
+        kern = _nvrtc_fused_adamw()
+        if kern is None:                         # compile failed late: degrade
+            self._adamw_torch(t, th, gr, m, v)
+            return
+        n = int(th.numel())
+        # Float constants are passed as a float32 device tensor: the NVRTC
+        # launcher promotes bare Python floats to c_double (8 bytes) and
+        # ints to c_int, so bare floats would be mis-encoded as kernel args.
+        consts = torch.tensor([
+            np.float32(self.b1), np.float32(1.0 - self.b1),
+            np.float32(self.b2), np.float32(1.0 - self.b2),
+            np.float32(1.0 / (1.0 - self.b1 ** t)),
+            np.float32(1.0 / (1.0 - self.b2 ** t)),
+            np.float32(self.eps),
+        ], dtype=F, device=self.device)
+        lv = self._role_lr_vec()
+        wv = self._wd_coord_vec()
+        block = 256
+        grid = (n + block - 1) // block
+        kern(grid=(grid, 1, 1), block=(block, 1, 1),
+             args=[th, gr, m, v, lv, wv, consts, int(n)])
 
     # ---------------- persistence / bridging -------------
     def params_dict(self):
