@@ -4407,3 +4407,55 @@ the instrument limit, not a finding about the model; the per-byte rate with
 its matched null is the right metric, and the plan's ACQUIRE threshold
 (exact recall of a 4-byte payload) will need a **matched alphabet** to be
 measurable at all.
+
+### 10. The fused AdamW: bit-identical, and 1.09x on the WHOLE step (MX150)
+
+The optimizer region was the second-cheapest prize after the tail: the
+update is hand-built on flat fp32 vectors and made ~25-30 separate array
+passes, measured at ~3.0 ms/step on a T4. A fused single NVRTC kernel makes
+7 passes.
+
+**Bit-identical, on both machines.** The new gate `tests/check_fused_adamw.py`
+compares the fused path against the unfused path on the parameters, the Adam
+moments `m` and `v`, across the settings that matter (the per-role LR, the
+P6 weight-decay exemption, the wd_decay=0 case) AND pins the CPU fallback
+against the fused path:
+
+| setting | parameter delta | m delta | v delta |
+|---|---:|---:|---:|
+| role-LR `lr_decay=8e-3` | **0.000e+00** | **0.000e+00** | **0.000e+00** |
+| role-LR + `wd_decay=0` | **0.000e+00** | **0.000e+00** | **0.000e+00** |
+
+`array_equal=True` on every one. The same gate PASSES on the MX150's GPU
+(cc 6.1) as well as on the CPU, so the NVRTC path is bit-identical there
+too.
+
+**The speed, on the MX150, whole step, B=1024, dim=512, layers=16:**
+
+| | ms/step | peak CUDA |
+|---|---:|---:|
+| `fused_adam=off` | 151.26 | 0.910 GB |
+| **`fused_adam=on`** | **138.83** | 0.900 GB |
+| **speedup** | **1.09×** (−12.4 ms) | — |
+
+**A caveat on the transfer to the T4, stated honestly.** The MX150 saves
+12.4 ms/step; the T4's optimizer region was measured at 3.0 ms. The gap is
+the MX150 being **launch-bound**: ~25-30 array passes are ~25-30 kernel
+launches, and on a slow GPU with high launch latency they cost far more
+than the arithmetic. On the T4 (26.72 ms/step) the same fusion should save
+roughly the 3.0 ms region, i.e. **~11 % of the step — but that number is
+projected, not measured.** The T4 measurement is outstanding, and the
+projected figure is what should go in the plan until it lands.
+
+**What the arithmetic had to survive, and did:** the per-coordinate LR and
+weight-decay VECTORS (the role LR), the eps placement (after bias
+correction AND inside the role-LR bracket), the decay scaled by the role LR,
+the P6 per-group weight-decay exemption, and the bias correction
+`b1**t`/`b2**t`. `torch.optim.AdamW` is not used and could not be: it
+cannot express per-coordinate LR/WD without splitting the flat layout, which
+would change the checkpoint format.
+
+**The lesson about eager resolution applies here too.** The new flag
+`--fused-adam {auto,on,off}` is resolved **lazily** in `GpuModel`, not in
+the constructor — the same lesson as the ring-credit default, where an
+eager resolution made the fastest path unreachable and cost 1.26×.

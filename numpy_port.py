@@ -339,6 +339,11 @@ class Model:
         self.tail = None
         self.tail_state = {}   # checkpoint keys handed to a fresh tail
         self.tail_enabled = os.environ.get("TMT_TAIL", "1") != "0"
+        self.tail_fused = tail_credit.tail_fused_resolve(
+            os.environ.get("TMT_FUSED_TAIL", "off"))
+        if self.tail_fused:
+            print("  [tail] FUSED decay+credit enabled: 3 tail passes -> 2.",
+                  flush=True)
 
     def new_states(self, B):
         self.B = B
@@ -368,7 +373,8 @@ class Model:
         if not getattr(self, "tail_enabled", False):
             return
         if self.tail is None or self.tail.B != self.B:
-            self.tail = TailCredit(self.B, self.ring_k)
+            self.tail = TailCredit(self.B, self.ring_k,
+                                      fused=self.tail_fused)
             if self.tail_state:
                 self.tail.restore_from(self.tail_state, self.layercount)
             self.tail_state = {}
@@ -561,14 +567,20 @@ class Model:
             # one-hot in place instead of building a (B,256,1) array.
             # decay first: the dense credit uses (T_{t-1} * decay_t), not T_{t-1}
             w *= decays[i]
+            # Fused mode folds begin_step's decay into credit(); skip it and
+            # pass the per-hot-dim sigma to credit instead.
+            sig_hot = None
             if self.tail is not None and self.tail.nhot(i):
-                self.tail.begin_step(i, decays[i][self.tail.cols_of(i)])
+                if self.tail.fused:
+                    sig_hot = decays[i][self.tail.cols_of(i)]
+                else:
+                    self.tail.begin_step(i, decays[i][self.tail.cols_of(i)])
             np.multiply(w, dlds[:, None, :], out=scratch)
             if self.tail is not None and self.tail.nhot(i):
                 # ring skips hot dims (their credit would be truncated); the
                 # tail EMA covers them exactly at every lag
                 scratch[:, :, self.tail.mask(i)] = 0.0
-                tailc = self.tail.credit(i, dlds)
+                tailc = self.tail.credit(i, dlds, sig_hot)
                 if tailc is not None:
                     np.add.at(dembed, (slice(None), self.tail.cols_of(i)), tailc)
             sv = scratch.reshape(B * K, self.dim)
